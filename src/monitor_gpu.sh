@@ -91,6 +91,26 @@ log_debug() {
     fi
 }
 
+###############################################################################
+# _trim_ws: Strip leading/trailing whitespace from a string using only bash
+# parameter expansion — no subprocess fork, no pipeline. Writes the result
+# to the global $REPLY variable in the caller's scope (idiomatic bash
+# pattern for return-by-reference helpers in hot paths).
+#
+# Used in update_stats()'s per-tick CSV parsing loop. Phase 2's initial
+# version called `echo ... | xargs` per field, which forked one subprocess
+# per CSV field per GPU per tick — ~16 forks per tick on a 4-GPU system.
+# Parameter expansion is strictly cheaper (no fork, no exec).
+#
+# Defined at the top level (not inside update_stats) because bash functions
+# are globally scoped regardless of where they're declared — defining it
+# inside update_stats would re-register the function on every tick.
+###############################################################################
+_trim_ws() {
+    local v="${1#"${1%%[![:space:]]*}"}"
+    REPLY="${v%"${v##*[![:space:]]}"}"
+}
+
 # Paths for GPU inventory and config. Discovery happens later in the
 # startup block once helper functions (safe_write_json, log_*) are in
 # scope — see the GPU inventory section near the end of this file.
@@ -335,12 +355,19 @@ function discover_gpus() {
     export GPU_UUID
 
     # Wrap the per-GPU entries in a top-level object and write atomically.
-    # If the write fails (disk full, permissions, read-only mount), log
-    # loudly and return non-zero so the startup path can fail fast rather
-    # than running with a stale inventory file and silently falling back
-    # to the single-UUID env var for multi-GPU installs.
+    # Two separate failure modes to catch:
+    #  (a) jq can't parse/merge the per-GPU entries — indicates a bug
+    #      in the entry-building code above, fail fast rather than
+    #      letting safe_write_json persist an empty/invalid inventory.
+    #  (b) safe_write_json can't write the file — disk full, permissions,
+    #      read-only mount. Fail fast rather than running with a stale
+    #      inventory file and silently falling back to the single-UUID
+    #      env var for multi-GPU installs.
     local inventory_json
-    inventory_json=$(jq -s '{gpus: .}' <<< "$inventory_entries")
+    if ! inventory_json=$(jq -s '{gpus: .}' <<< "$inventory_entries"); then
+        log_error "discover_gpus: failed to build GPU inventory JSON (jq error)"
+        return 1
+    fi
     if ! safe_write_json "$INVENTORY_FILE" "$inventory_json"; then
         log_error "discover_gpus: failed to write GPU inventory to $INVENTORY_FILE"
         return 1
@@ -893,14 +920,24 @@ def process_buffer(db_path, buffer_lines):
     # interval_s (the cadence the collector is currently running at) comes
     # from the GPU_MONITOR_INTERVAL_S env var set by the bash caller.
     # gpu_uuid is looked up per-row from the gpu_inventory.json file that
-    # discover_gpus() writes at startup, with GPU_MONITOR_GPU_UUID as a
-    # last-resort fallback for single-GPU legacy environments.
+    # discover_gpus() writes at startup. Two distinct fallback modes:
+    #
+    #   1. Inventory file is empty/unreadable (single-GPU dev env without
+    #      nvidia-smi): use GPU_MONITOR_GPU_UUID env var for every row.
+    #      This is the expected legacy single-GPU path.
+    #
+    #   2. Inventory file has data but is missing a specific gpu_index
+    #      (hot-add/remove after startup, partial corruption): use the
+    #      'legacy-unknown' sentinel rather than silently attributing the
+    #      row to some other GPU's UUID. Silent misattribution would
+    #      corrupt per-GPU analytics in a way that is hard to detect later.
     try:
         interval_s = int(os.environ.get('GPU_MONITOR_INTERVAL_S', '4'))
     except ValueError:
         interval_s = 4
-    fallback_uuid = os.environ.get('GPU_MONITOR_GPU_UUID', 'legacy-unknown') or 'legacy-unknown'
+    legacy_env_uuid = os.environ.get('GPU_MONITOR_GPU_UUID', 'legacy-unknown') or 'legacy-unknown'
     uuid_by_index = load_gpu_uuid_by_index('/app/gpu_inventory.json')
+    inventory_empty = not uuid_by_index
 
     try:
         conn = sqlite3.connect(db_path)
@@ -961,7 +998,14 @@ def process_buffer(db_path, buffer_lines):
                 dt = datetime.strptime(f"{current_year} {timestamp}", "%Y %m-%d %H:%M:%S")
             timestamp_epoch = int(dt.timestamp())
 
-            gpu_uuid = uuid_by_index.get(gpu_index, fallback_uuid)
+            # Dual-mode fallback per the comment at the top of this
+            # function: env var when the inventory is completely missing,
+            # sentinel when a specific index is absent from a non-empty
+            # inventory.
+            if inventory_empty:
+                gpu_uuid = legacy_env_uuid
+            else:
+                gpu_uuid = uuid_by_index.get(gpu_index, 'legacy-unknown')
 
             conn.execute(stmt,
                 (timestamp, timestamp_epoch, temperature, utilization, memory, power,
@@ -1086,19 +1130,15 @@ update_stats() {
     local gpu0_temp="" gpu0_util="" gpu0_mem="" gpu0_power=""
     local first_temp="" first_util="" first_mem="" first_power=""
     local row_count=0
-    # Whitespace-trim helper using bash parameter expansion only (no
-    # subprocess fork per call). Writes to $REPLY in the caller's scope.
-    # Phase 2's initial version used `echo ... | xargs` per field, which
-    # forked ~16 subprocesses per tick on a 4-GPU system.
-    _trim() {
-        local v="${1#"${1%%[![:space:]]*}"}"
-        REPLY="${v%"${v##*[![:space:]]}"}"
-    }
     while IFS=',' read -r idx temp util mem power; do
-        _trim "$idx";   idx="$REPLY"
-        _trim "$temp";  temp="$REPLY"
-        _trim "$util";  util="$REPLY"
-        _trim "$mem";   mem="$REPLY"
+        # _trim_ws is a top-level helper (defined earlier in this file).
+        # Defining it inside this function would redefine a GLOBAL bash
+        # function on every tick — bash functions aren't locally scoped,
+        # regardless of where they're declared.
+        _trim_ws "$idx";   idx="$REPLY"
+        _trim_ws "$temp";  temp="$REPLY"
+        _trim_ws "$util";  util="$REPLY"
+        _trim_ws "$mem";   mem="$REPLY"
         # power has additional [N/A] bracket handling; strip spaces and
         # brackets using parameter-expansion substitutions.
         power="${power// /}"
