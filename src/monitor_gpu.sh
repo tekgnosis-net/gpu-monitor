@@ -792,16 +792,69 @@ function safe_write_json() {
 ###############################################################################
 # process_buffer: Safely handles buffered GPU metrics data
 # Implements atomic write operations to prevent data loss during system updates
+#
+# Retry semantics (task #23):
+#
+#   On python insert failure, the buffered rows are renamed from
+#   $temp_file → ${BUFFER_FILE}.pending, and a sibling
+#   ${BUFFER_FILE}.pending.retries file records the consecutive
+#   failure count. On the next process_buffer call, any existing
+#   .pending file is CHRONOLOGICALLY PREPENDED to the freshly-copied
+#   buffer before python runs — so the retry and the new rows are
+#   written as a single transaction, preserving sample ordering.
+#
+#   After MAX_PROCESS_BUFFER_RETRIES consecutive failures, the pending
+#   file is renamed to ${BUFFER_FILE}.stuck-YYYYMMDDHHMMSS for manual
+#   operator recovery, and the retry count resets. This prevents a
+#   persistent bug (e.g. schema mismatch, read-only filesystem) from
+#   infinitely accumulating unprocessable rows in .pending.
+#
+#   Regardless of python success/failure, every row is ALSO appended
+#   to $LOG_FILE as an audit trail — that safety net was added in
+#   Phase 1 and is preserved here.
+#
 # Returns: 0 on success, 1 on failure
 ###############################################################################
+MAX_PROCESS_BUFFER_RETRIES=5
+
 function process_buffer() {
     local temp_file="${BUFFER_FILE}.tmp"
+    local pending_file="${BUFFER_FILE}.pending"
+    local retries_file="${pending_file}.retries"
     local success=0
-    
+
     # Create temp file with buffer contents
     if cp "$BUFFER_FILE" "$temp_file"; then
-        # Clear original buffer only after successful copy
+        # Clear original buffer only after successful copy so any
+        # samples written between now and python exit go into a clean
+        # slate rather than being double-processed or lost.
         > "$BUFFER_FILE"
+
+        # If a prior tick left a .pending file behind, prepend its
+        # contents to the freshly-copied buffer so old-then-new
+        # chronological order is preserved in the retry transaction.
+        # Rows in .pending are always older than anything now sitting
+        # in $temp_file because the main loop is serialized — no
+        # concurrent writer could have added to .pending after we
+        # started this function. Use a merge temp file to avoid the
+        # "cat a > a" race that would silently produce an empty file.
+        local current_retries=0
+        if [ -f "$pending_file" ]; then
+            local merge_tmp="${temp_file}.merge"
+            if cat "$pending_file" "$temp_file" > "$merge_tmp" 2>/dev/null; then
+                mv "$merge_tmp" "$temp_file"
+            else
+                log_warning "process_buffer: could not merge .pending (continuing with fresh buffer only)"
+                rm -f "$merge_tmp"
+            fi
+            # Read the retry counter — missing or malformed counter
+            # resets to 0, which is the conservative default (worst
+            # case: one extra retry cycle before escalation to .stuck).
+            if [ -f "$retries_file" ]; then
+                current_retries=$(cat "$retries_file" 2>/dev/null || echo 0)
+                [[ "$current_retries" =~ ^[0-9]+$ ]] || current_retries=0
+            fi
+        fi
         
         # Process buffer with Python and write to database
         cat > /tmp/process_buffer.py << 'PYTHONSCRIPT'
@@ -984,25 +1037,65 @@ PYTHONSCRIPT
             log_error "Failed to process buffer into database"
         fi
         # Append buffered samples to the audit log REGARDLESS of DB insert
-        # success. Without this, a transient DB-insert failure meant the
-        # buffer had already been truncated (line 715) and the temp file was
-        # about to be deleted, so there was no record of the failed samples
-        # anywhere. Appending unconditionally means every sample is
-        # recoverable from $LOG_FILE even if the DB write failed. (The
-        # proper retry mechanism — rename temp_file to a pending-retry
-        # artifact and pick it up on the next flush — is still future work
-        # that deserves its own focused PR.)
+        # success. The audit-log safety net was added in Phase 1 so every
+        # sample is recoverable from $LOG_FILE even if both the DB write
+        # and the retry path fail. The retry path (below) stashes failed
+        # rows to .pending / .stuck-* for programmatic recovery; the audit
+        # log is the belt-and-braces fallback for the case where even the
+        # retry path is broken (read-only filesystem, etc.).
         cat "$temp_file" >> "$LOG_FILE"
-        
-        # Clean up
+
+        # Clean up the Python script (recreated on every call)
         rm -f /tmp/process_buffer.py
     else
         log_error "Failed to create temp buffer file"
     fi
-    
-    # Clean up temp file
-    rm -f "$temp_file"
-    
+
+    # Final disposition of $temp_file depends on whether the Python
+    # insert succeeded and whether we've exhausted the retry budget:
+    if [ "$success" -eq 1 ]; then
+        # Clean slate: delete temp + any lingering .pending retry
+        # artifacts. A successful insert discharges all buffered rows
+        # — the .pending file (which was merged into temp_file at the
+        # top of this function) has already been committed to the DB.
+        rm -f "$temp_file" "$pending_file" "$retries_file"
+    elif [ -f "$temp_file" ]; then
+        # Python failed. Decide between "defer for retry" and
+        # "escalate to .stuck for manual recovery".
+        local next_retries=$((current_retries + 1))
+        if [ "$next_retries" -ge "$MAX_PROCESS_BUFFER_RETRIES" ]; then
+            # Exhausted retry budget — stash to .stuck-* with a
+            # timestamp suffix and reset the retry state. The operator
+            # needs to look at the file manually (fix the underlying
+            # issue, replay via sqlite3 + the process_buffer.py heredoc,
+            # or delete if unrecoverable). Logging an ERROR here flags
+            # it in the main log stream so it surfaces in Settings →
+            # Housekeeping → DB info for observability.
+            local stuck_file
+            stuck_file="${BUFFER_FILE}.stuck-$(date '+%Y%m%d%H%M%S')"
+            if mv "$temp_file" "$stuck_file" 2>/dev/null; then
+                rm -f "$pending_file" "$retries_file"
+                log_error "process_buffer: $next_retries consecutive DB-insert failures; stashed $(wc -l < "$stuck_file" 2>/dev/null || echo '?') rows to $stuck_file for manual recovery"
+            else
+                log_error "process_buffer: cannot escalate to .stuck-* (mv failed); keeping .pending"
+                # Leave .pending/temp_file as-is — next tick will try
+                # again. Better to spin on retries than to silently drop.
+                mv "$temp_file" "$pending_file" 2>/dev/null || true
+            fi
+        else
+            # Still within retry budget — defer to .pending for the
+            # next tick to pick up and prepend.
+            if mv "$temp_file" "$pending_file" 2>/dev/null; then
+                echo "$next_retries" > "$retries_file" 2>/dev/null || \
+                    log_warning "process_buffer: could not write retry counter (next tick may reset)"
+                log_warning "process_buffer: DB insert failed (retry $next_retries/$MAX_PROCESS_BUFFER_RETRIES); deferred to $pending_file"
+            else
+                log_error "process_buffer: cannot rename temp to .pending; rows will be re-fetched on audit-log replay only"
+                rm -f "$temp_file"
+            fi
+        fi
+    fi
+
     # Return result
     return $((1 - success))
 }
