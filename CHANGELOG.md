@@ -5,15 +5,49 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 
 ## [Unreleased]
 
+_Nothing yet — this section accumulates changes that land on main
+between releases. `release-please` will move these into a new
+`[X.Y.Z]` section on the next release PR._
+
+## [1.0.0] - 2026-04-12
+
+The v1.0.0 overhaul. Eight phases of work taking `bigsk1/gpu-monitor`
+from a single-GPU, single-theme, single-HTML-file container to a
+multi-GPU, Apple-HIG-themed dashboard with scheduled email reports,
+a real REST API, SMTP + electricity-cost settings, housekeeping
+controls, and GHCR semver release automation. See the per-phase
+entries below for the full arc — all changes in this release were
+previously listed under `[Unreleased]` and are collected here as the
+first tagged release of this fork.
+
 ### Added
+- **Phase 8** — Release automation. New `release-please` configuration
+  opens auto-generated release PRs on main pushes that accumulate
+  conventional-commit entries into the `[Unreleased]` section and
+  bump `VERSION` + `CHANGELOG.md` on merge. A companion
+  `release.yml` workflow fires on `v*.*.*` tags pushed by release-
+  please, verifies that the tag matches the VERSION file contents,
+  and publishes the container image to GHCR with the full semver
+  tag set (`1.0.0`, `1.0`, `1`, `latest`). The existing
+  `docker-publish.yml` is scoped to dev builds only, publishing
+  `ghcr.io/.../gpu-monitor:main` and `:main-<sha>` pointers on
+  each push to main. Docker Hub is dropped from this repo's publish
+  pipeline — GHCR-only from v1.0.0 onwards. `VERSION` bumped from
+  `1.0.0-dev` to `1.0.0`. `README.md` complete rewrite with upstream
+  `bigsk1/gpu-monitor` attribution, "How this fork differs" table,
+  full features list by view, API reference, quick-start with
+  docker-run and docker-compose, full `settings.json` schema
+  reference, live-reload scope documentation, security/threat
+  model, upgrade instructions from upstream, and development
+  section with test-suite invocation and architecture diagram.
 - **Phase 7** — Polish pass addressing the three deferred Phase-4 accessibility tasks plus the alert system re-wire, keyboard shortcuts, and final info-tip / empty-state audits:
   - **`src/web/components/gauge.js`** — `aria-valuenow` is now sanitized via a `_sanitizedValue()` helper that clamps non-finite input to 0 and bounds values into `[0, max]`. Screen readers no longer announce `NaN` or unclamped negatives on the progressbar. Visible display continues to show `—` for non-finite via `_displayValue()` (sighted and AT users expect different failure semantics).
   - **`src/web/components/info-tip.js`** — Trigger is now a real `<button type="button">` instead of a `<span role="button">`. Real buttons get Space/Enter keyboard activation for free from the platform (the old span never handled them, so pressing Space did nothing). Added `aria-expanded` bound to the `_open` state, click-to-toggle for touch devices where hover doesn't exist, and UA style resets (`padding: 0`, `margin: 0`, `appearance: none`) so the browser default button chrome doesn't fight the circular-pill design.
   - **`src/web/widgets/tablist.js`** — New shared helper implementing the WAI-ARIA tab pattern: `markTabSelected` (dual-stamps `aria-selected` for AT + `aria-current` for back-compat with existing CSS selectors + roving `tabindex` 0/-1) and `attachTablistKeyboard` (arrow / Home / End / automatic-activation). Wired into all four existing tab strips (GPU picker + time-range picker in `dashboard.js`, GPU picker + window picker in `power.js`). Each tab strip now has an `aria-label` on the `role="tablist"` container and proper keyboard navigation between tabs.
-  - **`src/web/alerts.js`** — New module re-implementing the alert system that Phase 4 stripped out. Loads thresholds from `/api/settings.alerts` at dashboard mount (with pre-Phase-4 hardcoded defaults as a failing-closed fallback), compares each current-metrics poll result against them, and fires a toast banner + optional sound + optional browser Notification on breach. Per-metric cooldown state machine prevents toast spam from sustained breaches. Safe-DOM toast rendering (createElement + textContent, no `innerHTML` with metric data). Audio playback gates on `sound_enabled` + user-interaction requirement (silently swallows `NotAllowedError` on first-load polls).
+  - **`src/web/alerts.js`** — New module re-implementing the alert system that Phase 4 stripped out. Loads thresholds from `/api/settings.alerts` at dashboard mount (with pre-Phase-4 hardcoded defaults as a failing-closed fallback), compares each current-metrics poll result against them, and fires a toast banner + optional sound + optional browser Notification on breach. Per-metric cooldown state machine with a named `COOLDOWN_CLEAR_GRACE_SECONDS` constant prevents toast spam from sustained breaches. Safe-DOM toast rendering (createElement + textContent, no `innerHTML` with metric data). Audio playback gates on `sound_enabled` + user-interaction requirement (silently swallows `NotAllowedError` on first-load polls).
   - **`src/web/views/dashboard.js`** — Calls `alerts.loadThresholdsFromServer()` at mount and `alerts.checkMetrics()` after each `refreshCurrent()` poll. Try/catch around the alert call so an alert-module bug never breaks the dashboard poll loop.
-  - **`src/web/views/settings.js`** — Alerts tab's "Desktop notifications" checkbox now has a change listener that calls `alerts.requestNotificationPermission()` only when the user explicitly flips it ON — never on page load. Fixes the "spooky unprompted permission request" UX smell that the Phase-4 hardcoded-to-configurable audit specifically called out. On denial, the checkbox is unticked and an error message explains how to re-enable in browser settings.
-  - **`src/web/keybindings.js`** — New module installing a single window-level keydown listener with the documented shortcut set: `g d` / `g r` / `g p` / `g s` to navigate (1-second navigation-prefix window), `t` to cycle theme (auto → light → dark → auto), `\` to toggle sidebar collapse, `?` to show/hide the keyboard cheat-sheet overlay, `Escape` to close the overlay. Suppresses all shortcuts while the user is typing in an `<input>` / `<textarea>` / `contenteditable` element or when any modifier key is held (reserved for browser/OS shortcuts). The cheat-sheet overlay uses safe-DOM construction and proper `role="dialog"` + `aria-modal` attributes.
+  - **`src/web/views/settings.js`** — Alerts tab's "Desktop notifications" checkbox has a change listener that calls `alerts.requestNotificationPermission()` only when the user explicitly flips it ON — never on page load. Fixes the "spooky unprompted permission request" UX smell that the Phase-4 hardcoded-to-configurable audit specifically called out. Full switch on the result value (granted / denied / default / unsupported / error) with inline status messages per state; blocking `alert()` calls replaced by a non-modal status element matching the Save-button status pattern.
+  - **`src/web/keybindings.js`** — New module installing a single window-level keydown listener with the documented shortcut set: `g d` / `g r` / `g p` / `g s` to navigate (1-second navigation-prefix window), `t` to cycle theme (auto → light → dark → auto), `\` to toggle sidebar collapse, `?` to show/hide the keyboard cheat-sheet overlay, `Escape` to close the overlay. Case-insensitive alphabetic key normalization so Shift / Caps Lock doesn't break the shortcut set. Suppresses all shortcuts while the user is typing in an `<input>` / `<textarea>` / `<select>` / `contenteditable` element or when any modifier key is held (reserved for browser/OS shortcuts). The cheat-sheet overlay uses safe-DOM construction with `role="dialog"` + `aria-modal` attributes, an explicit Close button with `requestAnimationFrame`-scheduled autofocus, and focus restoration on dismiss (save `document.activeElement` on show, restore inside try/catch on hide).
   - **`src/web/app.js`** — Imports and calls `installKeybindings()` after router initialization so `navigate()` resolves to registered views when a shortcut fires.
 - **Phase 6** — Settings persistence, SMTP-based email reports, standalone cron scheduler, housekeeping endpoints. Split across two sub-PRs for review discipline (6a + 6b) but one Changelog entry for the arc:
   - **`src/reporting/` subpackage** (new): `settings.py` (Pydantic models + atomic load/save for `/app/settings.json`), `crypto.py` (Fernet wrapper for SMTP password at rest with O_EXCL atomic key creation via `os.link`), `mailer.py` (aiosmtplib wrapper with STARTTLS/TLS/plain modes), `render.py` (Jinja2 + matplotlib PNG + premailer HTML email rendering), `scheduler.py` (standalone asyncio cron loop supervised by `monitor_gpu.sh`).
@@ -102,4 +136,5 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 - The Phase 1 migration is one-way — existing data is preserved but downgrading to a pre-Phase-1 image will fail because the old collector does not know about the new columns.
 - Hot-add/remove of GPUs in a running container is out of Phase 2 scope — `discover_gpus()` runs once at startup; a container restart is required to pick up hardware changes.
 
-[Unreleased]: https://github.com/tekgnosis-net/gpu-monitor/compare/main...HEAD
+[Unreleased]: https://github.com/tekgnosis-net/gpu-monitor/compare/v1.0.0...HEAD
+[1.0.0]: https://github.com/tekgnosis-net/gpu-monitor/releases/tag/v1.0.0
