@@ -42,6 +42,54 @@ let state = {
     schedules: [],
 };
 
+// Detach handle for the themechange listener, cleared on unmount
+// so the listener doesn't leak across view re-entries.
+let themeChangeHandler = null;
+
+// Resolve the effective theme of the DOCUMENT (what the user
+// visually experiences), not the raw data-theme attribute. Phase 4's
+// theme.js sets `data-theme="light"` / `data-theme="dark"` explicitly,
+// but also supports an auto mode where the attribute may be absent
+// or equal to "auto" — in that case the OS preference decides via
+// the prefers-color-scheme media query.
+//
+// Returns 'dark' or 'light'.
+function resolvedTheme() {
+    const attr = document.documentElement.getAttribute('data-theme');
+    if (attr === 'dark') return 'dark';
+    if (attr === 'light') return 'light';
+    // auto / missing → defer to OS preference
+    const mql = window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)');
+    return mql && mql.matches ? 'dark' : 'light';
+}
+
+// Apply (or remove) the dark-mode invert filter on the preview
+// iframe. The email template is intentionally hardcoded to light-
+// mode colors because its primary consumer is a mail client, and
+// mail clients predominantly ignore prefers-color-scheme. Inside
+// the dashboard iframe embed, that produces a jarring bright-white
+// block against a dark UI. Inverting via CSS filter is a one-line
+// bridge that keeps the server-side render authentic (WYSIWYG for
+// email recipients) while giving a dark-friendly appearance
+// when embedded in a dark dashboard.
+//
+// The invert() + hue-rotate(180deg) combo preserves the subjective
+// lightness of any colored regions while flipping the polarity of
+// grays — it's the standard CSS technique for "cheap dark mode".
+// It works here because the preview endpoint sets include_charts=
+// False, so there are no PNG images to corrupt with inversion.
+// If charts are ever added to the preview, this approach would
+// need to change.
+function applyPreviewTheme(iframe) {
+    if (!iframe) return;
+    const theme = resolvedTheme();
+    if (theme === 'dark') {
+        iframe.style.filter = 'invert(1) hue-rotate(180deg)';
+    } else {
+        iframe.style.filter = '';
+    }
+}
+
 function el(tag, className, text) {
     const node = document.createElement(tag);
     if (className) node.className = className;
@@ -218,10 +266,27 @@ export const reportView = {
 
         container.append(buildTemplatePicker((template) => {
             const iframe = document.getElementById('report-preview-iframe');
-            if (iframe) iframe.src = api.getReportPreviewUrl(template.id);
+            if (iframe) {
+                iframe.src = api.getReportPreviewUrl(template.id);
+                // Re-apply the theme filter after src change so the
+                // new preview content honors the current dashboard
+                // theme from its first paint rather than flashing
+                // light and then inverting.
+                applyPreviewTheme(iframe);
+            }
         }));
 
-        // Iframe for the live HTML preview
+        // Iframe for the live HTML preview.
+        //
+        // Background is set to match the email template's body
+        // color (#f5f5f7) rather than pure white. When the dashboard
+        // is in light mode, the iframe appears identical to how
+        // Gmail/Outlook/Apple Mail will render the email. When the
+        // dashboard is in dark mode, applyPreviewTheme() applies a
+        // CSS invert+hue-rotate filter that bridges the contrast
+        // without changing the server-rendered HTML — the email
+        // template's "light mode by default" contract stays intact
+        // for real mail-client consumers.
         const iframe = document.createElement('iframe');
         iframe.id = 'report-preview-iframe';
         iframe.src = api.getReportPreviewUrl(state.template);
@@ -229,15 +294,38 @@ export const reportView = {
         iframe.style.height = '600px';
         iframe.style.border = 'none';
         iframe.style.borderRadius = 'var(--radius-md)';
-        iframe.style.background = 'white';
+        iframe.style.background = '#f5f5f7';
         iframe.setAttribute('sandbox', 'allow-same-origin');
         iframe.setAttribute('title', 'Report preview');
+        applyPreviewTheme(iframe);
 
         container.append(buildPreviewCard(iframe));
         container.append(buildScheduleList());
+
+        // Subscribe to theme changes so toggling the sidebar theme
+        // updates the iframe filter in place without requiring a
+        // page reload or a view re-mount. theme.js emits the
+        // 'themechange' window event on every initTheme call and
+        // every cycleTheme call (Phase 4).
+        themeChangeHandler = () => {
+            const liveIframe = document.getElementById('report-preview-iframe');
+            applyPreviewTheme(liveIframe);
+        };
+        window.addEventListener('themechange', themeChangeHandler);
+
+        // Also listen for OS-level prefers-color-scheme changes
+        // when the user is in 'auto' theme mode and flips their
+        // OS appearance. theme.js already listens to matchMedia
+        // and emits themechange when the OS flips, so this is
+        // covered by the themechange subscription above. No
+        // separate matchMedia listener needed here.
     },
 
     unmount() {
         state.schedules = [];
+        if (themeChangeHandler) {
+            window.removeEventListener('themechange', themeChangeHandler);
+            themeChangeHandler = null;
+        }
     },
 };
