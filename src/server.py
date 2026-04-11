@@ -11,6 +11,7 @@ frontend. Routes:
     GET  /api/metrics/current                 latest sample per GPU (array)
     GET  /api/metrics/history?range=24h&gpu=0 timeseries for one GPU
     GET  /api/stats/24h                       per-GPU min/max array
+    GET  /api/stats/power?range=24h&gpu=0     integrated energy + power stats
 
 The API reads from:
   * /app/VERSION             (single source of truth for version)
@@ -50,10 +51,23 @@ DB_FILE = BASE_DIR / "history" / "gpu_metrics.db"
 SCHEMA_VERSION = 2  # Matches Phase 1 migration (gpu_index, gpu_uuid, interval_s)
 
 # Allowed `range` query parameter values and their durations in seconds.
-# Keep this tight — the frontend picks from a fixed set of timeframe
-# buttons (15m, 30m, 1h, 6h, 12h, 24h, 3d, 7d) and free-form values would
-# just invite confusion.
-RANGE_SECONDS: dict[str, int] = {
+# Two dicts intentionally, not one — the set of legal ranges differs per
+# endpoint:
+#
+#   * HISTORY_RANGE_SECONDS is used by /api/metrics/history, which returns
+#     every sampled row in the window. 30 days × 4s sampling × 2 GPUs is
+#     ~1.3M points — enough to freeze the browser and slam SQLite. The
+#     history endpoint caps at 7d.
+#
+#   * POWER_RANGE_SECONDS is used by /api/stats/power, which returns a
+#     single SUM across the window. 30 days is fine because the cost
+#     for the aggregation is O(n) over an index-served range scan and
+#     the response shape is a handful of floats regardless of window.
+#
+# Shared entries are duplicated rather than computed via set operations
+# so a future change (e.g. removing 7d for some reason) touches the
+# endpoint whose behavior is actually changing.
+HISTORY_RANGE_SECONDS: dict[str, int] = {
     "15m": 15 * 60,
     "30m": 30 * 60,
     "1h": 1 * 3600,
@@ -62,6 +76,10 @@ RANGE_SECONDS: dict[str, int] = {
     "24h": 24 * 3600,
     "3d": 3 * 86400,
     "7d": 7 * 86400,
+}
+POWER_RANGE_SECONDS: dict[str, int] = {
+    **HISTORY_RANGE_SECONDS,
+    "30d": 30 * 86400,
 }
 DEFAULT_RANGE = "24h"
 
@@ -108,14 +126,26 @@ def _open_db_readonly() -> sqlite3.Connection:
     return conn
 
 
-def _range_seconds(param: str | None) -> int:
-    """Translate a range query-parameter (e.g. '24h', '3d') into seconds,
-    defaulting to 24h when missing or unrecognized. A stricter approach
-    would 400 on unknown values; for Phase 3 we prefer a friendly default
-    over breaking the dashboard if the frontend sends something unexpected."""
+def _resolve_range(param: str | None, allowlist: dict[str, int]) -> tuple[int, str]:
+    """Translate a range query-parameter (e.g. '24h', '3d') into
+    (seconds, effective_key) against the given allowlist, defaulting to
+    24h when missing or unrecognized.
+
+    Returning both lets the response include the *effective* key (what
+    the query actually used) rather than whatever raw string the client
+    sent. This avoids a class of client-side confusion where a partial
+    or invalid ?range=... produces response data for one window but the
+    response metadata says another.
+
+    A stricter alternative would 400 on unknown values; we prefer a
+    friendly default so a stale frontend build never breaks the page.
+    """
     if not param:
-        return RANGE_SECONDS[DEFAULT_RANGE]
-    return RANGE_SECONDS.get(param.lower(), RANGE_SECONDS[DEFAULT_RANGE])
+        return allowlist[DEFAULT_RANGE], DEFAULT_RANGE
+    key = param.lower()
+    if key in allowlist:
+        return allowlist[key], key
+    return allowlist[DEFAULT_RANGE], DEFAULT_RANGE
 
 
 def _parse_gpu_param(param: str | None) -> int:
@@ -199,8 +229,16 @@ async def handle_metrics_history(request: web.Request) -> web.Response:
     """Timeseries for a single GPU over a time range. Shape matches the
     legacy history/history.json contract exactly so the Phase 3 retrofit
     of gpu-stats.html is a pure URL change — Phase 4 rewrites the
-    frontend and can introduce a richer shape then."""
-    range_s = _range_seconds(request.query.get("range"))
+    frontend and can introduce a richer shape then.
+
+    Phase 5 note: this endpoint deliberately uses HISTORY_RANGE_SECONDS
+    (no 30d) because 30 days of 4s sampling is ~648k rows per GPU and
+    returning every one as JSON would freeze the browser. The
+    /api/stats/power endpoint accepts 30d because it only returns
+    aggregate scalars, not raw rows."""
+    range_s, _effective_range = _resolve_range(
+        request.query.get("range"), HISTORY_RANGE_SECONDS
+    )
     gpu_index = _parse_gpu_param(request.query.get("gpu"))
 
     try:
@@ -278,6 +316,127 @@ async def handle_stats_24h(request: web.Request) -> web.Response:
     ])
 
 
+async def handle_stats_power(request: web.Request) -> web.Response:
+    """Integrated energy + power statistics for a single GPU over a time
+    range. Used by the Phase 5 Power view to populate its per-window
+    tiles (energy, peak, avg) and the cost calculation.
+
+    The energy integration is a Riemann sum: for each sample we multiply
+    the instantaneous power by the interval the sample represents, then
+    divide by 3600 to convert watt-seconds to watt-hours. Storing
+    `interval_s` per row in Phase 1 is what lets this stay correct when
+    the user changes `collection.interval_seconds` mid-window — a row
+    at 4 s contributes `power * 4`, a row at 10 s contributes
+    `power * 10`. No `LAG()` gymnastics, one `SUM`, O(n) over windowed
+    rows served directly from the composite (gpu_index, timestamp_epoch)
+    index.
+
+    Invalid samples (NULL power or power ≤ 0, which the collector writes
+    when nvidia-smi reports [N/A] or the card lacks a usable sensor) are
+    excluded from the integration — they'd otherwise contribute zero and
+    silently under-count energy. Their count is returned alongside the
+    total so the frontend can surface an "insufficient_telemetry" notice
+    without hiding the tile.
+
+    Response shape:
+        {
+          "range": "24h",
+          "gpu_index": 0,
+          "energy_wh": 1234.5,
+          "peak_power_w": 280.0,
+          "avg_power_w":  150.3,
+          "samples_total": 21600,
+          "samples_invalid": 0,
+          "insufficient_telemetry": false
+        }
+    """
+    range_s, effective_range = _resolve_range(
+        request.query.get("range"), POWER_RANGE_SECONDS
+    )
+    gpu_index = _parse_gpu_param(request.query.get("gpu"))
+
+    # Single fallback shape used for every failure path below so the
+    # client always gets the same keys. `range` is the *effective*
+    # (normalized) key — not the raw query string — so a partial/
+    # unknown ?range=... doesn't confuse clients that display the
+    # response metadata back to the user.
+    def _empty_response() -> dict:
+        return {
+            "range": effective_range,
+            "gpu_index": gpu_index,
+            "energy_wh": 0.0,
+            "peak_power_w": 0.0,
+            "avg_power_w": 0.0,
+            "samples_total": 0,
+            "samples_invalid": 0,
+            "insufficient_telemetry": True,
+        }
+
+    try:
+        conn = _open_db_readonly()
+    except sqlite3.OperationalError as exc:
+        log.warning("stats_power: cannot open DB: %s", exc)
+        return web.json_response(_empty_response(), status=200)
+
+    try:
+        try:
+            # Single aggregation query — all metrics fall out of one
+            # scan of the windowed rows for this GPU. The CASE WHEN
+            # guards ensure NULL / non-positive power rows don't corrupt
+            # peak/avg/energy but still get counted in samples_total via
+            # an unconditional COUNT(*) so the frontend can compute the
+            # invalid ratio.
+            row = conn.execute(
+                """
+                SELECT
+                    COALESCE(
+                        SUM(CASE WHEN power > 0 THEN power * interval_s ELSE 0 END),
+                        0
+                    ) / 3600.0 AS energy_wh,
+                    COALESCE(MAX(CASE WHEN power > 0 THEN power END), 0) AS peak_power_w,
+                    COALESCE(AVG(CASE WHEN power > 0 THEN power END), 0) AS avg_power_w,
+                    COUNT(*) AS samples_total,
+                    SUM(CASE WHEN power IS NULL OR power <= 0 THEN 1 ELSE 0 END)
+                        AS samples_invalid
+                FROM gpu_metrics
+                WHERE gpu_index = ?
+                  AND timestamp_epoch > strftime('%s', 'now') - ?
+                """,
+                (gpu_index, range_s),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            # A DB-open that succeeded can still race a schema change,
+            # WAL-checkpoint lock, or (in pathological cases) a missing
+            # table. Match the DB-open fallback shape so callers see the
+            # same "insufficient_telemetry: true" notice in both
+            # failure modes rather than one silent 5xx and one graceful
+            # placeholder.
+            log.warning("stats_power: query failed: %s", exc)
+            return web.json_response(_empty_response(), status=200)
+    finally:
+        conn.close()
+
+    samples_total = int(row["samples_total"] or 0)
+    samples_invalid = int(row["samples_invalid"] or 0)
+    # "Insufficient telemetry" means either the window has no data at
+    # all, or at least one sample had to be excluded from the energy
+    # sum. The frontend shows a warning icon + tooltip when this is
+    # true; the numeric values are still returned so partial data
+    # remains visible.
+    insufficient = samples_total == 0 or samples_invalid > 0
+
+    return web.json_response({
+        "range": effective_range,
+        "gpu_index": gpu_index,
+        "energy_wh": float(row["energy_wh"] or 0.0),
+        "peak_power_w": float(row["peak_power_w"] or 0.0),
+        "avg_power_w": float(row["avg_power_w"] or 0.0),
+        "samples_total": samples_total,
+        "samples_invalid": samples_invalid,
+        "insufficient_telemetry": insufficient,
+    })
+
+
 async def handle_static(request: web.Request) -> web.Response:
     """Catch-all static file serving for the legacy frontend and assets.
     Registered LAST in the route table so /api/* prefixes take precedence.
@@ -316,6 +475,7 @@ def make_app() -> web.Application:
     app.router.add_get("/api/metrics/current", handle_metrics_current)
     app.router.add_get("/api/metrics/history", handle_metrics_history)
     app.router.add_get("/api/stats/24h",       handle_stats_24h)
+    app.router.add_get("/api/stats/power",     handle_stats_power)
 
     # Static catch-all LAST.
     app.router.add_get("/{tail:.*}", handle_static)
@@ -330,6 +490,7 @@ if __name__ == "__main__":
     log.info("----------------------------------------")
     log.info("Server running on: http://localhost:8081")
     log.info("  API: /api/health, /api/version, /api/gpus")
-    log.info("       /api/metrics/current, /api/metrics/history, /api/stats/24h")
+    log.info("       /api/metrics/current, /api/metrics/history")
+    log.info("       /api/stats/24h, /api/stats/power")
     log.info("========================================")
     web.run_app(make_app(), port=8081, access_log=None)
