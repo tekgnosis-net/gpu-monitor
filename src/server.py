@@ -18,6 +18,8 @@ frontend. Routes:
     GET  /api/housekeeping/db-info            size, row count, oldest/newest, per-GPU
     POST /api/housekeeping/vacuum             run SQLite VACUUM, return freed bytes
     POST /api/housekeeping/purge              delete rows older than N days
+    POST /api/schedules/{id}/run-now          synchronously fire one report schedule
+    GET  /api/reports/preview?template=daily  render a report body for iframe preview
 
 The API reads from:
   * /app/VERSION             (single source of truth for version)
@@ -60,7 +62,7 @@ _SERVER_DIR = Path(__file__).resolve().parent
 if str(_SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(_SERVER_DIR))
 
-from reporting import crypto  # noqa: E402
+from reporting import crypto, mailer, render  # noqa: E402
 from reporting.settings import (  # noqa: E402
     DEFAULT_SETTINGS,
     Settings,
@@ -736,21 +738,233 @@ async def handle_smtp_test(request: web.Request) -> web.Response:
     saved* SMTP config. Reports success/failure inline to the Settings
     view so the user gets immediate feedback on their configuration.
 
-    Phase 6a stub: the actual mailer wrapper (`reporting.mailer`)
-    lands in a later sub-PR of Phase 6. This handler returns a 501
-    Not Implemented until then. Flagged as stubbed rather than
-    omitted so the route is registered, the URL pattern is stable,
-    and the Settings view's "Test" button has something to call
-    from day one.
+    Phase 6b real implementation: reads settings.json, decrypts
+    smtp.password_enc, builds a minimal test message via
+    mailer.build_test_message, hands it to mailer.send_message.
+
+    Recipients: by default the test sends to the configured user
+    address (same as "email yourself"). Callers can override via
+    a POST body `{"to": "alice@example.com"}` to send to a
+    different inbox — useful for verifying the relay can reach
+    external addresses without having to first set a separate
+    `user` account.
     """
     if not _origin_is_same(request):
         return web.json_response({"error": "cross-origin rejected"}, status=403)
-    return web.json_response(
-        {
-            "ok": False,
-            "error": "SMTP mailer not yet implemented",
-        },
-        status=501,
+
+    # Optional body with alternate recipient
+    override_to: str | None = None
+    if request.can_read_body:
+        try:
+            body = await request.json()
+            if isinstance(body, dict) and isinstance(body.get("to"), str):
+                override_to = body["to"]
+        except (ValueError, json.JSONDecodeError):
+            # Empty / non-JSON body is fine — we default to user=from
+            pass
+
+    data = load_settings(SETTINGS_FILE)
+    smtp = data.get("smtp", {})
+    host = smtp.get("host") or ""
+    if not host:
+        return web.json_response(
+            {
+                "ok": False,
+                "error": "SMTP host is not configured. Set it in Settings → SMTP.",
+            },
+            status=400,
+        )
+
+    from_addr = smtp.get("from") or smtp.get("user") or "gpu-monitor@localhost"
+    to_addr = override_to or smtp.get("user") or from_addr
+
+    try:
+        key = crypto.load_or_create_key(SECRET_KEY_FILE)
+        plaintext = crypto.decrypt(smtp.get("password_enc", ""), key)
+    except crypto.CryptoError as exc:
+        log.error("smtp_test: cannot decrypt password: %s", exc)
+        return web.json_response(
+            {"ok": False, "error": f"cannot decrypt stored password: {exc}"},
+            status=500,
+        )
+
+    message = mailer.build_test_message(from_addr, to_addr)
+
+    try:
+        await mailer.send_message(
+            message,
+            host=host,
+            port=int(smtp.get("port") or 587),
+            user=smtp.get("user", "") or "",
+            password=plaintext,
+            tls=smtp.get("tls") or "starttls",
+            # Tight timeout so the UI doesn't hang forever if the
+            # relay is misconfigured — users want fast feedback
+            # from a test button.
+            timeout=15.0,
+        )
+    except mailer.MailerError as exc:
+        return web.json_response(
+            {"ok": False, "error": str(exc)},
+            status=502,
+        )
+
+    return web.json_response({
+        "ok": True,
+        "to": to_addr,
+        "from": from_addr,
+        "host": host,
+    })
+
+
+async def handle_schedule_run_now(request: web.Request) -> web.Response:
+    """POST /api/schedules/{id}/run-now — synchronously render and
+    send one specific schedule's report. Used by the Report view's
+    "Run now" button.
+
+    Returns the same shape as the SMTP test on success/failure so
+    the frontend can share a single result-display component.
+    """
+    if not _origin_is_same(request):
+        return web.json_response({"error": "cross-origin rejected"}, status=403)
+
+    schedule_id = request.match_info.get("id", "")
+    if not schedule_id:
+        return web.json_response({"error": "schedule id required"}, status=400)
+
+    data = load_settings(SETTINGS_FILE)
+    schedules = data.get("schedules") or []
+    schedule = next(
+        (s for s in schedules if isinstance(s, dict) and s.get("id") == schedule_id),
+        None,
+    )
+    if schedule is None:
+        return web.json_response(
+            {"ok": False, "error": f"schedule {schedule_id!r} not found"},
+            status=404,
+        )
+
+    recipients = schedule.get("recipients") or []
+    if not recipients:
+        return web.json_response(
+            {"ok": False, "error": "schedule has no recipients"},
+            status=400,
+        )
+
+    smtp = data.get("smtp", {})
+    host = smtp.get("host") or ""
+    if not host:
+        return web.json_response(
+            {"ok": False, "error": "SMTP host is not configured"},
+            status=400,
+        )
+
+    try:
+        key = crypto.load_or_create_key(SECRET_KEY_FILE)
+        plaintext = crypto.decrypt(smtp.get("password_enc", ""), key)
+    except crypto.CryptoError as exc:
+        return web.json_response(
+            {"ok": False, "error": f"cannot decrypt password: {exc}"},
+            status=500,
+        )
+
+    version = _read_version()
+    try:
+        message = render.generate_report(
+            template=schedule.get("template", "daily"),
+            db_file=DB_FILE,
+            inventory_file=INVENTORY_FILE,
+            settings_file=SETTINGS_FILE,
+            version=version,
+        )
+    except render.RenderError as exc:
+        return web.json_response(
+            {"ok": False, "error": f"render failed: {exc}"},
+            status=500,
+        )
+
+    from_addr = smtp.get("from") or smtp.get("user") or "gpu-monitor@localhost"
+    message["From"] = from_addr
+    message["To"] = ", ".join(recipients)
+
+    try:
+        await mailer.send_message(
+            message,
+            host=host,
+            port=int(smtp.get("port") or 587),
+            user=smtp.get("user", "") or "",
+            password=plaintext,
+            tls=smtp.get("tls") or "starttls",
+            timeout=30.0,
+        )
+    except mailer.MailerError as exc:
+        return web.json_response(
+            {"ok": False, "error": str(exc)},
+            status=502,
+        )
+
+    # Update last_run_epoch in-place
+    import time
+    now_epoch = int(time.time())
+    for s in schedules:
+        if isinstance(s, dict) and s.get("id") == schedule_id:
+            s["last_run_epoch"] = now_epoch
+            break
+    data["schedules"] = schedules
+    try:
+        save_settings(SETTINGS_FILE, data)
+    except OSError as exc:
+        log.warning("run_now: could not persist last_run_epoch: %s", exc)
+
+    return web.json_response({
+        "ok": True,
+        "schedule_id": schedule_id,
+        "recipients": recipients,
+        "last_run_epoch": now_epoch,
+    })
+
+
+async def handle_report_preview(request: web.Request) -> web.Response:
+    """GET /api/reports/preview?template=daily — return the rendered
+    HTML body of a report (no images, no charts). Used by the
+    Report view's <iframe srcdoc> so the user can see roughly what
+    their scheduled email will look like before wiring up SMTP.
+
+    include_charts=False mode skips matplotlib entirely so this
+    endpoint is cheap to hit repeatedly. The iframe wouldn't
+    display cid: references anyway — it's not a MIME client.
+    """
+    template = request.query.get("template") or "daily"
+
+    try:
+        message = render.generate_report(
+            template=template,
+            db_file=DB_FILE,
+            inventory_file=INVENTORY_FILE,
+            settings_file=SETTINGS_FILE,
+            version=_read_version(),
+            include_charts=False,
+        )
+    except render.RenderError as exc:
+        return web.Response(
+            text=f"<html><body><h1>Preview failed</h1><p>{exc}</p></body></html>",
+            status=400,
+            content_type="text/html",
+        )
+
+    # Extract the HTML body from the multipart/alternative message.
+    # include_charts=False means there's no multipart/related
+    # wrapper — the text/html is a direct subpart.
+    html_body = ""
+    for part in message.walk():
+        if part.get_content_type() == "text/html":
+            html_body = part.get_content()
+            break
+
+    return web.Response(
+        text=html_body or "<html><body>No preview available.</body></html>",
+        content_type="text/html",
+        charset="utf-8",
     )
 
 
@@ -1013,6 +1227,10 @@ def make_app() -> web.Application:
     app.router.add_put ("/api/settings",           handle_put_settings)
     app.router.add_post("/api/settings/smtp/test", handle_smtp_test)
 
+    # Phase 6b — scheduled reports
+    app.router.add_post("/api/schedules/{id}/run-now", handle_schedule_run_now)
+    app.router.add_get ("/api/reports/preview",        handle_report_preview)
+
     # Phase 6.2 — housekeeping. Read-only db-info is unauthenticated;
     # vacuum/purge enforce same-origin because they mutate data.
     app.router.add_get ("/api/housekeeping/db-info", handle_db_info)
@@ -1035,5 +1253,7 @@ if __name__ == "__main__":
     log.info("       /api/metrics/current, /api/metrics/history")
     log.info("       /api/stats/24h, /api/stats/power")
     log.info("       /api/settings (GET/PUT), /api/settings/smtp/test")
+    log.info("       /api/schedules/{id}/run-now, /api/reports/preview")
+    log.info("       /api/housekeeping/{db-info, vacuum, purge}")
     log.info("========================================")
     web.run_app(make_app(), port=8081, access_log=None)
