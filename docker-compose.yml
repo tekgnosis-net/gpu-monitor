@@ -2,7 +2,9 @@ version: '3.8'
 
 services:
   gpu-monitor:
-    build: .
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
     container_name: gpu-monitor
     ports:
       - "8081:8081"

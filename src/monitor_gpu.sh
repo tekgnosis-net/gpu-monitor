@@ -32,6 +32,12 @@ DB_FILE="$HISTORY_DIR/gpu_metrics.db"
 INTERVAL=4  # Time between GPU checks (seconds)
 BUFFER_SIZE=15  # Number of readings before writing to history (15 * 4s = 1 minute)
 
+# Single source of truth for the history retention window.
+# Used by clean_old_data (DB purge) AND by export_history_json (JSON export
+# cutoff). Keep them in lockstep by deriving both from this one value.
+# Default: 3 days + 10 minutes of slack to avoid chart gaps at the edge.
+RETENTION_SECONDS=$(( 3 * 86400 + 600 ))
+
 # Debug toggle (comment out to disable debug logging)
 # DEBUG=true
 
@@ -145,17 +151,17 @@ import sys
 import os
 from datetime import datetime, timedelta
 
-def export_history_json(db_path, output_path):
+def export_history_json(db_path, output_path, retention_seconds):
     try:
         # Connect to SQLite database
         conn = sqlite3.connect(db_path)
         conn.row_factory = sqlite3.Row
+
+        # Cutoff comes from RETENTION_SECONDS passed in by the caller so there
+        # is exactly one retention value in the whole codebase.
+        cutoff_time = int(datetime.now().timestamp()) - retention_seconds
         
-        # Get current time for filtering
-        # Keep 3 days of history
-        cutoff_time = int((datetime.now() - timedelta(days=3, minutes=10)).timestamp())
-        
-        # Query the database for the last 3 days + 10 minutes of data
+        # Query the database for everything newer than the computed cutoff
         cur = conn.cursor()
         cur.execute('''
             SELECT timestamp, temperature, utilization, memory, power
@@ -198,16 +204,22 @@ def export_history_json(db_path, output_path):
             conn.close()
 
 if __name__ == "__main__":
-    if len(sys.argv) != 3:
-        print(f"Usage: {sys.argv[0]} <db_path> <output_json_path>", file=sys.stderr)
+    if len(sys.argv) != 4:
+        print(f"Usage: {sys.argv[0]} <db_path> <output_json_path> <retention_seconds>", file=sys.stderr)
         sys.exit(1)
-        
-    success = export_history_json(sys.argv[1], sys.argv[2])
+
+    try:
+        retention_seconds = int(sys.argv[3])
+    except ValueError:
+        print(f"Error: retention_seconds must be an integer, got: {sys.argv[3]!r}", file=sys.stderr)
+        sys.exit(2)
+
+    success = export_history_json(sys.argv[1], sys.argv[2], retention_seconds)
     sys.exit(0 if success else 1)
 PYTHONSCRIPT
 
     # Run the Python script to export data
-    if ! python3 /tmp/export_json.py "$DB_FILE" "$output_file"; then
+    if ! python3 /tmp/export_json.py "$DB_FILE" "$output_file" "$RETENTION_SECONDS"; then
         log_error "Failed to export history data to JSON"
         return 1
     fi
@@ -349,10 +361,11 @@ rotate_logs() {
 ###############################################################################
 function clean_old_data() {
     log_debug "Cleaning old data from SQLite database"
-    
-    # Remove data older than 3 days + 10 minutes (extended retention policy)
-    local cutoff_time=$(( $(date +%s) - 259200 - 600 ))  # 3 days (259200 seconds) + 10 minutes
-    
+
+    # Retention comes from the single RETENTION_SECONDS constant at the top
+    # of this file — keep in sync with export_history_json by design.
+    local cutoff_time=$(( $(date +%s) - RETENTION_SECONDS ))
+
     sqlite3 "$DB_FILE" <<EOF
     DELETE FROM gpu_metrics WHERE timestamp_epoch < $cutoff_time;
     VACUUM; -- Free up disk space and optimize
@@ -456,10 +469,15 @@ def process_buffer(db_path, buffer_lines):
                 power = float(parts[4]) if parts[4].strip() != 'N/A' else 0
             except (ValueError, AttributeError):
                 power = 0
-            
-            # Calculate epoch time from timestamp (assuming current year)
-            current_year = datetime.now().year
-            dt = datetime.strptime(f"{current_year} {timestamp}", "%Y %m-%d %H:%M:%S")
+
+            # Parse timestamp to epoch. New format is "%Y-%m-%d %H:%M:%S";
+            # fall back to the legacy yearless format for any stragglers in an
+            # on-disk buffer from a pre-upgrade container.
+            try:
+                dt = datetime.strptime(timestamp, "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                current_year = datetime.now().year
+                dt = datetime.strptime(f"{current_year} {timestamp}", "%Y %m-%d %H:%M:%S")
             timestamp_epoch = int(dt.timestamp())
             
             # Insert record
@@ -522,8 +540,11 @@ PYTHONSCRIPT
 update_stats() {
     local write_failed=0
     
-    # Collect current GPU metrics
-    local timestamp=$(date '+%m-%d %H:%M:%S')
+    # Collect current GPU metrics.
+    # Timestamp includes the year to avoid the year-rollover bug where buffered
+    # records were misassigned to the flush-time year (e.g. a Dec 31 23:59 reading
+    # flushed at Jan 1 00:00 would land an entire year in the future).
+    local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     local gpu_stats=$(nvidia-smi --query-gpu=temperature.gpu,utilization.gpu,memory.used,power.draw \
                      --format=csv,noheader,nounits 2>/dev/null)
     
@@ -586,8 +607,24 @@ EOF
 # Initialize the SQLite database before starting monitoring
 initialize_database
 
-# Start web server in background using Python server
-cd /app && python3 server.py &
+###############################################################################
+# run_web_server: Runs server.py in a supervised respawn loop.
+# If aiohttp dies, the bash collector would otherwise keep running silently
+# while the dashboard went dark. This wrapper logs the exit and relaunches.
+###############################################################################
+run_web_server() {
+    cd /app
+    while true; do
+        python3 server.py
+        local rc=$?
+        log_error "server.py exited with code $rc; respawning in 2s"
+        sleep 2
+    done
+}
+
+run_web_server &
+SERVER_PID=$!
+log_debug "Web server supervisor started (pid=$SERVER_PID)"
 
 ###############################################################################
 # Main Process Loop
