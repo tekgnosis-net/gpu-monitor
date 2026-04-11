@@ -136,5 +136,5 @@ first tagged release of this fork.
 - The Phase 1 migration is one-way — existing data is preserved but downgrading to a pre-Phase-1 image will fail because the old collector does not know about the new columns.
 - Hot-add/remove of GPUs in a running container is out of Phase 2 scope — `discover_gpus()` runs once at startup; a container restart is required to pick up hardware changes.
 
-[Unreleased]: https://github.com/tekgnosis-net/gpu-monitor/compare/v1.0.0...HEAD
+[Unreleased]: https://github.com/tekgnosis-net/gpu-monitor/compare/main...HEAD
 [1.0.0]: https://github.com/tekgnosis-net/gpu-monitor/releases/tag/v1.0.0
