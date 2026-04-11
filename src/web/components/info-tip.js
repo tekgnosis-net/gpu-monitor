@@ -41,6 +41,17 @@ class InfoTip extends LitElement {
         }
 
         .trigger {
+            /* Reset UA <button> styles so the inherited defaults
+             * don't fight the circular-pill design. Phase 7 switched
+             * the trigger from <span role="button"> to a real
+             * <button type="button"> for keyboard semantics; that
+             * change pulled in browser-default padding, fonts, and
+             * focus rings that need to be nulled out. */
+            padding: 0;
+            margin: 0;
+            -webkit-appearance: none;
+            appearance: none;
+
             display: inline-flex;
             align-items: center;
             justify-content: center;
@@ -95,13 +106,29 @@ class InfoTip extends LitElement {
     `;
 
     render() {
+        // Phase 7 / task #30: the trigger is a real <button> element,
+        // not a <span role="button">. Real buttons get keyboard
+        // Space/Enter activation semantics for free from the platform
+        // — the old span-with-role required custom @keydown handling
+        // (which we never added), so pressing Space on the span did
+        // nothing. <button type="button"> also participates correctly
+        // in form reset, prevents implicit submit when the info-tip
+        // lives inside a <form>, and integrates with browser dev-tool
+        // accessibility inspectors out of the box.
+        //
+        // The click handler toggles _open so a mouse user without
+        // hover (e.g. iPad Safari) can also see the tooltip. Previous
+        // behavior relied on hover-only which is a dead-end on touch.
+        const toggleOpen = () => { this._open = !this._open; };
         return html`
-            <span
+            <button
+                type="button"
                 class="trigger"
-                role="button"
-                tabindex="0"
                 aria-describedby="info-tip-body"
+                aria-expanded=${this._open ? 'true' : 'false'}
+                aria-label=${`Help: ${this.text}`}
                 title=${this.text}
+                @click=${toggleOpen}
                 @mouseenter=${() => (this._open = true)}
                 @mouseleave=${() => (this._open = false)}
                 @focus=${() => (this._open = true)}
@@ -109,7 +136,7 @@ class InfoTip extends LitElement {
                 @keydown=${(e) => {
                     if (e.key === 'Escape') this._open = false;
                 }}
-            >ⓘ</span>
+            >ⓘ</button>
             <span
                 id="info-tip-body"
                 class="tooltip ${this._open ? 'open' : ''}"

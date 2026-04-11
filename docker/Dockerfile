@@ -73,6 +73,7 @@ COPY src/web/sidebar.js     /app/
 COPY src/web/styles/       /app/styles/
 COPY src/web/components/   /app/components/
 COPY src/web/views/        /app/views/
+COPY src/web/widgets/      /app/widgets/
 COPY src/web/images/       /app/images/
 COPY src/web/sounds/       /app/sounds/
 COPY src/monitor_gpu.sh    /app/

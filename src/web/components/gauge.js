@@ -119,6 +119,30 @@ class GpuGauge extends LitElement {
         return pct;
     }
 
+    // Phase 7 / task #29: Sanitize the value before it hits
+    // aria-valuenow so screen readers never announce NaN, Infinity,
+    // or unclamped negatives / over-maxes. The visible display uses
+    // _displayValue() which has its own NaN → "—" handling; AT
+    // users need a finite number inside the ARIA progressbar
+    // contract instead. The sanitized value is clamped into
+    // [0, max] so assistive tech that computes percent internally
+    // (e.g. VoiceOver) produces matching output to the visible bar.
+    _sanitizedValue() {
+        const v = Number(this.value);
+        if (!isFinite(v)) return 0;
+        const max = Number(this.max);
+        const upperBound = isFinite(max) && max > 0 ? max : 100;
+        if (v < 0) return 0;
+        if (v > upperBound) return upperBound;
+        return v;
+    }
+
+    _sanitizedMax() {
+        const max = Number(this.max);
+        if (!isFinite(max) || max <= 0) return 100;
+        return max;
+    }
+
     _colorClass(pct) {
         if (pct >= 80) return 'danger';
         if (pct >= 50) return 'warn';
@@ -145,9 +169,9 @@ class GpuGauge extends LitElement {
             </div>
             <div class="track" role="progressbar"
                  aria-label=${this.label}
-                 aria-valuenow=${this.value}
+                 aria-valuenow=${this._sanitizedValue()}
                  aria-valuemin="0"
-                 aria-valuemax=${this.max}>
+                 aria-valuemax=${this._sanitizedMax()}>
                 <div class="fill ${colorClass}" style="width: ${pct}%"></div>
             </div>
         `;

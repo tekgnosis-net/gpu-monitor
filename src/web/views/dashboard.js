@@ -20,6 +20,7 @@
 import * as api from '../api.js';
 import '../components/gauge.js';
 import '../components/gpu-card.js';
+import { attachTablistKeyboard, markTabSelected } from '../widgets/tablist.js';
 
 const TIME_RANGES = [
     { id: '15m', label: '15m' },
@@ -70,29 +71,40 @@ function buildGpuTabs() {
     const tabs = document.createElement('div');
     tabs.className = 'tabs';
     tabs.setAttribute('role', 'tablist');
+    tabs.setAttribute('aria-label', 'Select GPU');
 
+    let initialActive = null;
     state.gpus.forEach((gpu) => {
         const btn = document.createElement('button');
         btn.textContent = `GPU ${gpu.index}`;
         btn.setAttribute('data-gpu-index', String(gpu.index));
         btn.setAttribute('role', 'tab');
-        if (gpu.index === state.selectedGpuIndex) {
-            btn.setAttribute('aria-current', 'true');
-        }
         btn.addEventListener('click', () => {
             state.selectedGpuIndex = gpu.index;
-            // Refresh the active tab highlight
-            tabs.querySelectorAll('button').forEach(b => {
-                if (b.getAttribute('data-gpu-index') === String(gpu.index)) {
-                    b.setAttribute('aria-current', 'true');
-                } else {
-                    b.removeAttribute('aria-current');
-                }
-            });
+            markTabSelected(tabs, btn);
             // Reload the history chart for the newly-selected GPU
             refreshHistory();
         });
         tabs.append(btn);
+        if (gpu.index === state.selectedGpuIndex) {
+            initialActive = btn;
+        }
+    });
+
+    // Phase 7 / task #28: full WAI-ARIA tab pattern via
+    // widgets/tablist.js — aria-selected, roving tabindex,
+    // arrow-key navigation. markTabSelected does the initial
+    // highlight + tabindex stamp; attachTablistKeyboard wires
+    // up the arrow/Home/End handling.
+    if (initialActive) markTabSelected(tabs, initialActive);
+    attachTablistKeyboard(tabs, {
+        onSelect: (targetTab) => {
+            const idx = Number(targetTab.getAttribute('data-gpu-index'));
+            if (Number.isFinite(idx)) {
+                state.selectedGpuIndex = idx;
+                refreshHistory();
+            }
+        },
     });
 
     wrapper.append(label, tabs);
@@ -126,26 +138,33 @@ function buildGpuCards(container) {
 function buildTimeRangePicker() {
     const picker = document.createElement('div');
     picker.className = 'time-range';
+    picker.setAttribute('role', 'tablist');
+    picker.setAttribute('aria-label', 'Chart time range');
 
+    let initialActive = null;
     TIME_RANGES.forEach((range) => {
         const btn = document.createElement('button');
         btn.textContent = range.label;
         btn.setAttribute('data-range', range.id);
-        if (range.id === state.timeRange) {
-            btn.setAttribute('aria-current', 'true');
-        }
+        btn.setAttribute('role', 'tab');
         btn.addEventListener('click', () => {
             state.timeRange = range.id;
-            picker.querySelectorAll('button').forEach(b => {
-                if (b.getAttribute('data-range') === range.id) {
-                    b.setAttribute('aria-current', 'true');
-                } else {
-                    b.removeAttribute('aria-current');
-                }
-            });
+            markTabSelected(picker, btn);
             refreshHistory();
         });
         picker.append(btn);
+        if (range.id === state.timeRange) initialActive = btn;
+    });
+
+    if (initialActive) markTabSelected(picker, initialActive);
+    attachTablistKeyboard(picker, {
+        onSelect: (targetTab) => {
+            const id = targetTab.getAttribute('data-range');
+            if (id) {
+                state.timeRange = id;
+                refreshHistory();
+            }
+        },
     });
 
     return picker;
