@@ -1,0 +1,345 @@
+/*
+ * Layout — shell grid, sidebar, main content, responsive breakpoints.
+ *
+ * The HTML shell is a 2-column CSS Grid:
+ *   ┌───────────┬───────────────────────┐
+ *   │           │                       │
+ *   │  sidebar  │  main                 │
+ *   │           │                       │
+ *   └───────────┴───────────────────────┘
+ *
+ * Sidebar width toggles between full (240px) and collapsed (64px) via a
+ * data-sidebar-collapsed attribute on <html>, controlled by JS in
+ * sidebar.js. The transition uses --motion-normal so the resize is
+ * smooth but skippable by users with reduced-motion preferences.
+ *
+ * At < 768px the sidebar becomes an off-canvas drawer: hidden by default,
+ * slid in from the left when data-sidebar-open="true", with a
+ * translucent scrim overlay on the main content area.
+ */
+
+* {
+    box-sizing: border-box;
+}
+
+html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: var(--font-system);
+    font-size: var(--font-size-md);
+    line-height: var(--line-height-normal);
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    min-height: 100vh;
+}
+
+body {
+    display: grid;
+    grid-template-columns: var(--sidebar-width) 1fr;
+    grid-template-rows: 1fr;
+    min-height: 100vh;
+    transition: grid-template-columns var(--motion-normal);
+}
+
+html[data-sidebar-collapsed="true"] body {
+    grid-template-columns: var(--sidebar-width-collapsed) 1fr;
+}
+
+/* ─── Sidebar ───────────────────────────────────────────────────────────── */
+
+aside.sidebar {
+    grid-column: 1;
+    background: var(--bg-secondary);
+    border-right: 1px solid var(--border-subtle);
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+    position: sticky;
+    top: 0;
+    overflow: hidden;
+    transition: width var(--motion-normal);
+}
+
+aside.sidebar .sidebar-header {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-4) var(--space-5);
+    border-bottom: 1px solid var(--border-subtle);
+    min-height: var(--header-height);
+}
+
+aside.sidebar .sidebar-header .logo {
+    width: 28px;
+    height: 28px;
+    flex-shrink: 0;
+    background: linear-gradient(135deg, var(--color-blue), var(--color-indigo));
+    border-radius: var(--radius-sm);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: white;
+    font-weight: var(--font-weight-bold);
+    font-size: var(--font-size-sm);
+}
+
+aside.sidebar .sidebar-header .title {
+    font-size: var(--font-size-md);
+    font-weight: var(--font-weight-semibold);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+html[data-sidebar-collapsed="true"] aside.sidebar .sidebar-header .title {
+    display: none;
+}
+
+/* Navigation list */
+aside.sidebar nav {
+    flex: 1;
+    padding: var(--space-3) var(--space-2);
+    display: flex;
+    flex-direction: column;
+    gap: var(--space-1);
+    overflow-y: auto;
+}
+
+aside.sidebar nav a {
+    display: flex;
+    align-items: center;
+    gap: var(--space-3);
+    padding: var(--space-3) var(--space-3);
+    border-radius: var(--radius-md);
+    color: var(--text-secondary);
+    text-decoration: none;
+    font-size: var(--font-size-md);
+    font-weight: var(--font-weight-medium);
+    transition: background var(--motion-fast), color var(--motion-fast);
+    white-space: nowrap;
+    overflow: hidden;
+}
+
+aside.sidebar nav a:hover {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+}
+
+aside.sidebar nav a[aria-current="page"] {
+    background: var(--accent);
+    color: var(--text-on-accent);
+}
+
+aside.sidebar nav a .icon {
+    flex-shrink: 0;
+    width: 20px;
+    height: 20px;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    line-height: 1;
+}
+
+html[data-sidebar-collapsed="true"] aside.sidebar nav a .label {
+    display: none;
+}
+
+html[data-sidebar-collapsed="true"] aside.sidebar nav a {
+    justify-content: center;
+    padding: var(--space-3) 0;
+}
+
+/* Footer — version + byline */
+aside.sidebar .sidebar-footer {
+    border-top: 1px solid var(--border-subtle);
+    padding: var(--space-4) var(--space-5);
+    font-size: var(--font-size-xs);
+    color: var(--text-tertiary);
+    line-height: var(--line-height-loose);
+}
+
+aside.sidebar .sidebar-footer .version {
+    font-family: var(--font-mono);
+    color: var(--text-secondary);
+}
+
+aside.sidebar .sidebar-footer .byline {
+    display: block;
+    margin-top: var(--space-1);
+}
+
+html[data-sidebar-collapsed="true"] aside.sidebar .sidebar-footer {
+    padding: var(--space-4) var(--space-2);
+    text-align: center;
+}
+
+html[data-sidebar-collapsed="true"] aside.sidebar .sidebar-footer .byline {
+    display: none;
+}
+
+/* Collapse toggle button */
+aside.sidebar .sidebar-toggle {
+    display: block;
+    margin: var(--space-2);
+    padding: var(--space-2);
+    background: transparent;
+    border: 1px solid var(--border-subtle);
+    border-radius: var(--radius-md);
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 16px;
+    transition: background var(--motion-fast), color var(--motion-fast);
+}
+
+aside.sidebar .sidebar-toggle:hover {
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+}
+
+/* ─── Main content area ─────────────────────────────────────────────────── */
+
+main.content {
+    grid-column: 2;
+    padding: var(--space-6) var(--space-7);
+    max-width: 1400px;
+    width: 100%;
+    margin: 0 auto;
+}
+
+main.content h1 {
+    font-size: var(--font-size-3xl);
+    font-weight: var(--font-weight-bold);
+    letter-spacing: -0.02em;
+    margin: 0 0 var(--space-2) 0;
+}
+
+main.content .subtitle {
+    color: var(--text-tertiary);
+    font-size: var(--font-size-md);
+    margin-bottom: var(--space-6);
+}
+
+main.content section {
+    margin-bottom: var(--space-6);
+}
+
+main.content section h2 {
+    font-size: var(--font-size-xl);
+    font-weight: var(--font-weight-semibold);
+    margin: 0 0 var(--space-4) 0;
+}
+
+/* ─── Responsive ────────────────────────────────────────────────────────── */
+
+@media (max-width: 768px) {
+    body {
+        grid-template-columns: 1fr;
+    }
+
+    html[data-sidebar-collapsed="true"] body {
+        grid-template-columns: 1fr;
+    }
+
+    aside.sidebar {
+        position: fixed;
+        top: 0;
+        left: 0;
+        width: var(--sidebar-width);
+        z-index: 100;
+        transform: translateX(-100%);
+        transition: transform var(--motion-normal);
+        box-shadow: var(--shadow-lg);
+    }
+
+    /* Cancel the desktop "collapsed" styles on mobile. A user who
+     * collapsed the sidebar on a large screen, then opened the same
+     * session on a phone, would otherwise see an icon-only drawer with
+     * no text labels and a cramped footer — not what "open the menu"
+     * should produce. The drawer ignores collapse state and always
+     * renders at full width with all labels visible. */
+    html[data-sidebar-collapsed="true"] aside.sidebar {
+        width: var(--sidebar-width);
+    }
+    html[data-sidebar-collapsed="true"] aside.sidebar .sidebar-header .title,
+    html[data-sidebar-collapsed="true"] aside.sidebar nav a .label,
+    html[data-sidebar-collapsed="true"] aside.sidebar .sidebar-footer .byline {
+        display: initial;
+    }
+    html[data-sidebar-collapsed="true"] aside.sidebar nav a {
+        justify-content: flex-start;
+        padding: var(--space-3) var(--space-3);
+    }
+    html[data-sidebar-collapsed="true"] aside.sidebar .sidebar-footer {
+        padding: var(--space-4) var(--space-5);
+        text-align: left;
+    }
+
+    /* Hide the desktop collapse toggle in mobile drawer mode —
+     * collapse is a desktop affordance, the drawer has its own
+     * open/close semantics via the scrim + hamburger. */
+    aside.sidebar .sidebar-toggle[aria-label="Toggle sidebar"] {
+        display: none;
+    }
+
+    html[data-sidebar-open="true"] aside.sidebar {
+        transform: translateX(0);
+    }
+
+    /* Scrim overlay when sidebar drawer is open on mobile */
+    html[data-sidebar-open="true"] main.content::before {
+        content: "";
+        position: fixed;
+        inset: 0;
+        background: var(--bg-overlay);
+        z-index: 50;
+    }
+
+    main.content {
+        padding: var(--space-4);
+    }
+
+    /* Hamburger-button visible only on mobile */
+    .mobile-menu-button {
+        display: inline-flex !important;
+    }
+}
+
+.mobile-menu-button {
+    display: none;
+    position: fixed;
+    top: var(--space-4);
+    left: var(--space-4);
+    z-index: 90;
+    background: var(--bg-elevated);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid var(--border-regular);
+    border-radius: var(--radius-md);
+    padding: var(--space-2) var(--space-3);
+    cursor: pointer;
+    color: var(--text-primary);
+    font-size: 20px;
+    line-height: 1;
+    box-shadow: var(--shadow-md);
+}
+
+/* Focus rings — HIG uses a 2px inner offset ring on :focus-visible.
+ *
+ * The `:focus:not(:focus-visible)` selector only strips the outline
+ * when BOTH conditions are true: the element has focus AND the browser
+ * has decided it shouldn't show a visible ring (e.g. mouse click in
+ * a modern browser). In browsers without :focus-visible support the
+ * selector matches nothing, so the default outline stays intact —
+ * keyboard users always get a focus ring regardless of support. */
+*:focus:not(:focus-visible) {
+    outline: none;
+}
+
+*:focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 2px;
+    border-radius: var(--radius-sm);
+}
