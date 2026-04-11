@@ -15,6 +15,9 @@ frontend. Routes:
     GET  /api/settings                        current settings.json (pw redacted)
     PUT  /api/settings                        partial-merge update with validation
     POST /api/settings/smtp/test              send a test email with current config
+    GET  /api/housekeeping/db-info            size, row count, oldest/newest, per-GPU
+    POST /api/housekeeping/vacuum             run SQLite VACUUM, return freed bytes
+    POST /api/housekeeping/purge              delete rows older than N days
 
 The API reads from:
   * /app/VERSION             (single source of truth for version)
@@ -147,6 +150,20 @@ def _open_db_readonly() -> sqlite3.Connection:
     rather than relying on reviewer discipline."""
     uri = f"file:{DB_FILE}?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _open_db_readwrite() -> sqlite3.Connection:
+    """Open a read/write connection to the metrics database. Used only
+    by the Phase 6 housekeeping routes (VACUUM, purge). The collector
+    remains the only writer of measurements; these routes mutate
+    *user-triggered* housekeeping operations on the same data.
+    Longer timeout than the read-only path because VACUUM can be
+    slow on large databases — SQLite will hold a write lock the
+    whole time."""
+    uri = f"file:{DB_FILE}?mode=rw"
+    conn = sqlite3.connect(uri, uri=True, timeout=30.0)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -645,6 +662,216 @@ async def handle_smtp_test(request: web.Request) -> web.Response:
     )
 
 
+# ─── Housekeeping (Phase 6.2) ───────────────────────────────────────────────
+
+
+async def handle_db_info(request: web.Request) -> web.Response:
+    """Return a snapshot of the metrics database's physical state:
+    file size, total row count, oldest/newest sample epoch, and per-GPU
+    row counts. Used by the Settings → Housekeeping tab to show the
+    user what the container is currently storing.
+
+    The file size includes the main .db file only — the WAL / SHM
+    sidecar files from Phase 1's WAL mode are transient and their
+    size depends on recent write activity, so including them would
+    make the reported size flap.
+    """
+    try:
+        size_bytes = DB_FILE.stat().st_size if DB_FILE.exists() else 0
+    except OSError as exc:
+        log.warning("db_info: stat failed: %s", exc)
+        size_bytes = 0
+
+    try:
+        conn = _open_db_readonly()
+    except sqlite3.OperationalError as exc:
+        log.warning("db_info: cannot open DB: %s", exc)
+        return web.json_response({
+            "size_bytes": size_bytes,
+            "row_count": 0,
+            "oldest_epoch": None,
+            "newest_epoch": None,
+            "row_count_per_gpu": [],
+        })
+
+    try:
+        try:
+            summary = conn.execute("""
+                SELECT
+                    COUNT(*)             AS row_count,
+                    MIN(timestamp_epoch) AS oldest,
+                    MAX(timestamp_epoch) AS newest
+                FROM gpu_metrics
+            """).fetchone()
+            per_gpu_rows = conn.execute("""
+                SELECT gpu_index, COUNT(*) AS n
+                FROM gpu_metrics
+                GROUP BY gpu_index
+                ORDER BY gpu_index ASC
+            """).fetchall()
+        except sqlite3.OperationalError as exc:
+            log.warning("db_info: query failed: %s", exc)
+            return web.json_response({
+                "size_bytes": size_bytes,
+                "row_count": 0,
+                "oldest_epoch": None,
+                "newest_epoch": None,
+                "row_count_per_gpu": [],
+            })
+    finally:
+        conn.close()
+
+    return web.json_response({
+        "size_bytes": size_bytes,
+        "row_count": int(summary["row_count"] or 0),
+        "oldest_epoch": summary["oldest"],
+        "newest_epoch": summary["newest"],
+        "row_count_per_gpu": [
+            {"gpu_index": r["gpu_index"], "row_count": int(r["n"])}
+            for r in per_gpu_rows
+        ],
+    })
+
+
+async def handle_vacuum(request: web.Request) -> web.Response:
+    """Run SQLite VACUUM on the metrics database and return the freed
+    bytes. VACUUM rebuilds the file from scratch, compacting free
+    pages that accumulated from DELETE operations (notably
+    clean_old_data running nightly).
+
+    VACUUM requires the database to not be held in any transaction by
+    another connection, and holds an exclusive write lock for the
+    duration. On a homelab-sized DB (~100 MB) this takes a few
+    seconds; on a 1 GB+ DB it can take a minute or more. The 30 s
+    connection timeout above caps the worst case — if we can't
+    acquire the lock in 30 s we return 503 rather than hanging the
+    request forever.
+    """
+    if not _origin_is_same(request):
+        return web.json_response({"error": "cross-origin rejected"}, status=403)
+
+    try:
+        before = DB_FILE.stat().st_size if DB_FILE.exists() else 0
+    except OSError:
+        before = 0
+
+    try:
+        conn = _open_db_readwrite()
+    except sqlite3.OperationalError as exc:
+        log.warning("vacuum: cannot open DB for write: %s", exc)
+        return web.json_response(
+            {"error": "database unavailable", "detail": str(exc)},
+            status=503,
+        )
+
+    try:
+        try:
+            # VACUUM cannot run inside a transaction. isolation_level=None
+            # disables the implicit BEGIN sqlite3 normally wraps around
+            # executes — essential for VACUUM, harmless for everything
+            # else we might run here.
+            conn.isolation_level = None
+            conn.execute("VACUUM")
+        except sqlite3.OperationalError as exc:
+            log.warning("vacuum: execute failed: %s", exc)
+            return web.json_response(
+                {"error": "vacuum failed", "detail": str(exc)},
+                status=503,
+            )
+    finally:
+        conn.close()
+
+    try:
+        after = DB_FILE.stat().st_size if DB_FILE.exists() else before
+    except OSError:
+        after = before
+
+    # freed_bytes can be negative if VACUUM actually grew the file
+    # (uncommon but possible if fragmentation was minimal and the
+    # rebuilt version pads). Report the raw delta; the UI shows "0 MB
+    # freed" for non-positive deltas.
+    freed = before - after
+    return web.json_response({
+        "ok": True,
+        "size_before": before,
+        "size_after": after,
+        "freed_bytes": freed,
+    })
+
+
+async def handle_purge(request: web.Request) -> web.Response:
+    """Delete rows older than N days. Body: {"days": N} where
+    N is a positive integer. Returns the number of rows deleted.
+
+    This is the user-triggered version of the collector's nightly
+    clean_old_data, for cases where someone wants to manually reclaim
+    space without waiting for the daily sweep. Always safe: the
+    DELETE is bounded by `timestamp_epoch < (now - N days)`, so the
+    same request run twice is idempotent (the second run deletes
+    zero rows).
+    """
+    if not _origin_is_same(request):
+        return web.json_response({"error": "cross-origin rejected"}, status=403)
+
+    try:
+        body = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+
+    if not isinstance(body, dict):
+        return web.json_response({"error": "body must be a JSON object"}, status=400)
+
+    days_raw = body.get("days")
+    if not isinstance(days_raw, int) or isinstance(days_raw, bool):
+        return web.json_response(
+            {"error": "days must be a positive integer"}, status=400
+        )
+    # Upper bound: 365 (one year). Lower bound: 1 (purging with days=0
+    # would wipe everything, which the UI should never do — manual
+    # factory-reset is a different operation).
+    if days_raw < 1 or days_raw > 365:
+        return web.json_response(
+            {"error": "days must be between 1 and 365"}, status=400
+        )
+
+    cutoff_seconds = days_raw * 86400
+
+    try:
+        conn = _open_db_readwrite()
+    except sqlite3.OperationalError as exc:
+        log.warning("purge: cannot open DB for write: %s", exc)
+        return web.json_response(
+            {"error": "database unavailable", "detail": str(exc)},
+            status=503,
+        )
+
+    try:
+        try:
+            cursor = conn.execute(
+                """
+                DELETE FROM gpu_metrics
+                WHERE timestamp_epoch < (strftime('%s', 'now') - ?)
+                """,
+                (cutoff_seconds,),
+            )
+            rows_deleted = cursor.rowcount
+            conn.commit()
+        except sqlite3.OperationalError as exc:
+            log.warning("purge: execute failed: %s", exc)
+            return web.json_response(
+                {"error": "purge failed", "detail": str(exc)},
+                status=503,
+            )
+    finally:
+        conn.close()
+
+    return web.json_response({
+        "ok": True,
+        "days": days_raw,
+        "rows_deleted": int(rows_deleted or 0),
+    })
+
+
 # ─── Static ─────────────────────────────────────────────────────────────────
 
 async def handle_static(request: web.Request) -> web.Response:
@@ -693,6 +920,12 @@ def make_app() -> web.Application:
     app.router.add_get ("/api/settings",           handle_get_settings)
     app.router.add_put ("/api/settings",           handle_put_settings)
     app.router.add_post("/api/settings/smtp/test", handle_smtp_test)
+
+    # Phase 6.2 — housekeeping. Read-only db-info is unauthenticated;
+    # vacuum/purge enforce same-origin because they mutate data.
+    app.router.add_get ("/api/housekeeping/db-info", handle_db_info)
+    app.router.add_post("/api/housekeeping/vacuum",  handle_vacuum)
+    app.router.add_post("/api/housekeeping/purge",   handle_purge)
 
     # Static catch-all LAST.
     app.router.add_get("/{tail:.*}", handle_static)
