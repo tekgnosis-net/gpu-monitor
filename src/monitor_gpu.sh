@@ -916,6 +916,23 @@ def load_gpu_uuid_by_index(inventory_path):
         return {}
 
 
+def _safe_float(s, default=0.0):
+    """Parse a CSV cell to float, returning `default` for N/A-style values
+    or any non-numeric input. nvidia-smi emits '[Not Supported]' and 'N/A'
+    for missing-telemetry fields (compute-only GPUs, vGPUs, older cards
+    where the sensor isn't wired up), and a bare float() call on those
+    aborts the whole buffer flush transaction, losing every row."""
+    try:
+        if s is None:
+            return default
+        cleaned = s.strip()
+        if cleaned in ('N/A', '[N/A]', '[Not Supported]', ''):
+            return default
+        return float(cleaned)
+    except (ValueError, AttributeError):
+        return default
+
+
 def process_buffer(db_path, buffer_lines):
     # interval_s (the cadence the collector is currently running at) comes
     # from the GPU_MONITOR_INTERVAL_S env var set by the bash caller.
@@ -978,15 +995,17 @@ def process_buffer(db_path, buffer_lines):
             else:
                 continue
 
-            temperature = float(metric_parts[0])
-            utilization = float(metric_parts[1])
-            memory = float(metric_parts[2])
-
-            # Handle N/A power values
-            try:
-                power = float(metric_parts[3]) if metric_parts[3].strip() != 'N/A' else 0
-            except (ValueError, AttributeError):
-                power = 0
+            # Use _safe_float for every metric field. Previously only
+            # power had N/A-aware handling, so a temperature/utilization/
+            # memory field of 'N/A' or '[Not Supported]' would raise
+            # ValueError out of float() and abort the whole flush,
+            # losing all buffered rows. Now one bad reading defaults to
+            # 0 and the flush proceeds — partial data is better than no
+            # data for a homelab GPU monitor.
+            temperature = _safe_float(metric_parts[0])
+            utilization = _safe_float(metric_parts[1])
+            memory = _safe_float(metric_parts[2])
+            power = _safe_float(metric_parts[3])
 
             # Parse timestamp to epoch. New format is "%Y-%m-%d %H:%M:%S";
             # fall back to the legacy yearless format for any stragglers in an
@@ -1192,10 +1211,15 @@ update_stats() {
     fi
 
     # Detailed error logging for debugging any write failures.
+    # log_error reads its message from $1, not stdin, so we capture each
+    # diagnostic command's output via $(...) and pass as an argument.
+    # The `ls ... | log_error` pipeline form in earlier revisions of this
+    # code silently dropped the diagnostic because log_error never read
+    # from stdin.
     if [[ $write_failed -eq 1 ]]; then
         log_error "Buffer write details:"
-        ls -l "$BUFFER_FILE" 2>&1 | log_error
-        df -h "$(dirname "$BUFFER_FILE")" 2>&1 | log_error
+        log_error "$(ls -l "$BUFFER_FILE" 2>&1)"
+        log_error "$(df -h "$(dirname "$BUFFER_FILE")" 2>&1)"
     fi
 
     # Prefer GPU-index-0 values; fall back to first-seen if idx 0 is absent
