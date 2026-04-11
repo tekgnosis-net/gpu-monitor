@@ -136,6 +136,29 @@ CONFIG_FILE="$BASE_DIR/gpu_config.json"
 declare -gA GPU_NAMES
 declare -gA GPU_UUIDS
 declare -ga GPU_INDEXES
+
+# NVIDIA_SMI_AVAILABLE — cached at startup via `command -v nvidia-smi`.
+#
+# Dev/test environments frequently have no nvidia-smi binary at all
+# (CI runners, container unit tests, non-NVIDIA Linux boxes). Without
+# this flag, every tick of update_stats calls nvidia-smi, gets empty
+# output, returns 1, and engages the main loop's 3×1s retry backoff —
+# producing ~4 log lines per tick and ~10 seconds of wall-clock spent
+# retrying a failure that will never recover. The loop never quits
+# either, so dev environments "work" but the log files fill with
+# false-alarm ERRORs.
+#
+# The fix: at startup, run `command -v nvidia-smi` once and cache
+# the result. update_stats consults the cache — if nvidia-smi is
+# permanently unavailable, synthesize zeroed metric rows for every
+# discovered GPU and return 0, bypassing the retry loop entirely.
+# If nvidia-smi IS installed but returns empty (transient failure,
+# driver hiccup, permissions), the old retry path still engages
+# because that's the case the retry was designed for.
+#
+# Set to 0 before the detection runs; the startup block a few
+# hundred lines below flips it to 1 if the binary is found.
+NVIDIA_SMI_AVAILABLE=0
 NUM_GPUS=0
 GPU_NAME="GPU"
 GPU_UUID="legacy-unknown"
@@ -1012,18 +1035,55 @@ update_stats() {
     # Multi-GPU query: one row per attached GPU, prefixed with the GPU index
     # so rows can be disambiguated downstream. The `index` field is always
     # emitted first and the remaining field order matches Phase 1.
+    #
+    # When NVIDIA_SMI_AVAILABLE=0 (set at startup by the cache in the
+    # startup block), skip the nvidia-smi call entirely and synthesize
+    # zeroed rows for every discovered GPU. This keeps dev/CI
+    # environments quiet without false-alarm ERROR lines or 3× retry
+    # delays, while preserving the transient-failure retry path for
+    # real production hardware where nvidia-smi IS installed but
+    # occasionally hiccups.
     local gpu_stats
-    gpu_stats=$(nvidia-smi \
-        --query-gpu=index,temperature.gpu,utilization.gpu,memory.used,power.draw \
-        --format=csv,noheader,nounits 2>/dev/null)
+    if [ "$NVIDIA_SMI_AVAILABLE" -eq 1 ]; then
+        gpu_stats=$(nvidia-smi \
+            --query-gpu=index,temperature.gpu,utilization.gpu,memory.used,power.draw \
+            --format=csv,noheader,nounits 2>/dev/null)
 
-    if [[ -z "$gpu_stats" ]]; then
-        # Return 1 so the main retry loop engages its nvidia-smi-hiccup
-        # backoff (3 × 1s retries). Phase 2 initially returned 0 here
-        # which silently suppressed the retry mechanism and contradicted
-        # the "Returns: 0 on success, 1 on failure" contract.
-        log_error "Failed to get GPU stats output"
-        return 1
+        if [[ -z "$gpu_stats" ]]; then
+            # Return 1 so the main retry loop engages its nvidia-smi-hiccup
+            # backoff (3 × 1s retries). Phase 2 initially returned 0 here
+            # which silently suppressed the retry mechanism and contradicted
+            # the "Returns: 0 on success, 1 on failure" contract.
+            log_error "Failed to get GPU stats output"
+            return 1
+        fi
+    else
+        # Synthetic path: build a multi-line CSV that matches nvidia-smi's
+        # format ("index, temperature, util, mem, power" — one row per
+        # discovered GPU). Values are zero across the board so the buffer
+        # parsing loop below can process them through the exact same code
+        # path as the real-hardware case — no alternate insert path, no
+        # special-case in process_buffer, no divergence in downstream
+        # aggregations. The Phase 5 power integration correctly
+        # contributes 0 Wh per tick from these rows, and /api/stats/power
+        # already surfaces an `insufficient_telemetry: true` flag when
+        # the window has zero power samples, so the UI won't claim
+        # fake readings are real.
+        gpu_stats=""
+        local i
+        for i in "${GPU_INDEXES[@]}"; do
+            if [ -n "$gpu_stats" ]; then
+                gpu_stats+=$'\n'
+            fi
+            gpu_stats+="${i}, 0, 0, 0, 0"
+        done
+        if [ -z "$gpu_stats" ]; then
+            # Extremely defensive: discover_gpus always populates at least
+            # one synthetic entry, so GPU_INDEXES should never be empty
+            # here. If it somehow is, fall through to a single GPU 0 row
+            # rather than silently no-op'ing the tick.
+            gpu_stats="0, 0, 0, 0, 0"
+        fi
     fi
 
     # Verify buffer write access before proceeding
@@ -1119,6 +1179,24 @@ update_stats() {
 if ! command -v jq >/dev/null 2>&1; then
     log_error "jq is required to generate $CONFIG_FILE but was not found in PATH"
     exit 1
+fi
+
+# Cache nvidia-smi availability once at startup. See the comment on the
+# NVIDIA_SMI_AVAILABLE declaration for why this matters — short version:
+# dev environments without nvidia-smi shouldn't flood the logs with
+# per-tick nvidia-smi-hiccup retries for a failure that will never
+# recover. If the binary is missing, log a single synthetic-mode
+# warning at startup and let update_stats generate zeroed rows for
+# every tick. discover_gpus already has its own synthetic fallback
+# for the inventory side; this flag just extends that behavior to the
+# hot-path collector loop.
+if command -v nvidia-smi >/dev/null 2>&1; then
+    NVIDIA_SMI_AVAILABLE=1
+else
+    NVIDIA_SMI_AVAILABLE=0
+    log_warning "nvidia-smi not found in PATH — running in synthetic-metrics mode"
+    log_warning "All telemetry rows will be zeroed; this is fine for test/CI but"
+    log_warning "indicates a missing NVIDIA driver if you're running on real hardware"
 fi
 
 # Discover attached GPUs. Populates NUM_GPUS, GPU_INDEXES, GPU_NAMES,
