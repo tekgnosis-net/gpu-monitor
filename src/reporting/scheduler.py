@@ -81,7 +81,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
-from zoneinfo import ZoneInfo
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 # Allow `from reporting import ...` when launched as a standalone
 # script. Mirrors the server.py trick for the same reason — no
@@ -108,6 +108,36 @@ DEFAULT_TICK_SECONDS = 60
 DEFAULT_STOP = False  # flipped by signal handler to request graceful exit
 
 
+def _resolve_tz() -> ZoneInfo:
+    """Return a ZoneInfo object honoring the TZ environment variable,
+    falling back to UTC if the zone isn't available in the container.
+
+    The python:3.11-slim base image ships without `tzdata`, so a
+    user who runs with -e TZ=America/Los_Angeles would otherwise
+    crash the scheduler at startup with ZoneInfoNotFoundError. The
+    bash supervisor would respawn the subprocess, the subprocess
+    would crash again on the same line, and we'd be stuck in an
+    infinite respawn loop burning container resources. UTC is
+    always available because Python's zoneinfo module has a
+    hardcoded UTC fallback.
+
+    We log a warning once so the user knows why their configured
+    TZ isn't being honored — silently ignoring the setting would
+    make cron schedules fire at "wrong" times with no explanation.
+    """
+    requested = os.environ.get("TZ", "UTC")
+    try:
+        return ZoneInfo(requested)
+    except ZoneInfoNotFoundError:
+        log.warning(
+            "scheduler: TZ=%s not found (tzdata may be missing in this image); "
+            "falling back to UTC. Install tzdata in the Dockerfile to honor "
+            "local time zones.",
+            requested,
+        )
+        return ZoneInfo("UTC")
+
+
 class _SchedulerState:
     """Encapsulates the mutable running state so the main loop can
     be driven from tests without module-globals getting in the way."""
@@ -119,7 +149,7 @@ class _SchedulerState:
         self.inventory_file = base_dir / "gpu_inventory.json"
         self.version_file = base_dir / "VERSION"
         self.secret_key_file = base_dir / "history" / ".secret"
-        self.tz = ZoneInfo(os.environ.get("TZ", "UTC"))
+        self.tz = _resolve_tz()
         self.stop_requested = False
 
 
@@ -307,9 +337,35 @@ async def run_once(state: _SchedulerState, now_epoch: int | None = None) -> int:
             fired += 1
 
     if fired > 0:
-        settings_data["schedules"] = schedules
+        # CONCURRENCY: Reload the latest settings right before
+        # persisting, then patch ONLY the last_run_epoch fields
+        # of schedules we actually fired. This prevents the
+        # lost-update pattern where a user PUT /api/settings
+        # during our render+send window gets clobbered by our
+        # stale settings_data snapshot.
+        #
+        # The `fired_timestamps` dict records (schedule_id →
+        # now_epoch) pairs; we look up each fired id in the
+        # reloaded schedules list and stamp the matching entry.
+        # Schedules added/removed/edited by a concurrent writer
+        # between our initial load and now are preserved
+        # exactly — we only touch last_run_epoch on the ids we
+        # own.
+        fired_ids = {
+            s["id"]: schedules[i]["last_run_epoch"]
+            for i, s in enumerate(schedules)
+            if isinstance(s, dict)
+            and s.get("last_run_epoch") == now_epoch
+            and s.get("id")
+        }
         try:
-            save_settings(state.settings_file, settings_data)
+            latest = load_settings(state.settings_file)
+            latest_schedules = list(latest.get("schedules") or [])
+            for s in latest_schedules:
+                if isinstance(s, dict) and s.get("id") in fired_ids:
+                    s["last_run_epoch"] = fired_ids[s["id"]]
+            latest["schedules"] = latest_schedules
+            save_settings(state.settings_file, latest)
         except OSError as exc:
             log.error("scheduler: could not persist last_run_epoch: %s", exc)
 

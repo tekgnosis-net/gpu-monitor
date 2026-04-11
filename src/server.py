@@ -903,16 +903,36 @@ async def handle_schedule_run_now(request: web.Request) -> web.Response:
             status=502,
         )
 
-    # Update last_run_epoch in-place
+    # CONCURRENCY: Reload settings right before persisting so we
+    # patch ONLY the target schedule's last_run_epoch without
+    # clobbering unrelated changes a concurrent writer made while
+    # render + send were in flight. Between the earlier load_settings
+    # at the top of this handler and now, the user might have PUT
+    # an updated smtp.host via the Settings view, or the scheduler
+    # subprocess might have fired another schedule and written its
+    # own last_run_epoch. Saving our stale `data` snapshot would be
+    # a last-write-wins overwrite — the lost-update pattern.
+    #
+    # Reload-and-patch is the smallest fix: we re-read the latest
+    # on-disk state, locate the target schedule by id, stamp its
+    # last_run_epoch, and save. This is still not fully transactional
+    # (a third writer could race us between the reload and the save),
+    # but that would require file-level locking or a compare-and-swap
+    # loop which is overkill for a settings file that's mutated
+    # at most a few times per minute by hand-operated UIs. The
+    # narrow window here is "between reload and save" which is
+    # measured in microseconds.
     import time
     now_epoch = int(time.time())
-    for s in schedules:
-        if isinstance(s, dict) and s.get("id") == schedule_id:
-            s["last_run_epoch"] = now_epoch
-            break
-    data["schedules"] = schedules
     try:
-        save_settings(SETTINGS_FILE, data)
+        latest = load_settings(SETTINGS_FILE)
+        latest_schedules = list(latest.get("schedules") or [])
+        for s in latest_schedules:
+            if isinstance(s, dict) and s.get("id") == schedule_id:
+                s["last_run_epoch"] = now_epoch
+                break
+        latest["schedules"] = latest_schedules
+        save_settings(SETTINGS_FILE, latest)
     except OSError as exc:
         log.warning("run_now: could not persist last_run_epoch: %s", exc)
 
@@ -927,8 +947,8 @@ async def handle_schedule_run_now(request: web.Request) -> web.Response:
 async def handle_report_preview(request: web.Request) -> web.Response:
     """GET /api/reports/preview?template=daily — return the rendered
     HTML body of a report (no images, no charts). Used by the
-    Report view's <iframe srcdoc> so the user can see roughly what
-    their scheduled email will look like before wiring up SMTP.
+    Report view's <iframe src=...> so the user can see roughly
+    what their scheduled email will look like before wiring up SMTP.
 
     include_charts=False mode skips matplotlib entirely so this
     endpoint is cheap to hit repeatedly. The iframe wouldn't
@@ -946,8 +966,26 @@ async def handle_report_preview(request: web.Request) -> web.Response:
             include_charts=False,
         )
     except render.RenderError as exc:
+        # SECURITY: The RenderError message can embed the caller-
+        # supplied `template` query parameter (e.g. "unknown template
+        # 'evilpayload'"). Interpolating that raw into the HTML
+        # response would be a reflected-XSS vector — a crafted
+        # ?template=<script>alert(1)</script> would end up as
+        # executable script in the returned page. html.escape()
+        # converts the five XSS-relevant ASCII characters (<, >,
+        # &, ", ') to their entity form, which the browser renders
+        # as literal text. The parent <iframe sandbox> in the Report
+        # view provides defense-in-depth, but the fix belongs here
+        # at the boundary where untrusted content becomes HTML.
+        import html as html_module
+        safe_message = html_module.escape(str(exc))
         return web.Response(
-            text=f"<html><body><h1>Preview failed</h1><p>{exc}</p></body></html>",
+            text=(
+                "<html><body>"
+                "<h1>Preview failed</h1>"
+                f"<p>{safe_message}</p>"
+                "</body></html>"
+            ),
             status=400,
             content_type="text/html",
         )

@@ -23,12 +23,20 @@ RUN apt-get update && apt-get install -y \
 #                    matplotlib (PNG chart rendering for email),
 #                    croniter (cron schedule evaluation)
 #
-# Image-size cost: ~80 MB on top of the Phase 3 baseline, dominated by
-# matplotlib's numpy runtime. The alternative (SVG inline or external
-# chart rendering) was considered and rejected — matplotlib's PNG +
-# MIME multipart/related gives the best compatibility across Gmail,
-# Outlook, and Apple Mail without per-client tuning.
-RUN pip install \
+# --no-cache-dir keeps pip's download cache out of the final image
+# layer. On the Phase 6 dep set that's ~50 MB of wheels + build
+# intermediates we'd otherwise bake into the runtime image. With
+# matplotlib + numpy + lxml being the heavy hitters, the savings
+# are substantial and the trade-off (slower rebuild from scratch)
+# is invisible in practice because the layer caches across builds
+# anyway.
+#
+# Image-size cost: ~80 MB on top of the Phase 3 baseline, dominated
+# by matplotlib's numpy runtime. The alternative (SVG inline or
+# external chart rendering) was considered and rejected — matplotlib's
+# PNG + MIME multipart/related gives the best compatibility across
+# Gmail, Outlook, and Apple Mail without per-client tuning.
+RUN pip install --no-cache-dir \
     aiohttp \
     pydantic \
     cryptography \

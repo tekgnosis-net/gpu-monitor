@@ -332,6 +332,30 @@ async def test_preview_unknown_template_returns_400(client, tmp_base_full):
 
 
 @pytest.mark.asyncio
+async def test_preview_error_message_escapes_template_param(client, tmp_base_full):
+    """SECURITY: the RenderError message interpolated into the HTML
+    response must be HTML-escaped so a crafted template query param
+    can't produce reflected XSS. Send a payload containing < > and
+    'script' — the response must contain the escaped entity form,
+    NOT the raw angle brackets.
+    """
+    # Use URL encoding so aiohttp passes the raw angle brackets through
+    # to the query string.
+    from urllib.parse import quote
+    payload = "<script>alert('xss')</script>"
+    resp = await client.get(f"/api/reports/preview?template={quote(payload)}")
+    assert resp.status == 400
+    body = await resp.text()
+
+    # The raw payload must NOT appear in the response — that would
+    # mean the browser will execute it
+    assert "<script>alert" not in body
+    # The escaped form (with &lt; and &gt;) SHOULD appear — proving
+    # html.escape ran
+    assert "&lt;script&gt;" in body or "&#x27;" in body or "&lt;" in body
+
+
+@pytest.mark.asyncio
 async def test_preview_defaults_to_daily(client, tmp_base_full):
     """No template parameter → daily."""
     resp = await client.get("/api/reports/preview")
