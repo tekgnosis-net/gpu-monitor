@@ -156,6 +156,15 @@ function load_settings() {
         new_flush="$default_flush"
     fi
 
+    # Cross-field coherence: the flush cadence must be at least as long as
+    # the collection cadence, otherwise BUFFER_SIZE collapses to 1 and we
+    # commit every tick. Clamping up (rather than rejecting) honours the
+    # user's intent of "as tight a flush as possible" while keeping the
+    # logged/advertised value matched to actual behaviour.
+    if [ "$new_flush" -lt "$new_interval" ]; then
+        new_flush="$new_interval"
+    fi
+
     if [ "$new_interval" != "$INTERVAL" ] || [ "$new_flush" != "$FLUSH_INTERVAL" ]; then
         # CRITICAL: flush any buffered rows BEFORE applying the new interval
         # so they get written with the cadence they were actually sampled at.
@@ -249,14 +258,27 @@ function migrate_database() {
     # Enable WAL once. WAL persists as a database attribute, so setting it
     # here is equivalent to setting it at database creation. Only log when
     # we actually change the mode — keeps no-op runs quiet.
-    local current_mode
+    #
+    # `PRAGMA journal_mode=WAL` always exits 0, but returns whatever mode
+    # SQLite actually applied. On filesystems that do not support WAL (tmpfs,
+    # some NFS configurations, FAT) it silently falls back to rollback
+    # journal mode. We capture the returned mode and warn (not fail) if it
+    # is not "wal": losing concurrent-reader scalability is a perf
+    # degradation, not a correctness issue — the collector is the only
+    # writer and the API's reads are single-row SELECTs that rollback
+    # mode handles correctly. Failing hard here would be user-hostile for
+    # ephemeral dev deployments on tmpfs.
+    local current_mode new_mode
     current_mode=$(sqlite3 -init /dev/null "$DB_FILE" "PRAGMA journal_mode;" 2>/dev/null)
     if [ "$current_mode" != "wal" ]; then
         log_warning "Migrating gpu_metrics: enabling WAL journal mode (was: ${current_mode:-unknown})"
-        sqlite3 -init /dev/null "$DB_FILE" "PRAGMA journal_mode=WAL;" >/dev/null 2>&1 || {
-            log_error "Failed to enable WAL journal mode"
+        new_mode=$(sqlite3 -init /dev/null "$DB_FILE" "PRAGMA journal_mode=WAL;" 2>/dev/null) || {
+            log_error "Failed to enable WAL journal mode (sqlite3 error)"
             return 1
         }
+        if [ "$new_mode" != "wal" ]; then
+            log_warning "WAL not supported on this filesystem; SQLite reported '${new_mode:-unknown}'. Concurrent-reader scalability will be reduced but correctness is unaffected."
+        fi
     fi
 
     # Add gpu_index if missing
@@ -898,10 +920,17 @@ EOF
 # atomic temp-file + rename so readers never see a partially-written file.
 # This runs here rather than at the top of the file because both jq and
 # safe_write_json must be available before the call.
-CONFIG_JSON=$(jq -n \
+if ! command -v jq >/dev/null 2>&1; then
+    log_error "jq is required to generate $CONFIG_FILE but was not found in PATH"
+    exit 1
+fi
+if ! CONFIG_JSON=$(jq -n \
     --arg gpu_name "$GPU_NAME" \
     --arg version "$GPU_MONITOR_VERSION" \
-    '{gpu_name: $gpu_name, version: $version}')
+    '{gpu_name: $gpu_name, version: $version}'); then
+    log_error "Failed to generate $CONFIG_FILE via jq"
+    exit 1
+fi
 safe_write_json "$CONFIG_FILE" "$CONFIG_JSON"
 
 # Run schema migrations on the existing DB (no-op on fresh installs), then
