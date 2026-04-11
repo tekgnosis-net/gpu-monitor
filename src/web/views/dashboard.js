@@ -201,6 +201,74 @@ async function refreshCurrent() {
     });
 }
 
+// Read the current theme's chart-relevant CSS custom properties into a plain
+// JS object. Chart.js cannot dereference `var(--…)` values itself, so we
+// snapshot them once per call and spread into the options tree below.
+function readThemeColors() {
+    const cs = getComputedStyle(document.documentElement);
+    const get = (name) => cs.getPropertyValue(name).trim();
+    return {
+        textPrimary:   get('--text-primary'),
+        textSecondary: get('--text-secondary'),
+        textTertiary:  get('--text-tertiary'),
+        bgSecondary:   get('--bg-secondary'),
+        borderRegular: get('--border-regular'),
+        borderSubtle:  get('--border-subtle'),
+    };
+}
+
+// Build a fresh Chart.js options object coloured with the current theme.
+// Pure function: no side effects, no DOM mutation, no Chart.js calls.
+function buildChartOptions() {
+    const c = readThemeColors();
+    return {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+            legend: {
+                position: 'top',
+                labels: {
+                    color: c.textSecondary,
+                    font: { size: 12 },
+                },
+            },
+            tooltip: {
+                backgroundColor: c.bgSecondary,
+                titleColor:      c.textPrimary,
+                bodyColor:       c.textSecondary,
+                borderColor:     c.borderRegular,
+                borderWidth: 1,
+            },
+        },
+        scales: {
+            x: {
+                ticks: {
+                    maxTicksLimit: 8,
+                    autoSkip: true,
+                    color: c.textTertiary,
+                },
+                grid: { color: c.borderSubtle },
+            },
+            y: {
+                beginAtZero: true,
+                ticks: { color: c.textTertiary },
+                grid: { color: c.borderSubtle },
+            },
+        },
+    };
+}
+
+// Re-skin the existing chart instance when the theme flips. No data refetch,
+// no network/DB hit — just walk the options tree with fresh CSS-var values
+// and let Chart.js re-render with update('none') so datasets don't animate.
+// This is the cheap alternative to calling refreshHistory() on themechange.
+function applyChartThemeOptions() {
+    if (!chartInstance) return;
+    chartInstance.options = buildChartOptions();
+    chartInstance.update('none');
+}
+
 async function refreshHistory() {
     const history = await api.getHistory(state.timeRange, state.selectedGpuIndex);
 
@@ -230,44 +298,7 @@ async function refreshHistory() {
         datasets,
     };
 
-    const options = {
-        responsive: true,
-        maintainAspectRatio: false,
-        interaction: { mode: 'index', intersect: false },
-        plugins: {
-            legend: {
-                position: 'top',
-                labels: {
-                    color: getComputedStyle(document.documentElement).getPropertyValue('--text-secondary').trim(),
-                    font: { size: 12 },
-                },
-            },
-            tooltip: {
-                backgroundColor: getComputedStyle(document.documentElement).getPropertyValue('--bg-secondary').trim(),
-                titleColor:      getComputedStyle(document.documentElement).getPropertyValue('--text-primary').trim(),
-                bodyColor:       getComputedStyle(document.documentElement).getPropertyValue('--text-secondary').trim(),
-                borderColor:     getComputedStyle(document.documentElement).getPropertyValue('--border-regular').trim(),
-                borderWidth: 1,
-            },
-        },
-        scales: {
-            x: {
-                ticks: {
-                    maxTicksLimit: 8,
-                    autoSkip: true,
-                    color: getComputedStyle(document.documentElement).getPropertyValue('--text-tertiary').trim(),
-                },
-                grid: { color: getComputedStyle(document.documentElement).getPropertyValue('--border-subtle').trim() },
-            },
-            y: {
-                beginAtZero: true,
-                ticks: {
-                    color: getComputedStyle(document.documentElement).getPropertyValue('--text-tertiary').trim(),
-                },
-                grid: { color: getComputedStyle(document.documentElement).getPropertyValue('--border-subtle').trim() },
-            },
-        },
-    };
+    const options = buildChartOptions();
 
     if (chartInstance) {
         chartInstance.data = data;
@@ -339,15 +370,19 @@ export const dashboardView = {
             refreshCurrent().catch(err => console.warn('dashboard poll failed:', err));
         }, 4000);
 
-        // Re-apply chart options on theme change so the legend /
-        // tooltip / tick colors follow the new palette. Without this,
-        // toggling the sidebar theme button leaves the chart stuck
-        // rendering in the prior theme's colors until the user
-        // happens to change the time range or GPU tab.
+        // Re-skin the chart when the theme flips so the legend / tooltip /
+        // tick colors follow the new palette. Calls applyChartThemeOptions()
+        // which rebuilds only the options tree from current CSS custom
+        // properties — no /api/metrics/history refetch, no dataset reset,
+        // no visible flicker. Without this, toggling the sidebar theme
+        // button would leave the chart stuck in the prior theme's colors
+        // until the user changed the time range or GPU tab.
         themeChangeHandler = () => {
-            refreshHistory().catch(err => {
-                console.warn('dashboard: theme-change refresh failed:', err);
-            });
+            try {
+                applyChartThemeOptions();
+            } catch (err) {
+                console.warn('dashboard: theme-change re-skin failed:', err);
+            }
         };
         window.addEventListener('themechange', themeChangeHandler);
     },

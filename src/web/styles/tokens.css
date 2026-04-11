@@ -149,11 +149,13 @@
     --shadow-lg: 0 10px 30px rgba(0, 0, 0, 0.4), 0 2px 6px rgba(0, 0, 0, 0.25);
 }
 
-/* Auto theme — when data-theme is absent OR set to "auto", fall back to
- * prefers-color-scheme. The [data-theme="auto"] selector is not strictly
- * necessary (the :root block already defines light values and the media
- * query swaps them for dark), but including it explicitly makes the
- * JavaScript theme toggle's "auto" state self-documenting. */
+/* Auto theme — when data-theme is absent, set to "auto", or set to "dark"
+ * without an explicit override, fall back to prefers-color-scheme. The
+ * :not([data-theme="light"]) selector means "anything except a user who
+ * has explicitly picked light mode", which covers both auto (no attribute
+ * or attribute="auto") and dark (attribute="dark"). The explicit
+ * [data-theme="dark"] block above wins over this media query in cases
+ * where the user has forced dark mode on a light-OS preference. */
 @media (prefers-color-scheme: dark) {
     :root:not([data-theme="light"]) {
         --bg-primary:    #000000;

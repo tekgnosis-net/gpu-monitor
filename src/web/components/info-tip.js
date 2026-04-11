@@ -54,7 +54,11 @@ class InfoTip extends LitElement {
             font-family: var(--font-system, sans-serif);
             cursor: help;
             border: 1px solid var(--border-subtle, rgba(0, 0, 0, 0.1));
-            transition: background 150ms, color 150ms;
+            /* Shared motion token — collapses to 0ms under
+             * prefers-reduced-motion via the @media block in tokens.css. */
+            transition:
+                background var(--motion-fast, 150ms linear),
+                color      var(--motion-fast, 150ms linear);
         }
 
         .trigger:hover, .trigger:focus-visible {
@@ -82,7 +86,7 @@ class InfoTip extends LitElement {
             z-index: 1000;
             pointer-events: none;
             opacity: 0;
-            transition: opacity 150ms;
+            transition: opacity var(--motion-fast, 150ms linear);
         }
 
         .tooltip.open {

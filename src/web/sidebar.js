@@ -64,7 +64,14 @@ export function toggleSidebar() {
 export function toggleMobileDrawer() {
     const root = document.documentElement;
     const open = root.getAttribute('data-sidebar-open') === 'true';
-    root.setAttribute('data-sidebar-open', open ? 'false' : 'true');
+    const next = !open;
+    root.setAttribute('data-sidebar-open', next ? 'true' : 'false');
+    // Reflect drawer state on the hamburger so AT users hear the
+    // correct expanded/collapsed announcement. The button lives in
+    // <body>, not inside <aside>, so we can't rely on a sibling
+    // selector — set the attribute directly.
+    const btn = document.querySelector('.mobile-menu-button');
+    if (btn) btn.setAttribute('aria-expanded', next ? 'true' : 'false');
 }
 
 function buildHeader() {
@@ -108,10 +115,13 @@ function buildNav() {
 
         // Close the mobile drawer when the user picks a nav item —
         // otherwise they'd land on the new view with the drawer still
-        // open over it.
+        // open over it. Also flip the hamburger's aria-expanded so
+        // assistive tech hears "collapsed" after the navigation.
         link.addEventListener('click', () => {
             if (window.matchMedia('(max-width: 768px)').matches) {
                 document.documentElement.setAttribute('data-sidebar-open', 'false');
+                const hamburger = document.querySelector('.mobile-menu-button');
+                if (hamburger) hamburger.setAttribute('aria-expanded', 'false');
             }
         });
 
@@ -189,6 +199,11 @@ export function mountMobileMenuButton(target) {
     const btn = document.createElement('button');
     btn.className = 'mobile-menu-button';
     btn.setAttribute('aria-label', 'Open navigation');
+    // aria-expanded pairs with aria-controls to tell AT that this
+    // button opens/closes the sidebar drawer. Initial state is
+    // "collapsed" — toggleMobileDrawer() flips it as the drawer opens.
+    btn.setAttribute('aria-expanded', 'false');
+    btn.setAttribute('aria-controls', 'main-sidebar');
     btn.textContent = '☰';
     btn.addEventListener('click', toggleMobileDrawer);
     (target || document.body).append(btn);

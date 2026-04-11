@@ -93,9 +93,13 @@ class GpuGauge extends LitElement {
             bottom: 0;
             border-radius: 4px;
             background: var(--success, #34c759);
+            /* Use the shared motion token so the transition collapses
+             * to 0ms for users with prefers-reduced-motion. The token
+             * packs duration + easing, so the shorthand expands to a
+             * complete transition declaration. */
             transition:
-                width 300ms cubic-bezier(0.4, 0, 0.2, 1),
-                background 300ms;
+                width var(--motion-normal, 250ms cubic-bezier(0.4, 0, 0.2, 1)),
+                background var(--motion-normal, 250ms cubic-bezier(0.4, 0, 0.2, 1));
         }
 
         .fill.warn {

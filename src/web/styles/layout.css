@@ -254,6 +254,36 @@ main.content section h2 {
         box-shadow: var(--shadow-lg);
     }
 
+    /* Cancel the desktop "collapsed" styles on mobile. A user who
+     * collapsed the sidebar on a large screen, then opened the same
+     * session on a phone, would otherwise see an icon-only drawer with
+     * no text labels and a cramped footer — not what "open the menu"
+     * should produce. The drawer ignores collapse state and always
+     * renders at full width with all labels visible. */
+    html[data-sidebar-collapsed="true"] aside.sidebar {
+        width: var(--sidebar-width);
+    }
+    html[data-sidebar-collapsed="true"] aside.sidebar .sidebar-header .title,
+    html[data-sidebar-collapsed="true"] aside.sidebar nav a .label,
+    html[data-sidebar-collapsed="true"] aside.sidebar .sidebar-footer .byline {
+        display: initial;
+    }
+    html[data-sidebar-collapsed="true"] aside.sidebar nav a {
+        justify-content: flex-start;
+        padding: var(--space-3) var(--space-3);
+    }
+    html[data-sidebar-collapsed="true"] aside.sidebar .sidebar-footer {
+        padding: var(--space-4) var(--space-5);
+        text-align: left;
+    }
+
+    /* Hide the desktop collapse toggle in mobile drawer mode —
+     * collapse is a desktop affordance, the drawer has its own
+     * open/close semantics via the scrim + hamburger. */
+    aside.sidebar .sidebar-toggle[aria-label="Toggle sidebar"] {
+        display: none;
+    }
+
     html[data-sidebar-open="true"] aside.sidebar {
         transform: translateX(0);
     }
