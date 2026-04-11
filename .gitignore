@@ -28,3 +28,8 @@ CLAUDE.md
 .remember/
 .claude/
 
+# Python bytecode caches — pytest / imports generate these in-tree.
+__pycache__/
+*.py[cod]
+*.pyo
+

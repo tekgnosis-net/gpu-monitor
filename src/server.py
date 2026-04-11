@@ -12,6 +12,9 @@ frontend. Routes:
     GET  /api/metrics/history?range=24h&gpu=0 timeseries for one GPU
     GET  /api/stats/24h                       per-GPU min/max array
     GET  /api/stats/power?range=24h&gpu=0     integrated energy + power stats
+    GET  /api/settings                        current settings.json (pw redacted)
+    PUT  /api/settings                        partial-merge update with validation
+    POST /api/settings/smtp/test              send a test email with current config
 
 The API reads from:
   * /app/VERSION             (single source of truth for version)
@@ -39,15 +42,37 @@ point; Phase 3 does not.
 import json
 import logging
 import sqlite3
+import sys
 from pathlib import Path
 
 from aiohttp import web
+
+# Allow `from reporting import ...` even when server.py is run via
+# `python3 /app/server.py` rather than as part of a package. The
+# Dockerfile lays out /app with server.py at the root and reporting/
+# as a sibling directory; adding the parent directory (BASE_DIR) to
+# sys.path mirrors how the module discovery would work if we had a
+# setup.py or pyproject.toml in the image.
+_SERVER_DIR = Path(__file__).resolve().parent
+if str(_SERVER_DIR) not in sys.path:
+    sys.path.insert(0, str(_SERVER_DIR))
+
+from reporting import crypto  # noqa: E402
+from reporting.settings import (  # noqa: E402
+    DEFAULT_SETTINGS,
+    Settings,
+    load_settings,
+    save_settings,
+)
+from pydantic import ValidationError  # noqa: E402
 
 
 BASE_DIR = Path("/app")
 VERSION_FILE = BASE_DIR / "VERSION"
 INVENTORY_FILE = BASE_DIR / "gpu_inventory.json"
 DB_FILE = BASE_DIR / "history" / "gpu_metrics.db"
+SETTINGS_FILE = BASE_DIR / "settings.json"
+SECRET_KEY_FILE = BASE_DIR / "history" / ".secret"
 SCHEMA_VERSION = 2  # Matches Phase 1 migration (gpu_index, gpu_uuid, interval_s)
 
 # Allowed `range` query parameter values and their durations in seconds.
@@ -437,6 +462,191 @@ async def handle_stats_power(request: web.Request) -> web.Response:
     })
 
 
+# ─── Settings (Phase 6) ────────────────────────────────────────────────────
+
+
+# Sentinel used by PUT /api/settings: smtp.password field semantics.
+#
+#   Field absent            → do not touch password_enc (preserve existing)
+#   Field present = null    → same as absent (explicit "no change")
+#   Field present = ""      → clear password_enc to ""
+#   Field present = "X"     → encrypt "X" and store in password_enc
+#
+# The sentinel lets clients distinguish "I didn't send this field" from
+# "I want to explicitly clear it". Without it, a PUT body containing
+# everything *except* smtp.password would have to gymnastically preserve
+# the existing ciphertext on the server side — this way the server just
+# follows the rule table above.
+
+
+def _redact_smtp_password(settings_dict: dict) -> dict:
+    """Replace `smtp.password_enc` (ciphertext) with `smtp.password_set`
+    (boolean) before sending settings to the client. The client should
+    never see the ciphertext — even though it's encrypted, leaking it
+    into browser DevTools / network logs would be an unnecessary
+    attack surface. Display the boolean "is a password configured"
+    instead, and let the user re-enter the plaintext in Settings if
+    they want to change it."""
+    redacted = json.loads(json.dumps(settings_dict))  # cheap deep copy
+    smtp = redacted.get("smtp", {})
+    password_enc = smtp.pop("password_enc", "")
+    smtp["password_set"] = bool(password_enc)
+    return redacted
+
+
+def _origin_is_same(request: web.Request) -> bool:
+    """Defense-in-depth CSRF check for mutating routes. aiohttp gives
+    us Origin and Host headers; a same-origin request has them
+    matching. Cross-origin requests (from a different host or a
+    browser tab on another domain) have an Origin that the Host
+    doesn't match, at which point we refuse. This is a LAN-only
+    defense — it doesn't help against a malicious LAN client — but
+    it costs 4 lines and prevents a drive-by click on a bookmark'd
+    IP from mutating settings."""
+    origin = request.headers.get("Origin")
+    # Origin is absent on same-origin GETs and some browser contexts.
+    # We only enforce when it's present; a None Origin is indistinguishable
+    # from a direct curl and we don't want to break that for users.
+    if not origin:
+        return True
+    host = request.headers.get("Host", "")
+    # Origin is "scheme://host[:port]"; normalize to the host portion
+    # and compare against the Host header's host portion.
+    try:
+        origin_host = origin.split("://", 1)[1]
+    except IndexError:
+        return False
+    return origin_host == host
+
+
+async def handle_get_settings(request: web.Request) -> web.Response:
+    """Return current settings with SMTP password ciphertext redacted.
+
+    Missing settings.json is a valid state — returns the DEFAULT_SETTINGS
+    shape so first-run UIs render identically to post-save UIs.
+    """
+    try:
+        data = load_settings(SETTINGS_FILE)
+    except Exception as exc:  # pragma: no cover — load_settings swallows its own errors
+        log.warning("get_settings: load failed: %s", exc)
+        data = json.loads(json.dumps(DEFAULT_SETTINGS))
+
+    return web.json_response(_redact_smtp_password(data))
+
+
+async def handle_put_settings(request: web.Request) -> web.Response:
+    """Partial-merge update: deep-merge the request body over the
+    current settings, validate via Pydantic, encrypt smtp.password
+    transition if present, atomically write.
+
+    Errors returned as JSON:
+        400 — body not JSON, or validation failure (with field detail)
+        403 — same-origin check failed
+        500 — filesystem / crypto failure
+    """
+    if not _origin_is_same(request):
+        return web.json_response({"error": "cross-origin rejected"}, status=403)
+
+    try:
+        body = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+
+    if not isinstance(body, dict):
+        return web.json_response({"error": "body must be a JSON object"}, status=400)
+
+    # Extract the SMTP password transition BEFORE the merge so the
+    # deep-merge logic doesn't have to understand the sentinel. We
+    # re-inject the encrypted form into the merged dict after
+    # validation.
+    smtp_body = body.get("smtp")
+    plaintext_password: str | None
+    clear_password = False
+    if isinstance(smtp_body, dict) and "password" in smtp_body:
+        raw = smtp_body.pop("password")
+        if raw is None:
+            plaintext_password = None   # absent / unchanged
+        elif raw == "":
+            plaintext_password = None   # still "no change to plaintext"
+            clear_password = True       # but explicitly clear the ciphertext
+        elif isinstance(raw, str):
+            plaintext_password = raw
+        else:
+            return web.json_response(
+                {"error": "smtp.password must be a string or null"}, status=400
+            )
+    else:
+        plaintext_password = None
+
+    # Deep-merge over the existing file, then validate the result.
+    from reporting.settings import _deep_merge  # local import keeps tests happy
+
+    current = load_settings(SETTINGS_FILE)
+    merged = _deep_merge(current, body)
+
+    try:
+        validated = Settings.model_validate(merged)
+    except ValidationError as exc:
+        return web.json_response(
+            {"error": "validation failed", "detail": exc.errors()},
+            status=400,
+        )
+
+    validated_dict = validated.model_dump(by_alias=True)
+
+    # Apply the SMTP password transition after validation (Pydantic
+    # doesn't know about the plaintext field, only password_enc).
+    if clear_password:
+        validated_dict.setdefault("smtp", {})["password_enc"] = ""
+    elif plaintext_password is not None:
+        try:
+            key = crypto.load_or_create_key(SECRET_KEY_FILE)
+            validated_dict.setdefault("smtp", {})["password_enc"] = crypto.encrypt(
+                plaintext_password, key
+            )
+        except crypto.CryptoError as exc:
+            log.error("put_settings: encryption failed: %s", exc)
+            return web.json_response(
+                {"error": "encryption failed", "detail": str(exc)},
+                status=500,
+            )
+
+    try:
+        save_settings(SETTINGS_FILE, validated_dict)
+    except OSError as exc:
+        log.error("put_settings: write failed: %s", exc)
+        return web.json_response(
+            {"error": "could not persist settings", "detail": str(exc)},
+            status=500,
+        )
+
+    return web.json_response(_redact_smtp_password(validated_dict))
+
+
+async def handle_smtp_test(request: web.Request) -> web.Response:
+    """Send a "Hello from GPU Monitor" test email using the *currently
+    saved* SMTP config. Reports success/failure inline to the Settings
+    view so the user gets immediate feedback on their configuration.
+
+    Phase 6.1 stub: the actual mailer lives in 6.3 so this returns a
+    501 Not Implemented until reporting.mailer is wired up. Flagged
+    as stubbed rather than omitted so the route is registered, the
+    URL pattern is stable, and the Settings view's "Test" button has
+    something to call from day one.
+    """
+    if not _origin_is_same(request):
+        return web.json_response({"error": "cross-origin rejected"}, status=403)
+    return web.json_response(
+        {
+            "ok": False,
+            "error": "SMTP mailer not yet implemented (Phase 6.3)",
+        },
+        status=501,
+    )
+
+
+# ─── Static ─────────────────────────────────────────────────────────────────
+
 async def handle_static(request: web.Request) -> web.Response:
     """Catch-all static file serving for the legacy frontend and assets.
     Registered LAST in the route table so /api/* prefixes take precedence.
@@ -477,6 +687,13 @@ def make_app() -> web.Application:
     app.router.add_get("/api/stats/24h",       handle_stats_24h)
     app.router.add_get("/api/stats/power",     handle_stats_power)
 
+    # Phase 6 — settings CRUD. GET is read-only and unauthenticated;
+    # PUT and POST routes enforce the same-origin header check via
+    # handler-level guards.
+    app.router.add_get ("/api/settings",           handle_get_settings)
+    app.router.add_put ("/api/settings",           handle_put_settings)
+    app.router.add_post("/api/settings/smtp/test", handle_smtp_test)
+
     # Static catch-all LAST.
     app.router.add_get("/{tail:.*}", handle_static)
 
@@ -492,5 +709,6 @@ if __name__ == "__main__":
     log.info("  API: /api/health, /api/version, /api/gpus")
     log.info("       /api/metrics/current, /api/metrics/history")
     log.info("       /api/stats/24h, /api/stats/power")
+    log.info("       /api/settings (GET/PUT), /api/settings/smtp/test")
     log.info("========================================")
     web.run_app(make_app(), port=8081, access_log=None)
