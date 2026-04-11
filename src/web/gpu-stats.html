@@ -964,13 +964,16 @@
                 // Timestamps are now "YYYY-MM-DD HH:MM:SS" but older rows in
                 // the DB may still be the legacy yearless "MM-DD HH:MM:SS"
                 // format until they age out of the retention window. Detect
-                // by leading "YYYY-" and fall back to prepending currentYear
-                // for legacy rows.
+                // by leading "YYYY-" and otherwise synthesize a full ISO 8601
+                // string from the legacy form so Date() parses reliably in
+                // every browser (the permissive legacy engine parser is not
+                // spec-mandated and has historically been inconsistent).
                 const parseTs = (ts) => {
                     if (/^\d{4}-\d{2}-\d{2} /.test(ts)) {
                         return new Date(ts.replace(' ', 'T'));
                     }
-                    return new Date(`${currentYear} ${ts}`);
+                    // "MM-DD HH:MM:SS" -> "YYYY-MM-DDTHH:MM:SS"
+                    return new Date(`${currentYear}-${ts.replace(' ', 'T')}`);
                 };
 
                 data.timestamps.forEach((timestamp, i) => {

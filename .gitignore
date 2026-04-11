@@ -24,6 +24,7 @@ history/*
 !history/.gitkeep
 CLAUDE.md
 
-# Session-local tooling state (Claude Code remember hook, etc.)
+# Session-local tooling state (Claude Code remember hook, runtime state, etc.)
 .remember/
+.claude/
 

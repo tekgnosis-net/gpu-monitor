@@ -161,7 +161,7 @@ def export_history_json(db_path, output_path, retention_seconds):
         # is exactly one retention value in the whole codebase.
         cutoff_time = int(datetime.now().timestamp()) - retention_seconds
         
-        # Query the database for the last 3 days + 10 minutes of data
+        # Query the database for everything newer than the computed cutoff
         cur = conn.cursor()
         cur.execute('''
             SELECT timestamp, temperature, utilization, memory, power
@@ -208,7 +208,13 @@ if __name__ == "__main__":
         print(f"Usage: {sys.argv[0]} <db_path> <output_json_path> <retention_seconds>", file=sys.stderr)
         sys.exit(1)
 
-    success = export_history_json(sys.argv[1], sys.argv[2], int(sys.argv[3]))
+    try:
+        retention_seconds = int(sys.argv[3])
+    except ValueError:
+        print(f"Error: retention_seconds must be an integer, got: {sys.argv[3]!r}", file=sys.stderr)
+        sys.exit(2)
+
+    success = export_history_json(sys.argv[1], sys.argv[2], retention_seconds)
     sys.exit(0 if success else 1)
 PYTHONSCRIPT
 
