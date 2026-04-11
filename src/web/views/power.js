@@ -1,44 +1,485 @@
 /*
- * views/power.js — Power usage view (placeholder for Phase 4).
+ * views/power.js — Power usage view.
  *
- * Phase 5 fills this view with per-GPU power graphs + kWh cost
- * approximation from an electricity rate stored in settings. Phase 4
- * only ships the sidebar entry and an empty state so navigation works.
+ * Phase 5. Per-GPU power draw, integrated energy, and electricity cost.
+ *
+ * Structure:
+ *   1. GPU picker (tabs) — only rendered when gpus.length > 1
+ *   2. Window picker — 1h / 24h / 7d / 30d buttons
+ *   3. KPI row — three tiles: energy (Wh/kWh), peak power, cost
+ *   4. Power timeseries chart for the selected GPU + window
+ *
+ * Data sources:
+ *   - /api/gpus                                            — inventory for the picker
+ *   - /api/stats/power?range=<window>&gpu=<index>          — the SUM query
+ *   - /api/metrics/history?range=<window>&gpu=<index>      — the chart series
+ *
+ * The cost calculation is `(energy_wh / 1000) * rate` where `rate` is an
+ * electricity tariff per kWh. Phase 5 stubs this at 0 with an info-tip
+ * explaining that the rate is configured in Settings — Phase 6 will add
+ * /api/settings and wire the real value in. The tile is still rendered
+ * (showing "$0.00") so users can see where the cost will appear without
+ * a placeholder wall.
+ *
+ * Chart.js instance is stored on a module-local variable, not shared
+ * with the Dashboard view, so each view tears down its own chart on
+ * unmount without stepping on the other.
  */
+
+import * as api from '../api.js';
+import '../components/info-tip.js';
+
+const WINDOWS = [
+    { id: '1h',  label: '1 h' },
+    { id: '24h', label: '24 h' },
+    { id: '7d',  label: '7 d'  },
+    { id: '30d', label: '30 d' },
+];
+
+// The Power view polls less often than the Dashboard — energy is a
+// SUM over minutes-to-days of samples, so hitting the API every 4 s
+// wastes cycles re-computing a number that barely changes. 30 s
+// strikes a balance between "see the number updating" and "don't
+// hammer the DB".
+const POLL_MS = 30_000;
+
+let chartInstance = null;
+let pollInterval = null;
+let themeChangeHandler = null;
+let state = {
+    gpus: [],
+    selectedGpuIndex: 0,
+    window: '24h',
+    // Electricity rate placeholder. Phase 6 reads this from
+    // /api/settings.power.rate_per_kwh; Phase 5 hardcodes 0 so the
+    // cost tile renders "$0.00" as a shape placeholder rather than
+    // being hidden entirely.
+    electricityRate: 0,
+    currency: '$',
+};
+
+/* ─── Formatting helpers ────────────────────────────────────────────────── */
+
+function formatEnergy(wh) {
+    // Sub-kWh: show as Wh with 0 decimals; kWh: show with 2 decimals.
+    // Matches how home electricity meters display consumption.
+    if (!Number.isFinite(wh) || wh < 0) return { value: '—', unit: 'Wh' };
+    if (wh < 1000) return { value: wh.toFixed(0), unit: 'Wh' };
+    return { value: (wh / 1000).toFixed(2), unit: 'kWh' };
+}
+
+function formatWatts(w) {
+    if (!Number.isFinite(w) || w < 0) return { value: '—', unit: 'W' };
+    return { value: w.toFixed(1), unit: 'W' };
+}
+
+function formatCost(wh, ratePerKwh, currency) {
+    if (!Number.isFinite(wh) || wh < 0) return `${currency}—`;
+    const cost = (wh / 1000) * ratePerKwh;
+    return `${currency}${cost.toFixed(2)}`;
+}
+
+/* ─── Chart theming (shared pattern with dashboard.js) ──────────────────── */
+
+function readThemeColors() {
+    const cs = getComputedStyle(document.documentElement);
+    const get = (name) => cs.getPropertyValue(name).trim();
+    return {
+        textSecondary: get('--text-secondary'),
+        textTertiary:  get('--text-tertiary'),
+        textPrimary:   get('--text-primary'),
+        bgSecondary:   get('--bg-secondary'),
+        borderRegular: get('--border-regular'),
+        borderSubtle:  get('--border-subtle'),
+    };
+}
+
+function buildChartOptions() {
+    const c = readThemeColors();
+    return {
+        responsive: true,
+        maintainAspectRatio: false,
+        interaction: { mode: 'index', intersect: false },
+        plugins: {
+            legend: {
+                position: 'top',
+                labels: { color: c.textSecondary, font: { size: 12 } },
+            },
+            tooltip: {
+                backgroundColor: c.bgSecondary,
+                titleColor:      c.textPrimary,
+                bodyColor:       c.textSecondary,
+                borderColor:     c.borderRegular,
+                borderWidth: 1,
+            },
+        },
+        scales: {
+            x: {
+                ticks: { maxTicksLimit: 8, autoSkip: true, color: c.textTertiary },
+                grid: { color: c.borderSubtle },
+            },
+            y: {
+                beginAtZero: true,
+                ticks: {
+                    color: c.textTertiary,
+                    callback: (v) => `${v} W`,
+                },
+                grid: { color: c.borderSubtle },
+            },
+        },
+    };
+}
+
+function applyChartThemeOptions() {
+    if (!chartInstance) return;
+    chartInstance.options = buildChartOptions();
+    chartInstance.update('none');
+}
+
+/* ─── DOM builders ──────────────────────────────────────────────────────── */
+
+function buildHeader() {
+    const header = document.createElement('header');
+    const h1 = document.createElement('h1');
+    h1.textContent = 'Power usage';
+    const subtitle = document.createElement('div');
+    subtitle.className = 'subtitle';
+    subtitle.textContent = 'Per-GPU power draw, integrated energy, and electricity cost';
+    header.append(h1, subtitle);
+    return header;
+}
+
+function buildGpuTabs(onSelect) {
+    if (state.gpus.length <= 1) return null;
+
+    const wrapper = document.createElement('section');
+    const label = document.createElement('div');
+    label.style.marginBottom = '12px';
+    label.style.color = 'var(--text-tertiary)';
+    label.style.fontSize = 'var(--font-size-sm)';
+    label.textContent = `${state.gpus.length} GPUs attached`;
+
+    const tabs = document.createElement('div');
+    tabs.className = 'tabs';
+    tabs.setAttribute('role', 'tablist');
+
+    state.gpus.forEach((gpu) => {
+        const btn = document.createElement('button');
+        btn.textContent = `GPU ${gpu.index}`;
+        btn.setAttribute('data-gpu-index', String(gpu.index));
+        btn.setAttribute('role', 'tab');
+        if (gpu.index === state.selectedGpuIndex) {
+            btn.setAttribute('aria-current', 'true');
+        }
+        btn.addEventListener('click', () => {
+            state.selectedGpuIndex = gpu.index;
+            tabs.querySelectorAll('button').forEach(b => {
+                if (b.getAttribute('data-gpu-index') === String(gpu.index)) {
+                    b.setAttribute('aria-current', 'true');
+                } else {
+                    b.removeAttribute('aria-current');
+                }
+            });
+            onSelect();
+        });
+        tabs.append(btn);
+    });
+
+    wrapper.append(label, tabs);
+    return wrapper;
+}
+
+function buildWindowPicker(onChange) {
+    const wrapper = document.createElement('section');
+
+    const label = document.createElement('div');
+    label.style.marginBottom = '12px';
+    label.style.color = 'var(--text-tertiary)';
+    label.style.fontSize = 'var(--font-size-sm)';
+    label.textContent = 'Integration window';
+
+    const picker = document.createElement('div');
+    picker.className = 'time-range';
+
+    WINDOWS.forEach((w) => {
+        const btn = document.createElement('button');
+        btn.textContent = w.label;
+        btn.setAttribute('data-window', w.id);
+        if (w.id === state.window) {
+            btn.setAttribute('aria-current', 'true');
+        }
+        btn.addEventListener('click', () => {
+            state.window = w.id;
+            picker.querySelectorAll('button').forEach(b => {
+                if (b.getAttribute('data-window') === w.id) {
+                    b.setAttribute('aria-current', 'true');
+                } else {
+                    b.removeAttribute('aria-current');
+                }
+            });
+            onChange();
+        });
+        picker.append(btn);
+    });
+
+    wrapper.append(label, picker);
+    return wrapper;
+}
+
+/* ─── KPI tile (reusable) ───────────────────────────────────────────────── */
+
+function buildKpiCard(id, title, infoText) {
+    const card = document.createElement('section');
+    card.className = 'card';
+    card.id = id;
+
+    const header = document.createElement('header');
+    const h3 = document.createElement('h3');
+    h3.textContent = title;
+    header.append(h3);
+
+    if (infoText) {
+        const tip = document.createElement('info-tip');
+        tip.setAttribute('text', infoText);
+        header.append(tip);
+    }
+    card.append(header);
+
+    // Big value + small unit. Inline styles keep the tile self-contained
+    // — no new CSS class needed in components.css for three tiles used
+    // in exactly one view. Phase 7 can promote this to a shared .kpi
+    // class if more views start using it.
+    const value = document.createElement('div');
+    value.className = 'value';
+    value.style.fontSize = 'var(--font-size-3xl)';
+    value.style.fontWeight = 'var(--font-weight-bold)';
+    value.style.fontVariantNumeric = 'tabular-nums';
+    value.style.color = 'var(--text-primary)';
+    value.style.lineHeight = '1.1';
+    value.textContent = '—';
+
+    const unit = document.createElement('span');
+    unit.className = 'unit';
+    unit.style.fontSize = 'var(--font-size-md)';
+    unit.style.fontWeight = 'var(--font-weight-normal)';
+    unit.style.color = 'var(--text-tertiary)';
+    unit.style.marginLeft = 'var(--space-2)';
+    value.append(unit);
+
+    const sub = document.createElement('div');
+    sub.className = 'subtitle';
+    sub.style.marginTop = 'var(--space-2)';
+    sub.style.color = 'var(--text-tertiary)';
+    sub.style.fontSize = 'var(--font-size-sm)';
+    sub.textContent = '';
+
+    card.append(value, sub);
+    return card;
+}
+
+function updateKpiCard(cardEl, displayValue, displayUnit, subtitle) {
+    const valueEl = cardEl.querySelector('.value');
+    if (!valueEl) return;
+    // Clear the text node before the <span>, preserving the unit span.
+    const unitEl = valueEl.querySelector('.unit');
+    valueEl.textContent = displayValue;
+    if (unitEl) {
+        unitEl.textContent = displayUnit || '';
+        valueEl.append(unitEl);
+    }
+    const subEl = cardEl.querySelector('.subtitle');
+    if (subEl) subEl.textContent = subtitle || '';
+}
+
+function buildChartCard() {
+    const card = document.createElement('section');
+    card.className = 'card';
+    card.id = 'power-chart-card';
+
+    const header = document.createElement('header');
+    const h3 = document.createElement('h3');
+    h3.textContent = 'Power draw';
+    const subtitle = document.createElement('div');
+    subtitle.className = 'subtitle';
+    subtitle.textContent = 'Instantaneous power over the selected window';
+
+    const left = document.createElement('div');
+    left.append(h3, subtitle);
+    header.append(left);
+    card.append(header);
+
+    const wrap = document.createElement('div');
+    wrap.className = 'chart-container';
+    const canvas = document.createElement('canvas');
+    canvas.id = 'power-history-chart';
+    wrap.append(canvas);
+    card.append(wrap);
+
+    return card;
+}
+
+/* ─── Data refresh ──────────────────────────────────────────────────────── */
+
+async function refresh() {
+    const [stats, history] = await Promise.all([
+        api.getPowerStats(state.window, state.selectedGpuIndex),
+        api.getHistory(state.window, state.selectedGpuIndex),
+    ]);
+
+    // Update KPI tiles
+    const energyCard = document.getElementById('kpi-energy');
+    const peakCard   = document.getElementById('kpi-peak');
+    const costCard   = document.getElementById('kpi-cost');
+
+    if (energyCard) {
+        const e = formatEnergy(stats.energy_wh);
+        const sub = stats.insufficient_telemetry
+            ? `${stats.samples_invalid} of ${stats.samples_total} samples missing power — lower bound`
+            : `Integrated from ${stats.samples_total} samples`;
+        updateKpiCard(energyCard, e.value, e.unit, sub);
+    }
+
+    if (peakCard) {
+        const p = formatWatts(stats.peak_power_w);
+        const avg = formatWatts(stats.avg_power_w);
+        updateKpiCard(peakCard, p.value, p.unit, `Average ${avg.value} ${avg.unit}`);
+    }
+
+    if (costCard) {
+        const cost = formatCost(stats.energy_wh, state.electricityRate, state.currency);
+        const sub = state.electricityRate > 0
+            ? `At ${state.currency}${state.electricityRate.toFixed(4)}/kWh`
+            : 'Set your electricity rate in Settings';
+        updateKpiCard(costCard, cost, '', sub);
+    }
+
+    // Update chart
+    const canvas = document.getElementById('power-history-chart');
+    if (!canvas) return;
+
+    const dataset = {
+        label: `GPU ${state.selectedGpuIndex} power (W)`,
+        data: history.power,
+        borderColor: '#af52de',
+        backgroundColor: '#af52de33',
+        borderWidth: 2,
+        pointRadius: 0,
+        tension: 0.3,
+        fill: true,
+    };
+
+    const data = { labels: history.timestamps, datasets: [dataset] };
+    const options = buildChartOptions();
+
+    if (chartInstance) {
+        chartInstance.data = data;
+        chartInstance.options = options;
+        chartInstance.update('none');
+    } else if (window.Chart) {
+        chartInstance = new window.Chart(canvas.getContext('2d'), {
+            type: 'line',
+            data,
+            options,
+        });
+    } else {
+        console.warn('power: Chart.js not available');
+    }
+}
+
+/* ─── View lifecycle ────────────────────────────────────────────────────── */
 
 export const powerView = {
     name: 'power',
 
     async mount(container) {
-        const header = document.createElement('header');
-        const h1 = document.createElement('h1');
-        h1.textContent = 'Power usage';
-        const subtitle = document.createElement('div');
-        subtitle.className = 'subtitle';
-        subtitle.textContent = 'Per-GPU power draw, energy, and electricity cost';
-        header.append(h1, subtitle);
-        container.append(header);
+        // Fetch the inventory once; it's stable per container session.
+        const fetched = await api.getGpus();
+        state.gpus = [...fetched].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+        if (state.gpus.length === 0) {
+            const empty = document.createElement('div');
+            empty.className = 'empty-state';
+            const icon = document.createElement('div');
+            icon.className = 'icon';
+            icon.textContent = '⚡';
+            const title = document.createElement('div');
+            title.className = 'title';
+            title.textContent = 'No GPUs detected';
+            const desc = document.createElement('div');
+            desc.className = 'description';
+            desc.textContent = 'The collector reported no attached NVIDIA GPUs. Power statistics require a working nvidia-smi inside the container.';
+            empty.append(icon, title, desc);
+            container.append(empty);
+            return;
+        }
 
-        const empty = document.createElement('div');
-        empty.className = 'empty-state';
+        state.selectedGpuIndex = state.gpus[0].index;
 
-        const icon = document.createElement('div');
-        icon.className = 'icon';
-        icon.textContent = '⚡';
+        // Build the static structure
+        container.append(buildHeader());
 
-        const title = document.createElement('div');
-        title.className = 'title';
-        title.textContent = 'Coming in Phase 5';
+        const gpuTabs = buildGpuTabs(() => refresh());
+        if (gpuTabs) container.append(gpuTabs);
 
-        const desc = document.createElement('div');
-        desc.className = 'description';
-        desc.textContent = 'This view will show per-GPU power trend charts, integrated energy (Wh/kWh), and a kWh-cost estimate based on an electricity rate you configure in Settings.';
+        container.append(buildWindowPicker(() => refresh()));
 
-        empty.append(icon, title, desc);
-        container.append(empty);
+        // KPI row
+        const kpiGrid = document.createElement('div');
+        kpiGrid.className = 'card-grid';
+        kpiGrid.append(
+            buildKpiCard(
+                'kpi-energy',
+                'Energy',
+                'Integrated power over the selected window. Each sample contributes power × interval_s, summed and divided by 3600. Missing-telemetry samples are excluded, so this is a lower bound when some readings were unavailable.',
+            ),
+            buildKpiCard(
+                'kpi-peak',
+                'Peak power',
+                'Highest single sample in the window, with the mean shown below. Zero-power or missing samples are excluded from both.',
+            ),
+            buildKpiCard(
+                'kpi-cost',
+                'Estimated cost',
+                'Energy × electricity rate per kWh. Set your local rate in Settings → Power. Until you do, this shows zero as a placeholder.',
+            ),
+        );
+        container.append(kpiGrid);
+
+        container.append(buildChartCard());
+
+        // Initial data fill
+        await refresh();
+
+        // Poll every POLL_MS. Longer than the dashboard because a SUM
+        // over an entire time window doesn't meaningfully change every
+        // 4 seconds — and the chart only refreshes when the window or
+        // GPU changes, which already call refresh() explicitly.
+        pollInterval = setInterval(() => {
+            refresh().catch(err => console.warn('power poll failed:', err));
+        }, POLL_MS);
+
+        // Re-skin the chart on theme flip. Cheap — no re-fetch.
+        themeChangeHandler = () => {
+            try {
+                applyChartThemeOptions();
+            } catch (err) {
+                console.warn('power: theme-change re-skin failed:', err);
+            }
+        };
+        window.addEventListener('themechange', themeChangeHandler);
     },
 
     unmount() {
-        /* no cleanup */
+        if (pollInterval) {
+            clearInterval(pollInterval);
+            pollInterval = null;
+        }
+        if (chartInstance) {
+            chartInstance.destroy();
+            chartInstance = null;
+        }
+        if (themeChangeHandler) {
+            window.removeEventListener('themechange', themeChangeHandler);
+            themeChangeHandler = null;
+        }
     },
 };

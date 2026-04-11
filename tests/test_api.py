@@ -273,3 +273,121 @@ async def test_static_path_traversal_is_rejected(client):
     # Either 403 or 404 is acceptable; we just don't want a 500 or the
     # actual contents of /etc/passwd.
     assert resp.status in (403, 404)
+
+
+# ─── Phase 5: /api/stats/power ─────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_stats_power_default_range_gpu0(client):
+    """/api/stats/power computes integrated energy for GPU 0 over 24h.
+
+    Fixture seeds 5 rows for GPU 0 at powers 280..284 W, each at 4 s
+    interval. Expected energy:
+        SUM(power * 4) / 3600
+      = 4 * (280+281+282+283+284) / 3600
+      = 4 * 1410 / 3600
+      = 5640 / 3600
+      ≈ 1.5667 Wh
+    peak = 284, avg = 282. All samples valid → insufficient=False.
+    """
+    resp = await client.get("/api/stats/power?range=24h&gpu=0")
+    assert resp.status == 200
+    data = await resp.json()
+
+    assert data["range"] == "24h"
+    assert data["gpu_index"] == 0
+    assert data["samples_total"] == 5
+    assert data["samples_invalid"] == 0
+    assert data["insufficient_telemetry"] is False
+
+    # Integrated energy — within 0.01 Wh of the analytical value
+    expected_energy = 4 * (280 + 281 + 282 + 283 + 284) / 3600.0
+    assert abs(data["energy_wh"] - expected_energy) < 0.01
+
+    assert data["peak_power_w"] == 284.0
+    assert abs(data["avg_power_w"] - 282.0) < 0.001
+
+
+@pytest.mark.asyncio
+async def test_stats_power_gpu_filter(client):
+    """?gpu=1 returns GPU 1's integration, not GPU 0's.
+
+    Fixture seeds GPU 1 at powers 150..154 W, 4 s intervals.
+    Expected energy = 4 * (150+151+152+153+154) / 3600 ≈ 0.8444 Wh.
+    """
+    resp = await client.get("/api/stats/power?range=24h&gpu=1")
+    assert resp.status == 200
+    data = await resp.json()
+
+    assert data["gpu_index"] == 1
+    expected_energy = 4 * (150 + 151 + 152 + 153 + 154) / 3600.0
+    assert abs(data["energy_wh"] - expected_energy) < 0.01
+    assert data["peak_power_w"] == 154.0
+
+
+@pytest.mark.asyncio
+async def test_stats_power_invalid_range_falls_back(client):
+    """Unknown range values fall back to 24h, matching metrics/history."""
+    resp = await client.get("/api/stats/power?range=eternity&gpu=0")
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["samples_total"] == 5  # same as 24h result
+
+
+@pytest.mark.asyncio
+async def test_stats_power_insufficient_telemetry(client, tmp_base):
+    """Adding a row with power=0 flips insufficient_telemetry to True
+    but the valid-sample integration stays correct (not corrupted).
+
+    The bad row is excluded from energy/peak/avg via the CASE WHEN
+    power > 0 guards, so the numeric result equals the all-valid case.
+    Only samples_total increments (by 1) and samples_invalid > 0.
+    """
+    db_path = tmp_base / "history" / "gpu_metrics.db"
+    conn = sqlite3.connect(str(db_path))
+    now = int(datetime.now(timezone.utc).timestamp())
+    ts_str = datetime.fromtimestamp(now, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    conn.execute(
+        """
+        INSERT INTO gpu_metrics
+        (timestamp, timestamp_epoch, temperature, utilization, memory, power,
+         gpu_index, gpu_uuid, interval_s)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 4)
+        """,
+        (
+            ts_str, now, 50.0, 10.0, 1000.0, 0.0,
+            0, "GPU-00000000-0000-0000-0000-000000000000",
+        ),
+    )
+    conn.commit()
+    conn.close()
+
+    resp = await client.get("/api/stats/power?range=24h&gpu=0")
+    assert resp.status == 200
+    data = await resp.json()
+
+    assert data["insufficient_telemetry"] is True
+    assert data["samples_invalid"] >= 1
+    assert data["samples_total"] == 6  # 5 valid + 1 invalid
+
+    # The valid-sample energy is unchanged because the bad row contributes
+    # zero via the CASE WHEN guard in the SQL.
+    expected_energy = 4 * (280 + 281 + 282 + 283 + 284) / 3600.0
+    assert abs(data["energy_wh"] - expected_energy) < 0.01
+    assert data["peak_power_w"] == 284.0  # unchanged
+
+
+@pytest.mark.asyncio
+async def test_stats_power_empty_window_gpu(client):
+    """Querying a non-existent GPU index returns zero everywhere and
+    insufficient_telemetry=True (no samples to integrate)."""
+    resp = await client.get("/api/stats/power?range=24h&gpu=99")
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["samples_total"] == 0
+    assert data["samples_invalid"] == 0
+    assert data["energy_wh"] == 0.0
+    assert data["peak_power_w"] == 0.0
+    assert data["avg_power_w"] == 0.0
+    assert data["insufficient_telemetry"] is True

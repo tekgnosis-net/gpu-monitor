@@ -76,3 +76,34 @@ export async function getStats24h() {
     const data = await _fetchJson('/stats/24h', []);
     return Array.isArray(data) ? data : [];
 }
+
+export async function getPowerStats(range = '24h', gpuIndex = 0) {
+    // Phase 5: integrated energy + peak / avg / sample counts for one GPU
+    // over a selectable window. The fallback shape matches the server
+    // handler's success shape so the view never has to null-check
+    // individual fields — it only has to check `insufficient_telemetry`.
+    const params = new URLSearchParams({ range, gpu: String(gpuIndex) });
+    const fallback = {
+        range,
+        gpu_index: gpuIndex,
+        energy_wh: 0,
+        peak_power_w: 0,
+        avg_power_w: 0,
+        samples_total: 0,
+        samples_invalid: 0,
+        insufficient_telemetry: true,
+    };
+    const data = await _fetchJson(`/stats/power?${params}`, fallback);
+    // Guard against a partial upstream response — treat missing keys as
+    // zero rather than propagating undefined into chart / formatting code.
+    return {
+        range:        data.range ?? range,
+        gpu_index:    Number.isFinite(data.gpu_index) ? data.gpu_index : gpuIndex,
+        energy_wh:    Number.isFinite(data.energy_wh)    ? data.energy_wh    : 0,
+        peak_power_w: Number.isFinite(data.peak_power_w) ? data.peak_power_w : 0,
+        avg_power_w:  Number.isFinite(data.avg_power_w)  ? data.avg_power_w  : 0,
+        samples_total:   Number.isFinite(data.samples_total)   ? data.samples_total   : 0,
+        samples_invalid: Number.isFinite(data.samples_invalid) ? data.samples_invalid : 0,
+        insufficient_telemetry: Boolean(data.insufficient_telemetry),
+    };
+}
