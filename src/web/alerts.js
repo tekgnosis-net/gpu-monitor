@@ -53,6 +53,23 @@ let thresholds = {
     notifications_enabled: false,
 };
 
+// Minimum time (in seconds) that must elapse after a fire before
+// a below-threshold poll can clear the cooldown state. The
+// comment below the usage site says "below threshold for at
+// least one poll" and that intent is preserved here: we want the
+// first real "metric dropped back" observation to clear the
+// cooldown, not an immediate sub-second jitter between the fire
+// and the next event.
+//
+// Set smaller than the default collection interval (4 s) so the
+// very next poll is eligible, but large enough to ignore
+// sub-second timing noise. If a user sets
+// collection.interval_seconds < 2, the cooldown will linger an
+// extra poll before clearing — acceptable because the cost is one
+// extra suppressed fire on an already-alerting metric, not a
+// missed alert.
+const COOLDOWN_CLEAR_GRACE_SECONDS = 2;
+
 // State per (gpu_index, metric) → last fire epoch. Keys look like
 // "0:temperature". Missing key → idle, ready to fire immediately.
 const lastFireEpoch = new Map();
@@ -140,9 +157,12 @@ export function checkMetrics(currentMetrics, gpuInventory) {
                     // Only clear if the value has been below
                     // threshold for at least one poll — flapping
                     // noise right at the boundary shouldn't
-                    // trigger instant re-fire.
+                    // trigger instant re-fire. The grace window
+                    // is the module-level COOLDOWN_CLEAR_GRACE_SECONDS
+                    // constant so the magic-number relationship to
+                    // the polling cadence is auditable in one place.
                     const lastFire = lastFireEpoch.get(stateKey);
-                    if (now - lastFire > 2) {
+                    if (now - lastFire > COOLDOWN_CLEAR_GRACE_SECONDS) {
                         lastFireEpoch.delete(stateKey);
                     }
                 }

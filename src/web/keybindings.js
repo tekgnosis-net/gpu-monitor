@@ -24,12 +24,26 @@
  * `t` while editing the SMTP hostname would toggle the theme
  * mid-keystroke. The suppression checks:
  *
- *   * document.activeElement is <input> or <textarea> or
+ *   * event target is <input>, <textarea>, or <select>, or is
  *     contenteditable
  *   * event has a modifier key (Ctrl/Alt/Meta) — reserved for
  *     browser and OS shortcuts
- *   * target element's closest <form> suggests the user is
- *     editing a form control
+ *
+ * Alphabetic key comparisons are case-INSENSITIVE — a user
+ * holding Shift or with Caps Lock on should still be able to
+ * press `g d` to navigate to Dashboard. We normalize via
+ * event.key.toLowerCase() before comparing so `'g'` and `'G'`
+ * both arm the navigation prefix, `'t'` and `'T'` both cycle
+ * the theme, etc.
+ *
+ * Focus management: the cheat-sheet overlay is a real
+ * role="dialog" aria-modal="true". On show, we save the
+ * previously-focused element and move focus into the overlay
+ * (a close button with autofocus). On hide, we restore focus
+ * to the saved element. A full Tab-focus trap is intentionally
+ * not implemented — the overlay is a read-only list with a
+ * single close affordance, so Tab-trapping would add complexity
+ * without changing the practical keyboard flow.
  *
  * Safe-DOM: the cheat-sheet overlay is built with createElement
  * + textContent — no innerHTML with dynamic content.
@@ -45,6 +59,13 @@ let navigationTimer = null;
 
 // Reference to the cheat-sheet overlay when visible; null otherwise
 let cheatSheetEl = null;
+
+// The element that had focus when the cheat sheet was opened, so
+// we can restore focus on close. Saving this up-front and
+// restoring it in hideCheatSheet() satisfies the WAI-ARIA dialog
+// pattern's focus-management expectation without implementing a
+// full Tab-focus trap (see the module header for rationale).
+let previouslyFocusedEl = null;
 
 
 function isEditingFormControl(event) {
@@ -87,7 +108,7 @@ function consumeNavigationPrefix() {
 
 const SHORTCUT_ROWS = [
     { keys: ['g', 'd'],  label: 'Go to Dashboard' },
-    { keys: ['g', 'r'],  label: 'Go to Reports' },
+    { keys: ['g', 'r'],  label: 'Go to Report' },
     { keys: ['g', 'p'],  label: 'Go to Power' },
     { keys: ['g', 's'],  label: 'Go to Settings' },
     { keys: ['t'],       label: 'Toggle theme (auto / light / dark)' },
@@ -166,9 +187,24 @@ function buildCheatSheet() {
 
     card.append(list);
 
+    // Close button — also serves as the focus target on show so
+    // Tab / Shift+Tab / Escape all have a sensible starting point
+    // for keyboard users. WAI-ARIA dialog guidance wants focus to
+    // land inside the dialog when it opens, and an explicit
+    // Close affordance is clearer than relying on ? or Escape.
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.textContent = 'Close';
+    closeBtn.style.marginTop = 'var(--space-4, 16px)';
+    closeBtn.style.display = 'block';
+    closeBtn.style.marginLeft = 'auto';
+    closeBtn.style.marginRight = 'auto';
+    closeBtn.addEventListener('click', hideCheatSheet);
+    card.append(closeBtn);
+
     const hint = document.createElement('div');
     hint.textContent = 'Press ? or Escape to close';
-    hint.style.marginTop = 'var(--space-4, 16px)';
+    hint.style.marginTop = 'var(--space-3, 12px)';
     hint.style.fontSize = 'var(--font-size-sm, 13px)';
     hint.style.color = 'var(--text-tertiary, #6e6e73)';
     hint.style.textAlign = 'center';
@@ -181,14 +217,44 @@ function buildCheatSheet() {
         if (event.target === overlay) hideCheatSheet();
     });
 
+    // Stash the close button on the overlay so showCheatSheet()
+    // can focus it without re-querying. Using a non-enumerable
+    // property to avoid polluting the element's standard shape.
+    Object.defineProperty(overlay, '_closeButton', {
+        value: closeBtn,
+        enumerable: false,
+    });
+
     return overlay;
 }
 
 
 function showCheatSheet() {
     if (cheatSheetEl) return;
+    // Save the currently-focused element BEFORE we mutate the DOM
+    // so we can restore focus on close. If nothing is focused or
+    // document.body has focus (which browsers report when no
+    // real control is focused), previouslyFocusedEl stays null
+    // and we'll skip the restore call.
+    const active = document.activeElement;
+    previouslyFocusedEl = (active && active !== document.body) ? active : null;
+
     cheatSheetEl = buildCheatSheet();
     document.body.append(cheatSheetEl);
+
+    // Move focus into the dialog. The close button is the most
+    // useful focus target because Tab/Shift+Tab cycle naturally
+    // around the surrounding page (we intentionally don't trap
+    // focus — see the module header for rationale) but Enter/
+    // Space on it triggers dismissal.
+    const closeBtn = cheatSheetEl._closeButton;
+    if (closeBtn && typeof closeBtn.focus === 'function') {
+        // requestAnimationFrame ensures the focus() call happens
+        // after the element is actually inserted into layout.
+        // Firing focus() inside the same microtask as append()
+        // can no-op on some browsers.
+        requestAnimationFrame(() => closeBtn.focus());
+    }
 }
 
 
@@ -196,6 +262,17 @@ function hideCheatSheet() {
     if (!cheatSheetEl) return;
     cheatSheetEl.remove();
     cheatSheetEl = null;
+
+    // Restore focus to whatever had it before the dialog opened.
+    // If the saved element has since been removed from the DOM
+    // (unlikely in this app but possible during hot-reload),
+    // focus() throws silently and we move on.
+    if (previouslyFocusedEl && typeof previouslyFocusedEl.focus === 'function') {
+        try {
+            previouslyFocusedEl.focus();
+        } catch { /* element was removed from the DOM — no-op */ }
+    }
+    previouslyFocusedEl = null;
 }
 
 
@@ -217,7 +294,12 @@ function handleKeyDown(event) {
     // Modifier-key combos are reserved for browser/OS shortcuts.
     if (event.ctrlKey || event.altKey || event.metaKey) return;
 
-    const key = event.key;
+    // Case-insensitive compare for alphabetic keys so Caps Lock
+    // and Shift don't break the shortcut set. `event.key` is
+    // already lowercase for punctuation and special keys (`\`,
+    // `?`, `Escape`) so the toLowerCase() is a no-op there but
+    // correctly normalizes `G` → `g`, `T` → `t`, etc.
+    const key = event.key.length === 1 ? event.key.toLowerCase() : event.key;
 
     // Navigation prefix: `g` arms the prefix. The next keypress
     // within 1000 ms interprets as a navigation target.
