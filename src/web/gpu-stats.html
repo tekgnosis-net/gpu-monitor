@@ -935,7 +935,14 @@
     }
 
     function updateChartForTimeframe(hours) {
-        fetch('history/history.json')
+        // Phase 3: swapped from static history/history.json to the
+        // /api/metrics/history endpoint. The response shape is identical
+        // (timestamps[] / temperatures[] / utilizations[] / memory[] /
+        // power[]) so the downstream client-side filter code is unchanged.
+        // We always request the 3d window and let the client-side filter
+        // do the within-timeframe slicing — matches pre-Phase-3 behaviour
+        // exactly (history.json also held 3 days of data).
+        fetch('/api/metrics/history?range=3d&gpu=0')
             .then(response => response.json())
             .then(data => {
                 if (!data || !data.timestamps || data.timestamps.length === 0) {
@@ -1095,22 +1102,30 @@
             }
         };
     
+        // Phase 3: fetch both endpoints via the new API. Response shapes:
+        //   /api/metrics/current → array of GPUs (we want [0] for legacy)
+        //   /api/stats/24h       → array of {gpu_index, stats} (we want [0].stats)
+        // Both return a non-error JSON response even on an empty DB, so the
+        // client-side defaultStats fallback only fires on a network error.
         Promise.all([
-            fetch('gpu_current_stats.json'),
-            fetch('gpu_24hr_stats.txt')
-                .then(response => {
-                    if (!response.ok) {
-                        return defaultStats;
-                    }
-                    return response.text();
-                })
-                .catch(() => defaultStats)
+            fetch('/api/metrics/current').then(r => r.json()),
+            fetch('/api/stats/24h').then(r => r.json()).catch(() => [])
         ])
-        .then(([currentResponse, statsResponse]) => {
-            return Promise.all([
-                currentResponse.json(),
-                typeof statsResponse === 'string' ? statsResponse : JSON.stringify(statsResponse)
-            ]);
+        .then(([currentArray, statsArray]) => {
+            // Pre-Phase-3 code consumed a single object for both endpoints;
+            // adapt in one place by picking the first element (GPU 0) so
+            // the downstream render logic stays unchanged.
+            const currentData = Array.isArray(currentArray) && currentArray.length > 0
+                ? currentArray[0]
+                : { timestamp: '', temperature: 0, utilization: 0, memory: 0, power: 0 };
+            const statsObj = Array.isArray(statsArray) && statsArray.length > 0
+                ? statsArray[0]
+                : defaultStats;
+            // The downstream code expects a JSON-string named statsText
+            // because pre-Phase-3 it was a text response from the .txt file.
+            // Re-serialize to preserve that contract with zero downstream
+            // changes.
+            return [currentData, JSON.stringify(statsObj)];
         })
         .then(([currentData, statsText]) => {
             // Update current metrics
