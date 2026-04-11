@@ -1,14 +1,28 @@
-name: Docker Build and Publish
+name: Docker Build and Publish (main dev builds)
+
+# Phase 8 rewrite: this workflow is now scoped to DEV builds only.
+# It fires on every push to main and produces two floating tags on
+# GHCR:
+#   ghcr.io/<owner>/gpu-monitor:main        — rolling pointer to the
+#                                              latest main build
+#   ghcr.io/<owner>/gpu-monitor:main-<sha>  — immutable per-commit tag
+#
+# Official release builds (semver tags, :latest pointer) are
+# produced by a separate workflow — see .github/workflows/release.yml
+# — which fires on v*.*.* git tags written by release-please.
+#
+# Docker Hub has been dropped from this repo's publish pipeline.
+# The upstream bigsk1/gpu-monitor still publishes there; this fork
+# publishes exclusively to GHCR. Users pulling `bigsk1/gpu-monitor`
+# from Docker Hub should see this repo's README "Upgrading from
+# bigsk1/gpu-monitor" section for migration guidance.
 
 on:
   push:
     branches: [ main ]
-  release:
-    types: [ published ]
 
 env:
   GHCR_IMAGE: ghcr.io/${{ github.repository }}
-  DOCKER_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/gpu-monitor
 
 jobs:
   build-and-push:
@@ -28,8 +42,15 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
+          # Pin BuildKit to a specific version — same rationale as
+          # release.yml. Dev builds don't strictly need the same
+          # reproducibility guarantee as release builds, but keeping
+          # both workflows on the same pinned version means an
+          # issue that surfaces on `:main` is easy to reproduce
+          # on the eventual `release.yml` run without guessing
+          # which BuildKit version was used.
           driver-opts: |
-            image=moby/buildkit:latest
+            image=moby/buildkit:v0.13.2
 
       - name: Login to GitHub Container Registry
         uses: docker/login-action@v3
@@ -38,23 +59,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v3
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Extract metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: |
             ${{ env.GHCR_IMAGE }}
-            ${{ env.DOCKER_IMAGE }}
+          # Dev-build tags:
+          #   - `type=ref,event=branch` → `main`
+          #   - `type=sha,prefix=main-` → `main-abc1234` (immutable per commit)
+          # The rolling `:main` pointer always tracks the latest successful
+          # build on the default branch; the `:main-<sha>` immutable tag
+          # lets users pin a specific dev build for rollback without
+          # depending on the floating pointer.
           tags: |
             type=ref,event=branch
-            type=raw,value=latest,enable={{is_default_branch}}
-            type=sha,prefix={{date 'YYYYMMDD'}}-
+            type=sha,prefix=main-
           labels: |
             org.opencontainers.image.title=GPU Monitor
             org.opencontainers.image.description=Real-time NVIDIA GPU monitoring dashboard
@@ -64,6 +84,9 @@ jobs:
         id: version
         # Reads the tracked VERSION file from the repo (not untrusted input)
         # and exposes it as a step output for the build-args stanza below.
+        # For main dev builds, VERSION contains "X.Y.Z-dev" between
+        # releases (release-please rewrites it to "X.Y.Z" inside its
+        # auto-generated release PR).
         run: |
           printf 'app_version=%s\n' "$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
 
@@ -82,21 +105,3 @@ jobs:
           provenance: mode=max
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-      - name: Export SBOM
-        run: |
-          mkdir -p sbom
-          # Wait a moment for the image to be available
-          sleep 10
-          DIGEST=$(docker buildx imagetools inspect ${{ env.GHCR_IMAGE }}:main --raw)
-          echo "Image digest: $DIGEST"
-          docker buildx imagetools inspect ${{ env.GHCR_IMAGE }}@$DIGEST \
-            --format '{{ json .SBOM }}' > sbom/bom.json || echo "SBOM export failed but continuing"
-
-      # Optional: Upload SBOM
-      - name: Upload SBOM
-        uses: actions/upload-artifact@v4
-        with:
-          name: sbom
-          path: sbom/bom.json
-          retention-days: 5

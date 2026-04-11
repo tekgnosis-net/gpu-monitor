@@ -1,396 +1,413 @@
-![Docker support](https://img.shields.io/badge/docker-supported-blue)
-[![Docker Pulls](https://img.shields.io/docker/pulls/bigsk1/gpu-monitor)](https://hub.docker.com/r/bigsk1/gpu-monitor)
-[![Docker Image Size](https://img.shields.io/docker/image-size/bigsk1/gpu-monitor)](https://hub.docker.com/r/bigsk1/gpu-monitor)
+![GPU Monitor](https://img.shields.io/badge/docker-supported-blue)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
+# GPU Monitor
 
-# Nvidia GPU Dashboard
+Real-time NVIDIA GPU telemetry dashboard with multi-GPU support,
+scheduled HTML email reports, electricity-cost tracking, and a
+live Apple-HIG-themed web UI. Ships as a single Docker container.
 
-A real-time lightweight NVIDIA GPU monitoring dashboard built with Docker for easy deployment and cross-platform compatibility.
+> **This is a fork of [`bigsk1/gpu-monitor`](https://github.com/bigsk1/gpu-monitor)**
+> with enormous thanks to the original author. The upstream project
+> provided the core bash + SQLite collector, the nvidia-smi polling
+> loop, and the original HTML dashboard. This fork takes that
+> foundation and rebuilds it into a multi-GPU, multi-theme, API-first
+> tool with emailed reporting and settings persistence. See
+> [How this fork differs](#how-this-fork-differs) below.
 
-https://github.com/user-attachments/assets/cd6cbe1f-33f0-47d5-8b30-29e4d08e90b4
+---
 
+## How this fork differs
 
-##  Quick Navigation 🔍
+| Feature | Upstream `bigsk1/gpu-monitor` | This fork |
+|---|---|---|
+| GPU support | Single GPU (first card only) | Multi-GPU with per-card tabs and aggregates |
+| Frontend | Single 1,200-line HTML file with inlined CSS + JS | ES modules + Lit web components + design tokens |
+| Theme | Dark navy | Apple-HIG light + dark + auto (OS preference) |
+| Navigation | Single page | Sidebar with Dashboard / Report / Power / Settings |
+| API | Flat-file JSON served from disk | REST endpoints backed by read-only SQLite (WAL) |
+| Settings | Browser localStorage only | `/app/settings.json` with Pydantic validation + live-reload |
+| Reports | None | Scheduled HTML email with matplotlib PNG charts via SMTP |
+| Electricity cost | None | `kWh × rate` on the Power view + in emailed reports |
+| Housekeeping | Nightly collector sweep only | + UI-triggered VACUUM and manual purge endpoints |
+| Docker registry | Docker Hub | **GHCR only** (`ghcr.io/tekgnosis-net/gpu-monitor`) |
+| Versioning | Latest tag on main | Semver releases via release-please, signed images with SBOM |
 
-<details>
-  <summary>Features</summary>
+The upstream project is excellent at what it does — a drop-in
+single-GPU monitor you can run in 30 seconds. This fork trades
+that simplicity for a larger feature surface that suits multi-GPU
+homelabs, emailed usage reports, and hands-off scheduled
+deliveries. Pick the version that matches your use case.
 
-  - [Features](#features)
-
-</details>
-
-<details>
-  <summary>Prerequisites</summary>
-
-  - [Prerequisites](#prerequisites)
-
-</details>
-
-<details open>
-  <summary>Quick Start</summary>
-
-  - [Using Pre-built Image](#using-pre-built-image)
-  - [Using Docker Compose](#using-docker-compose)
-
-</details>
-
-<details open>
-  <summary>Installation Prerequisites</summary>
-
-  - [Ubuntu / Debian / WSL](#1-ubuntu--debian--wsl)
-  - [Install NVIDIA Container Toolkit](#2-install-nvidia-container-toolkit)
-  - [Configure Docker with Toolkit](#3-configure-docker-with-toolkit)
-  - [Restart Docker Daemon](#4-restart-docker-daemon)
-  - [Test Installation](#5-test-to-see-if-installed-correctly)
-
-</details>
-
-<details>
-  <summary>Building gpu-monitor from Source</summary>
-
-  - [Clone and Build the Repository](#building-gpu-monitor-from-source)
-
-</details>
-
-<details>
-  <summary>Configuration</summary>
-
-  - [Access the Dashboard](#configuration)
-
-</details>
-
-<details open>
-  <summary>Alternative Setup Method</summary>
-
-  - [Setup Script Instructions](#alternative-setup-method)
-
-</details>
-
-<details>
-  <summary>Data Persistence</summary>
-
-  - [Managing Data Persistence](#data-persistence)
-
-</details>
-
-<details>
-  <summary>Alerts</summary>
-
-  - [Configuring Alerts](#alerts)
-
-</details>
-
-<details>
-  <summary>Troubleshooting</summary>
-
-  - [Common Issues](#common-issues)
-
-</details>
-
-<details>
-  <summary>License</summary>
-
-  - [License](#license)
-
-</details>
-
+---
 
 ## Features
 
-- Real-time GPU metrics monitoring of a single GPU.
-- Interactive web dashboard
-- Historical data tracking (15m, 30m, 1h, 6h, 12h, 24h, 3d)
-- Temperature, utilization, memory, and power monitoring
-- Docker-based for easy deployment
-- Persist history between new containers
-- Real time alerts - sound and notification
-- Responsive theme for any size screen
-- Toggle gauges on or off to show metrics in graph
-- SQLite database for efficient history storage and reduced CPU usage
+### Dashboard
+- **Multi-GPU layout**: tab strip when more than one card, classic
+  single-card view otherwise
+- **Real-time gauges**: temperature / utilization / memory / power
+  per GPU, polling every 4 s (configurable 2–300 s)
+- **Historical chart**: 15 m / 30 m / 1 h / 6 h / 12 h / 24 h / 3 d / 7 d
+  time ranges, backed by SQLite WAL
+- **Apple HIG-inspired theme** with auto / light / dark mode that
+  tracks OS preference via `matchMedia`
 
-## Prerequisites
+### Power view
+- **Integrated energy** (Wh / kWh) from `SUM(power × interval_s)`
+  — correct across runtime changes to the poll interval because
+  each sample records the cadence it was captured at
+- **Peak and average power** over selectable 1 h / 24 h / 7 d / 30 d
+  windows
+- **Electricity cost tile** computed from a configurable rate per
+  kWh (currency symbol configurable too)
+- **Insufficient-telemetry warnings** when some samples had
+  missing power data, so the energy total is honest about being
+  a lower bound
 
-- Docker
-- NVIDIA GPU
-- NVIDIA Container Toolkit
-- SQLite3 (included in the container)
+### Scheduled email reports
+- **Cron-driven scheduler** subprocess supervised by the bash
+  collector. Uses `croniter.get_prev()` so a container offline
+  during a scheduled slot fires once on startup (not N times for
+  N missed days)
+- **Multipart/alternative messages** with plain-text fallback and
+  HTML body containing embedded PNG charts (temperature + power)
+  per GPU, rendered by matplotlib with Apple-HIG palette
+- **SMTP support** for STARTTLS / implicit TLS / plain, with
+  password encrypted at rest via Fernet (key in env var or
+  auto-generated in `/app/history/.secret` mode 0600)
+- **Test email** button in Settings for immediate validation
 
-## Quick Start
+### Settings
+- 8-tab form: **Collection / SMTP / Alerts / Power / Housekeeping
+  / Logging / Reports / Theme**
+- **Live-reload** for collection cadence, log rotation, and data
+  retention — changes apply on the next tick/hour/day without a
+  container restart
+- **Info-tips** on every non-obvious field with `<info-tip>` Lit
+  component
+- **Alert thresholds**: temperature / utilization / power with
+  configurable cooldown, sound, and browser Notification opt-in
+- **Database housekeeping**: live size + row count display,
+  manual VACUUM button, purge-older-than-N-days with confirmation
 
-Test to see if you already have the requirements and ready to use. 
-
-```bash
-sudo docker run --rm --runtime=nvidia --gpus all ubuntu nvidia-smi
+### API (`/api/*`)
 ```
-If this failed proceed to [Installation Prerequisites](#installation-prerequisites)
+GET  /api/health                       ok + version + schema
+GET  /api/version                      {version}
+GET  /api/gpus                         inventory with per-card metadata
+GET  /api/metrics/current              latest sample per GPU
+GET  /api/metrics/history?range=24h&gpu=0   timeseries
+GET  /api/stats/24h                    per-GPU min/max
+GET  /api/stats/power?range=24h&gpu=0  energy + peak + avg
+GET  /api/settings                     current settings (password redacted)
+PUT  /api/settings                     partial-merge update
+POST /api/settings/smtp/test           send test email
+POST /api/schedules/{id}/run-now       fire one schedule synchronously
+GET  /api/reports/preview              rendered HTML for iframe preview
+GET  /api/housekeeping/db-info         size + row count + per-GPU
+POST /api/housekeeping/vacuum          run SQLite VACUUM
+POST /api/housekeeping/purge           delete rows older than N days
+```
 
+---
 
+## Quick start
 
-### Using Pre-built Image
+### Prerequisites
+- Docker with the NVIDIA Container Toolkit installed
+  ([install guide](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/latest/install-guide.html))
+- An NVIDIA GPU with a working `nvidia-smi` on the host
+
+### Run the latest stable release
 
 ```bash
 docker run -d \
   --name gpu-monitor \
-  -p 8081:8081 \
-  -e TZ=America/Los_Angeles \
-  -v /etc/localtime:/etc/localtime:ro \
-  -v ./history:/app/history:rw \
-  -v ./logs:/app/logs:rw \
   --gpus all \
-  --restart unless-stopped \
-  bigsk1/gpu-monitor:latest
-```
-Note: Update your timezone to use the correct time
-### Using Docker Compose
-
-1. Clone the repository:
-```bash
-git clone https://github.com/bigsk1/gpu-monitor.git
-cd gpu-monitor
+  -p 8081:8081 \
+  -e TZ=Etc/UTC \
+  -v gpu-monitor-history:/app/history \
+  -v gpu-monitor-logs:/app/logs \
+  ghcr.io/tekgnosis-net/gpu-monitor:latest
 ```
 
-2. Start the container:
-```bash
-docker-compose up -d
-```
+Then open `http://<host>:8081/`.
 
-3. Access the dashboard at: [http://localhost:8081](http://localhost:8081)
+### Pin to a specific version
 
-
-
-## Installation Prerequisites
-
-
-### 1. Ubuntu / Debian / WSL  
-Windows users make sure you have wsl with docker an easy way is [Docker Desktop Installation for Windows](https://docs.docker.com/desktop/setup/install/windows-install/)
- 
-Installing with apt add NVIDIA package repositories
-
-```bash
-curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | sudo gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg \
-  && curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-    sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | \
-    sudo tee /etc/apt/sources.list.d/nvidia-container-toolkit.list
-```
-
-### 2. Install nvidia container toolkit
-
-```bash
-sudo apt-get update
-```
-```bash
-sudo apt-get install -y nvidia-container-toolkit
-```
-
-### 3. Configure Docker with toolkit
-
-```bash
-sudo nvidia-ctk runtime configure --runtime=docker
-```
-The nvidia-ctk command modifies the /etc/docker/daemon.json file on the host. The file is updated so that Docker can use the NVIDIA Container Runtime.
-
-
-### 4. Restart Docker daemon
-
-```bash
-sudo systemctl restart docker
-```
-
-### 5. Test to see if installed correctly
-
-```bash
-sudo docker run --rm --runtime=nvidia --gpus all ubuntu nvidia-smi
-```
-
-
-For other distributions, check the [official documentation](https://docs.nvidia.com/datacenter/cloud-native/container-toolkit/install-guide.html).
-
-
-## Building gpu-monitor from source
-
-1. Clone the repository:
-```bash
-git clone https://github.com/bigsk1/gpu-monitor.git
-cd gpu-monitor
-```
-
-2. Build the image:
-```bash
-docker build -t gpu-monitor .
-```
-
-3. Run the container:
 ```bash
 docker run -d \
   --name gpu-monitor \
-  -p 8081:8081 \
-  -e TZ=America/Los_Angeles \
-  -v /etc/localtime:/etc/localtime:ro \
-  -v ./history:/app/history:rw \
-  -v ./logs:/app/logs:rw \
   --gpus all \
-  --restart unless-stopped \
-  gpu-monitor
+  -p 8081:8081 \
+  ghcr.io/tekgnosis-net/gpu-monitor:1.0.0
 ```
 
-## Configuration
+Available image tags:
 
-The dashboard is accessible at: [http://localhost:8081](http://localhost:8081)
- by default. To change the port, modify the `docker-compose.yml` file or the `-p` parameter in the docker run command.
+| Tag | Points to |
+|---|---|
+| `:latest` | Most recent stable release (rolling) |
+| `:1.0.0` | Exact version (immutable) |
+| `:1.0` | Latest patch of the 1.0 minor line |
+| `:1` | Latest minor of the 1.x major line |
+| `:main` | Latest dev build from main (not guaranteed stable) |
+| `:main-<sha>` | Immutable per-commit dev build |
 
---- 
-
-![GPU Monitor Dashboard](https://imagedelivery.net/WfhVb8dSNAAvdXUdMfBuPQ/a081bac1-e86f-4833-91ad-a1d64c994200/public)
-
-
-## Alternative Setup Methods
-
-A setup script is provided for convenience. It checks prerequisites and manages the service:
-
-- If you have issues then make sure `scripts/setup.sh` is executable
-
-```bash
-chmod +x ./scripts/setup.sh
-```
-
----
-- Check prerequisites and start the service
-```bash
-./scripts/setup.sh start
-```
----
-- Stop the service
-```bash
-./scripts/setup.sh stop
-```
----
-- Restart the service
-```bash
-./scripts/setup.sh restart
-```
----
-- Check service status
-```bash
-./scripts/setup.sh status
-```
----
-- View logs
-```bash
-./scripts/setup.sh logs
-```
-
-Example of script running
-```bash
-~/gpu-monitor ./scripts/setup.sh start
-[+] Checking prerequisites...
-[+] Docker: Found
-[+] Docker Compose: Found
-[+] NVIDIA Docker Runtime: Found
-[+] NVIDIA GPU: Found
-[+] Starting GPU Monitor...
-Creating network "gpu-monitor_default" with the default driver
-Creating gpu-monitor ... done
-[+] GPU Monitor started successfully!
-[+] Dashboard available at: http://localhost:8081
-[+] To check logs: docker-compose logs -f
-```
-
-
-## Data Persistence
-
-By default, all data is stored within the container will persist between container rebuilds, if you don't want that then remove volumes, modify the docker run or docker-compose.yml:
+### Docker Compose
 
 ```yaml
 services:
   gpu-monitor:
-    # ... other settings ...
+    image: ghcr.io/tekgnosis-net/gpu-monitor:latest
+    container_name: gpu-monitor
+    ports:
+      - "8081:8081"
     volumes:
-      - ./history:/app/history:rw    # Persists historical data and SQLite database
-      - ./logs:/app/logs:rw    # Persists logs
+      - gpu-monitor-history:/app/history
+      - gpu-monitor-logs:/app/logs
+    environment:
+      - TZ=Etc/UTC
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  gpu-monitor-history:
+  gpu-monitor-logs:
 ```
 
-The `:rw` flag explicitly sets read/write permissions, which is important when running containers on different hosts or network environments.
+---
 
-The application uses SQLite database (gpu_metrics.db) stored in the history directory for efficient storage of historical metrics. Both the database file and the history.json file (which is generated from the database) are persisted through the volume mounts. This ensures data continuity across container restarts or rebuilds.
+## Configuration
 
-### Viewing the Database
+All user-facing configuration lives in `/app/settings.json` inside
+the container and is managed via the **Settings** page of the web
+UI. The file is created on first launch with sensible defaults
+matching the pre-v1.0.0 container's behavior, so a fresh install
+needs no configuration to start working.
 
-For developers who want to inspect the SQLite database, we recommend using the "SQLite Viewer" extension:
-- VSCode/Cursor: [SQLite Viewer Extension](https://marketplace.visualstudio.com/items?itemName=qwtel.sqlite-viewer)
-- This allows you to easily browse and query the database contents right in your editor
+### Full settings reference
 
-**Important**: When upgrading from an older version that used JSON storage to this SQLite version, any previous history will not be migrated automatically. New metrics will begin collecting in the SQLite database after upgrading.
+```json
+{
+  "collection": {
+    "interval_seconds": 4,
+    "flush_interval_seconds": 60
+  },
+  "housekeeping": {
+    "retention_days": 3
+  },
+  "logging": {
+    "max_size_mb": 5,
+    "max_age_hours": 25
+  },
+  "alerts": {
+    "temperature_c": 80,
+    "utilization_pct": 100,
+    "power_w": 300,
+    "cooldown_seconds": 10,
+    "sound_enabled": true,
+    "notifications_enabled": false
+  },
+  "power": {
+    "rate_per_kwh": 0.0,
+    "currency": "$"
+  },
+  "smtp": {
+    "host": "",
+    "port": 587,
+    "user": "",
+    "password_enc": "(Fernet-encrypted)",
+    "from": "",
+    "tls": "starttls"
+  },
+  "schedules": [
+    {
+      "id": "daily-0800",
+      "template": "daily",
+      "cron": "0 8 * * *",
+      "recipients": ["ops@example.com"],
+      "enabled": true,
+      "last_run_epoch": null
+    }
+  ],
+  "theme": { "default_mode": "auto" }
+}
+```
 
-## Alerts
+### Live-reload scope
 
-You can enable or disable alerts in ui, you can set thresholds for gpu temp, gpu utilization % and watts. Setting are saved in your browser if you make changes you only need to do it once, however you can always modify the code and rebuild the container to make it permanent.
+Fields that apply **without a container restart**:
+- `collection.interval_seconds` — next poll tick
+- `collection.flush_interval_seconds` — next buffer flush
+- `logging.max_size_mb` / `logging.max_age_hours` — next hourly rotation
+- `housekeeping.retention_days` — next nightly sweep
+- All `alerts.*` — next dashboard poll (4 s)
+- All `smtp.*` and `schedules` — next scheduler tick (60 s)
 
-The defaults are: 
+### Timezone
+
+Set the `TZ` environment variable on the container to control
+clock display in the UI and cron evaluation in the scheduler. The
+slim base image ships without the full `tzdata` package — if you
+set `TZ=America/Los_Angeles` and see `ZoneInfoNotFoundError` in
+the scheduler log, install `tzdata` via a custom build:
+
+```dockerfile
+FROM ghcr.io/tekgnosis-net/gpu-monitor:latest
+RUN apt-get update && apt-get install -y tzdata && rm -rf /var/lib/apt/lists/*
+```
+
+The scheduler falls back to UTC on an unknown TZ so it never
+crashes — but cron expressions will evaluate in UTC instead of
+your local timezone.
+
+---
+
+## Security / threat model
+
+**This container is designed for trusted LAN deployment only.**
+There is no authentication, no authorization, and no network-level
+encryption on the HTTP endpoints. If your GPU monitor is reachable
+from the public internet, put it behind a reverse proxy that
+provides TLS + auth (nginx + basic auth, Caddy + Authelia,
+Cloudflare Access, Tailscale private network, etc).
+
+### What's encrypted
+
+- **SMTP password**: Fernet symmetric encryption at rest. Key
+  lives in the `GPU_MONITOR_SECRET` env var if set, otherwise
+  auto-generated at `/app/history/.secret` mode 0600. If you
+  lose the key file and don't have the env var, you must re-enter
+  the SMTP password via the Settings view.
+
+### What's not encrypted
+
+- All other fields in `settings.json` — collection cadence,
+  alert thresholds, electricity rate, schedules, recipients —
+  are stored as plaintext. These are not sensitive individually
+  but document your monitoring configuration.
+- `gpu_metrics.db` is a standard SQLite file. Per-sample GPU
+  telemetry is stored in the clear.
+- HTTP endpoints serve plaintext. A reverse proxy provides TLS.
+
+### Same-origin defense
+
+All mutating API routes (`PUT /api/settings`, `POST /api/*`) check
+the `Origin` header against the `Host` header and reject cross-
+origin requests with 403. This prevents drive-by CSRF attacks
+from a malicious page on another domain opened in the same
+browser. It does not protect against a malicious client on the
+same LAN.
+
+---
+
+## Upgrading from `bigsk1/gpu-monitor`
+
+1. **Back up your `history/gpu_metrics.db`** — the v1.0.0
+   migration is one-way (adds `gpu_index` / `gpu_uuid` /
+   `interval_s` columns, switches to WAL journal mode, adds a
+   composite index). Downgrading to a pre-v1.0.0 image will fail
+   because the upstream collector doesn't understand the new
+   columns.
+
+2. **Change your image tag** from `bigsk1/gpu-monitor` to
+   `ghcr.io/tekgnosis-net/gpu-monitor:1.0.0`.
+
+3. **Mount the same volumes** — `/app/history` and `/app/logs`.
+   Existing rows are preserved and attributed to `gpu_index = 0`
+   with `gpu_uuid = 'legacy-unknown'` after the migration.
+
+4. **First launch runs the migration automatically** — no manual
+   step required. The bash collector's `migrate_database()`
+   function is idempotent and runs at startup.
+
+5. **Check the sidebar footer** — it should show `v1.0.0`. If
+   you see `v1.0.0-dev` or an older version, check that the
+   image you're running matches the GHCR tag you pulled.
+
+---
+
+## Development
+
+### Architecture at a glance
+
+```
+┌────────────────────────┐    ┌────────────────────────┐
+│ bash collector         │    │ aiohttp API server     │
+│ (monitor_gpu.sh)       │    │ (src/server.py)        │
+│                        │    │                        │
+│ nvidia-smi every 4s    │    │ read-only queries      │
+│ buffered writes to     │    │ static file serving    │
+│ /app/history/          │    │ + settings CRUD        │
+│   gpu_metrics.db (WAL) │◄──►│ + housekeeping         │
+└────────────────────────┘    └────────────────────────┘
+            │                             │
+            │                             │
+            ▼                             ▼
+┌────────────────────────┐    ┌────────────────────────┐
+│ scheduler subprocess   │    │ frontend               │
+│ (reporting/scheduler)  │    │ (src/web/)             │
+│                        │    │                        │
+│ cron evaluation        │    │ ES modules + Lit       │
+│ → render → mailer      │    │ + design tokens        │
+│ every 60s              │    │ + Chart.js CDN         │
+└────────────────────────┘    └────────────────────────┘
+```
+
+All four processes run inside the same container and coordinate
+through the `/app` volume. The bash supervisor re-spawns any that
+crash.
+
+### Running the test suite
 
 ```bash
-    temperature: 80,  
-    utilization: 100,
-    power: 300
+# In a throwaway python:3.11-slim container
+docker run --rm -v "$PWD":/app -w /app python:3.11-slim sh -c '
+  pip install --quiet \
+    aiohttp pytest pytest-asyncio pydantic cryptography \
+    aiosmtplib jinja2 premailer matplotlib croniter &&
+  python -m pytest -q
+'
 ```
 
-![GPU Monitor Dashboard](https://imagedelivery.net/WfhVb8dSNAAvdXUdMfBuPQ/6799f2b8-aac2-4741-d125-3b4ed7496e00/public)
+90+ tests cover the API, crypto, settings, scheduler,
+housekeeping, email rendering, and mailer.
 
-
-## Troubleshooting
-
-### Common Issues
-
-1. **NVIDIA SMI not found**
-   - Ensure NVIDIA drivers are installed
-   - Verify NVIDIA Container Toolkit installation
-   - Make sure you can run:  
+### Building locally
 
 ```bash
-sudo docker run --rm --runtime=nvidia --gpus all ubuntu nvidia-smi
+docker build \
+  -f docker/Dockerfile \
+  --build-arg APP_VERSION=$(cat VERSION) \
+  -t gpu-monitor:local \
+  .
 ```
-If this failed proceed to [Installation Prerequisites](#installation-prerequisites)
 
-2. **Container fails to start**
-   - Check Docker logs: `docker logs gpu-monitor`
-   - Verify GPU access: `nvidia-smi`
-   - Ensure proper permissions
-
-3. **Dashboard not accessible**
-   - Verify container is running: `docker ps`
-   - Check container logs: `docker logs gpu-monitor`
-   - Ensure port 8081 is not in use
-4. **TimeStamps don't match your local time**
-
-    - Replace `America/Los_Angeles` with your timezone
-[List of tz database time zones](https://en.wikipedia.org/wiki/List_of_tz_database_time_zones)
-
-5. **I don't like the alert sound**
-    - Replace the .mp3 in the `sounds` folder and name it alert.mp3
-    - Getting double sounds from notifications, disable windows notifications or disable it in ui.
-
-6. **Updated Nvidia driver and UI metrics seem stuck**
-    - The connection to the nvidia runtime was interrupted, restart the container.
-
-## Mobile Layout
-
-<p align="center">
-  <img src="https://imagedelivery.net/WfhVb8dSNAAvdXUdMfBuPQ/3b772d51-8bd6-4d77-5147-25b15170a900/public" alt="GPU Monitor Dashboard Mobile Temp" width="300">
-</p>
-
-<p align="center">
-  <img src="https://imagedelivery.net/WfhVb8dSNAAvdXUdMfBuPQ/c0176433-9449-4243-d3cf-835c198f5500/public" alt="GPU Monitor Dashboard Mobile Stats" width="300">
-</p>
-
+---
 
 ## License
-[![License](https://img.shields.io/github/license/bigsk1/gpu-monitor)](https://github.com/bigsk1/gpu-monitor/blob/main/LICENSE)
 
-## Star History
+MIT. See [LICENSE](LICENSE). The bash collector and nvidia-smi
+polling logic is derived from the upstream
+[`bigsk1/gpu-monitor`](https://github.com/bigsk1/gpu-monitor)
+project by [@bigsk1](https://github.com/bigsk1) and retains its
+original MIT license. All additions in this fork (the REST API,
+the frontend rewrite, the reporting subpackage, the settings
+system) are original work under the same license.
 
-<a href="https://star-history.com/#bigsk1/gpu-monitor&Date">
- <picture>
-   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=bigsk1/gpu-monitor&type=Date&theme=dark" />
-   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/svg?repos=bigsk1/gpu-monitor&type=Date" />
-   <img alt="Star History Chart" src="https://api.star-history.com/svg?repos=bigsk1/gpu-monitor&type=Date" />
- </picture>
-</a>
+## Acknowledgements
+
+- **[@bigsk1](https://github.com/bigsk1)** for the original
+  `gpu-monitor` project this fork builds on
+- **Apple** for the Human Interface Guidelines palette and
+  typography conventions the UI borrows from
+- **The Python, aiohttp, Pydantic, matplotlib, and Lit
+  communities** for the building blocks

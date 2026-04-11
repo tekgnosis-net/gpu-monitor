@@ -1,0 +1,153 @@
+name: Release (semver tag → GHCR)
+
+# Phase 8. Fires when a v*.*.* git tag is pushed (typically by
+# release-please merging an auto-generated release PR into main),
+# builds the container image with the tagged version, and pushes
+# to GHCR with semver-flavored tags:
+#
+#   ghcr.io/<owner>/gpu-monitor:1.0.0      — exact version
+#   ghcr.io/<owner>/gpu-monitor:1.0        — rolling minor tag
+#   ghcr.io/<owner>/gpu-monitor:1          — rolling major tag
+#   ghcr.io/<owner>/gpu-monitor:latest     — rolling latest pointer
+#
+# The `:latest` tag is deliberately included so `docker pull
+# ghcr.io/.../gpu-monitor` without an explicit tag gets the latest
+# stable release rather than a dev build. Users pinning to a
+# specific version should use the exact `:1.0.0` form; users
+# wanting "same major, latest patch" can pin `:1` or `:1.0`.
+#
+# Sanity check: before building, assert that the git tag matches
+# the VERSION file contents. A mismatch means release-please and
+# the manual tag got out of sync (shouldn't happen in the happy
+# path, but the check costs nothing and surfaces human error
+# loudly instead of shipping a container whose /app/VERSION
+# reports a different string than its tag).
+#
+# Injection safety: github.ref_name (the tag) is lifted into an
+# `env:` block at the job level rather than interpolated directly
+# into run: blocks. GitHub tag names are constrained by git's tag
+# naming rules and tag creation requires repo write access, so
+# they're not classic untrusted user input — but the env-var
+# pattern is the documented-safe idiom and makes the workflow
+# easier to audit.
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  GHCR_IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write  # provenance signing
+
+    env:
+      # Hoist the tag name into a job-level env var so shell blocks
+      # below read it as $TAG_NAME rather than ${{ github.ref_name }}.
+      # This follows the "never interpolate untrusted input into run
+      # scripts" pattern documented in the GitHub Actions security
+      # guide, even though tag names are not classic untrusted input.
+      TAG_NAME: ${{ github.ref_name }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # release-please writes the VERSION bump into the release
+          # PR, so fetching full history isn't needed — the tagged
+          # commit has everything we want to build.
+          fetch-depth: 1
+
+      - name: Verify tag matches VERSION file
+        # Example: tag is `v1.0.0`, VERSION file contains `1.0.0`.
+        # Strip the leading `v` from the tag and compare byte-for-
+        # byte. A mismatch fails the workflow immediately, before
+        # any build or push.
+        run: |
+          STRIPPED="${TAG_NAME#v}"
+          FILE_VERSION="$(tr -d '[:space:]' < VERSION)"
+          if [ "$STRIPPED" != "$FILE_VERSION" ]; then
+            echo "::error::Tag '$TAG_NAME' does not match VERSION file '$FILE_VERSION'"
+            echo "The tag was normalized to '$STRIPPED' after stripping the leading 'v'."
+            echo "Either the tag was created manually without updating VERSION,"
+            echo "or release-please wrote a different VERSION value than it tagged."
+            exit 1
+          fi
+          echo "Tag and VERSION file match: $FILE_VERSION"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+        with:
+          # Pin BuildKit to a specific version so semver release
+          # builds stay reproducible. Using `:latest` would let
+          # BuildKit change underneath us between tag pushes,
+          # which could subtly affect artifact contents (layer
+          # ordering, compression parameters, cache-mount
+          # behavior). v0.13.2 is the current stable minor in
+          # the 0.13 line. Bump this when there's a reason to,
+          # not passively.
+          driver-opts: |
+            image=moby/buildkit:v0.13.2
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: |
+            ${{ env.GHCR_IMAGE }}
+          # Semver tag set:
+          #   {{version}}         → 1.0.0
+          #   {{major}}.{{minor}} → 1.0
+          #   {{major}}           → 1
+          #   latest              → always on semver pushes
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=semver,pattern={{major}}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=GPU Monitor
+            org.opencontainers.image.description=Real-time NVIDIA GPU monitoring dashboard
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+
+      - name: Read stripped version for build-arg
+        id: version
+        # Emit the tag without the leading `v` so APP_VERSION
+        # matches VERSION file contents (X.Y.Z, not vX.Y.Z). The
+        # variable is read from the job-level env so no untrusted
+        # interpolation happens in the run script body.
+        run: |
+          STRIPPED="${TAG_NAME#v}"
+          printf 'app_version=%s\n' "$STRIPPED" >> "$GITHUB_OUTPUT"
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            APP_VERSION=${{ steps.version.outputs.app_version }}
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
