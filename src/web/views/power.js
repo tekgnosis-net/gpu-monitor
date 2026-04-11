@@ -28,6 +28,7 @@
 
 import * as api from '../api.js';
 import '../components/info-tip.js';
+import { attachTablistKeyboard, markTabSelected } from '../widgets/tablist.js';
 
 const WINDOWS = [
     { id: '1h',  label: '1 h' },
@@ -162,27 +163,33 @@ function buildGpuTabs(onSelect) {
     const tabs = document.createElement('div');
     tabs.className = 'tabs';
     tabs.setAttribute('role', 'tablist');
+    tabs.setAttribute('aria-label', 'Select GPU for power integration');
 
+    let initialActive = null;
     state.gpus.forEach((gpu) => {
         const btn = document.createElement('button');
         btn.textContent = `GPU ${gpu.index}`;
         btn.setAttribute('data-gpu-index', String(gpu.index));
         btn.setAttribute('role', 'tab');
-        if (gpu.index === state.selectedGpuIndex) {
-            btn.setAttribute('aria-current', 'true');
-        }
         btn.addEventListener('click', () => {
             state.selectedGpuIndex = gpu.index;
-            tabs.querySelectorAll('button').forEach(b => {
-                if (b.getAttribute('data-gpu-index') === String(gpu.index)) {
-                    b.setAttribute('aria-current', 'true');
-                } else {
-                    b.removeAttribute('aria-current');
-                }
-            });
+            markTabSelected(tabs, btn);
             onSelect();
         });
         tabs.append(btn);
+        if (gpu.index === state.selectedGpuIndex) initialActive = btn;
+    });
+
+    // Phase 7 / task #28: full WAI-ARIA tab pattern.
+    if (initialActive) markTabSelected(tabs, initialActive);
+    attachTablistKeyboard(tabs, {
+        onSelect: (targetTab) => {
+            const idx = Number(targetTab.getAttribute('data-gpu-index'));
+            if (Number.isFinite(idx)) {
+                state.selectedGpuIndex = idx;
+                onSelect();
+            }
+        },
     });
 
     wrapper.append(label, tabs);
@@ -200,26 +207,33 @@ function buildWindowPicker(onChange) {
 
     const picker = document.createElement('div');
     picker.className = 'time-range';
+    picker.setAttribute('role', 'tablist');
+    picker.setAttribute('aria-label', 'Integration window');
 
+    let initialActive = null;
     WINDOWS.forEach((w) => {
         const btn = document.createElement('button');
         btn.textContent = w.label;
         btn.setAttribute('data-window', w.id);
-        if (w.id === state.window) {
-            btn.setAttribute('aria-current', 'true');
-        }
+        btn.setAttribute('role', 'tab');
         btn.addEventListener('click', () => {
             state.window = w.id;
-            picker.querySelectorAll('button').forEach(b => {
-                if (b.getAttribute('data-window') === w.id) {
-                    b.setAttribute('aria-current', 'true');
-                } else {
-                    b.removeAttribute('aria-current');
-                }
-            });
+            markTabSelected(picker, btn);
             onChange();
         });
         picker.append(btn);
+        if (w.id === state.window) initialActive = btn;
+    });
+
+    if (initialActive) markTabSelected(picker, initialActive);
+    attachTablistKeyboard(picker, {
+        onSelect: (targetTab) => {
+            const id = targetTab.getAttribute('data-window');
+            if (id) {
+                state.window = id;
+                onChange();
+            }
+        },
     });
 
     wrapper.append(label, picker);

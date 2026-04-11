@@ -52,6 +52,7 @@
  */
 
 import * as api from '../api.js';
+import * as alerts from '../alerts.js';
 import '../components/info-tip.js';
 
 const TABS = [
@@ -530,6 +531,72 @@ function renderAlertsTab() {
 
     panel.append(checkboxRow('alerts-notifications', 'Desktop notifications', a.notifications_enabled,
         'Use the browser\'s Notification API for system-level alerts. Browser permission is requested the first time you enable this.'));
+
+    // Inline status element attached right below the checkbox so
+    // the feedback appears where the user was looking.
+    // Non-blocking — we never use alert() here because it's
+    // modal and jars the user out of the Settings flow.
+    const notificationsStatus = el('div');
+    notificationsStatus.style.fontSize = 'var(--font-size-sm)';
+    notificationsStatus.style.marginLeft = 'calc(var(--space-5) + var(--space-2))';
+    notificationsStatus.style.marginTop = 'calc(-1 * var(--space-2))';
+    notificationsStatus.style.marginBottom = 'var(--space-3)';
+    panel.append(notificationsStatus);
+
+    // Phase 7: request browser Notification permission ONLY when
+    // the user explicitly flips the checkbox ON — never on page
+    // load. This fixes the "spooky unprompted permission request"
+    // UX smell that the Phase 4 hardcoded-to-configurable audit
+    // specifically called out. We listen on the change event
+    // rather than waiting for Save so the permission prompt is
+    // tightly coupled to the user's intent expression.
+    //
+    // Round-1 fix: the `requestNotificationPermission()` helper can
+    // return any of `granted` / `denied` / `default` / `unsupported`
+    // / `error`. Previously we only un-checked the box on `denied`,
+    // leaving it checked on `default` (user dismissed the prompt)
+    // or `unsupported` (browser has no Notification API) even
+    // though notifications would never fire. We now treat any
+    // non-`granted` result as failure: uncheck the box and surface
+    // a specific inline message per result type.
+    const notificationsCheckbox = panel.querySelector('#alerts-notifications');
+    if (notificationsCheckbox) {
+        notificationsCheckbox.addEventListener('change', async () => {
+            notificationsStatus.textContent = '';
+            if (!notificationsCheckbox.checked) return;
+
+            const result = await alerts.requestNotificationPermission();
+
+            if (result === 'granted') {
+                notificationsStatus.textContent = 'Notifications enabled — click Save to persist.';
+                notificationsStatus.style.color = 'var(--success)';
+                return;
+            }
+
+            // Any non-granted result → uncheck and explain.
+            notificationsCheckbox.checked = false;
+            notificationsStatus.style.color = 'var(--danger)';
+            switch (result) {
+                case 'denied':
+                    notificationsStatus.textContent =
+                        'Permission was denied. Re-enable it in your browser\'s site settings and try again.';
+                    break;
+                case 'default':
+                    notificationsStatus.textContent =
+                        'Permission prompt was dismissed. Toggle again and accept the prompt to enable.';
+                    break;
+                case 'unsupported':
+                    notificationsStatus.textContent =
+                        'Your browser does not support the Notification API. Toasts + sound alerts will still fire.';
+                    break;
+                case 'error':
+                default:
+                    notificationsStatus.textContent =
+                        'Could not request permission. Toasts + sound alerts will still fire.';
+                    break;
+            }
+        });
+    }
 
     panel.append(saveButton('alerts', async () => {
         const temp = numericValue(tempInput);
