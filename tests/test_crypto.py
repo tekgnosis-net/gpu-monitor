@@ -117,3 +117,35 @@ def test_invalid_key_material_raises_crypto_error(monkeypatch):
     monkeypatch.setenv(crypto_module.ENV_VAR, "not-a-real-fernet-key")
     with pytest.raises(crypto_module.CryptoError, match="Fernet"):
         crypto_module.load_or_create_key(Path("/nonexistent/secret"))
+
+
+def test_concurrent_key_generation_resolves_to_single_winner(tmp_path, monkeypatch):
+    """Simulate a race: a second process (simulated by pre-writing
+    a key to the target path) beats us to the exclusive create.
+    load_or_create_key must detect the collision and return the
+    winner's key rather than overwriting it — any ciphertext
+    produced between reads would otherwise become undecryptable.
+
+    This test proves the O_EXCL / os.link exclusive-create path by
+    pre-writing a known key to the target before calling
+    load_or_create_key. The function should observe the existing
+    file at the link step and read it rather than generating a
+    new key.
+    """
+    monkeypatch.delenv(crypto_module.ENV_VAR, raising=False)
+    key_path = tmp_path / ".secret"
+
+    # Pre-write a "winner" key to the target path — simulating
+    # another process that won the race.
+    winner_key = Fernet.generate_key()
+    key_path.write_bytes(winner_key)
+    os.chmod(key_path, 0o600)
+
+    # Call load_or_create_key. It should see the file exists and
+    # read the winner's key rather than regenerating.
+    result = crypto_module.load_or_create_key(key_path)
+    assert result == winner_key
+
+    # Disk state is unchanged — no stray .tmp files left behind
+    strays = list(tmp_path.glob(".secret.*"))
+    assert strays == [], f"unexpected stray files: {strays}"

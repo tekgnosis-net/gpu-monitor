@@ -37,6 +37,7 @@ Design principles:
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import tempfile
@@ -224,30 +225,58 @@ class Settings(BaseModel):
 # ─── Load / save helpers ───────────────────────────────────────────────────
 
 
-def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
     """Recursively merge `override` into `base` without mutating either.
 
     Nested dicts are merged key-by-key; list / scalar values from
-    `override` replace the corresponding entry in `base`. This is how a
-    partial PUT (e.g. just {"power": {"rate_per_kwh": 0.18}}) preserves
-    unrelated sections like smtp and schedules.
+    `override` replace the corresponding entry in `base`. This is how
+    a partial PUT (e.g. just {"power": {"rate_per_kwh": 0.18}})
+    preserves unrelated sections like smtp and schedules.
 
     Lists are replaced wholesale, not merged element-by-element. The
-    schedules list in particular has to support full CRUD — if a user
-    sends a 2-item list, that's the new complete list, not "add these
-    two to whatever you had".
+    schedules list in particular has to support full CRUD — if a
+    user sends a 2-item list, that's the new complete list, not
+    "add these two to whatever you had".
+
+    CRITICAL: the function MUST NOT alias any nested collection into
+    the return value. An earlier version used `dict(base)` which is
+    a shallow copy — nested dicts were shared with `base`, and
+    because `base` is often the module-level DEFAULT_SETTINGS, a
+    caller who mutated a returned subsection would silently mutate
+    the global defaults for the lifetime of the process. The current
+    implementation deep-copies any `base` value that the override
+    doesn't replace, so the return value is always independent
+    from its inputs.
     """
-    out: dict[str, Any] = dict(base)
+    out: dict[str, Any] = {}
+    for key, value in base.items():
+        # Deep-copy every base value up front. If override supplies
+        # the same key, we re-assign below, so the deep-copy cost
+        # for overridden keys is ~zero (one copy of a primitive).
+        out[key] = copy.deepcopy(value)
+
     for key, value in override.items():
         if (
             key in out
             and isinstance(out[key], dict)
             and isinstance(value, dict)
         ):
-            out[key] = _deep_merge(out[key], value)
+            out[key] = deep_merge(out[key], value)
         else:
-            out[key] = value
+            # Deep-copy override values too — a caller who then
+            # mutates the override dict after the merge shouldn't
+            # see their change reflected in the settings file.
+            out[key] = copy.deepcopy(value)
+
     return out
+
+
+# Back-compat alias for the previous underscore-prefixed name. The
+# server module used to import `_deep_merge` (a private helper),
+# which caused cross-module coupling to an underscore API. Keeping
+# the alias for now means the import site doesn't break during the
+# rename; it can be removed after one release.
+_deep_merge = deep_merge
 
 
 def load_settings(path: Path) -> dict[str, Any]:
@@ -275,17 +304,17 @@ def load_settings(path: Path) -> dict[str, Any]:
     serialize to JSON directly without a `.model_dump()` round-trip.
     """
     if not path.exists():
-        return _deep_merge(DEFAULT_SETTINGS, {})
+        return deep_merge(DEFAULT_SETTINGS, {})
 
     try:
         raw = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
-        return _deep_merge(DEFAULT_SETTINGS, {})
+        return deep_merge(DEFAULT_SETTINGS, {})
 
     if not isinstance(raw, dict):
-        return _deep_merge(DEFAULT_SETTINGS, {})
+        return deep_merge(DEFAULT_SETTINGS, {})
 
-    merged = _deep_merge(DEFAULT_SETTINGS, raw)
+    merged = deep_merge(DEFAULT_SETTINGS, raw)
 
     # Validate via Pydantic and re-emit. If validation fails on any
     # field, fall back to defaults wholesale — safer than leaving a
@@ -293,7 +322,7 @@ def load_settings(path: Path) -> dict[str, Any]:
     try:
         validated = Settings.model_validate(merged)
     except ValidationError:
-        return _deep_merge(DEFAULT_SETTINGS, {})
+        return deep_merge(DEFAULT_SETTINGS, {})
 
     return validated.model_dump(by_alias=True)
 

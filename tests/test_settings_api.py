@@ -293,6 +293,53 @@ async def test_put_cross_origin_is_rejected(client):
     assert resp.status == 403
 
 
+@pytest.mark.asyncio
+async def test_put_same_origin_with_default_port_is_accepted(client):
+    """Origin header with no port (implying default 443 for https)
+    and Host header with explicit :443 should compare equal. This
+    edge case used to fail when the comparison was raw string
+    equality between Origin.split('//')[1] and Host — the 443 /
+    no-443 asymmetry tripped legitimate same-origin requests."""
+    resp = await client.put(
+        "/api/settings",
+        json={"power": {"rate_per_kwh": 0.12}},
+        headers={
+            "Origin": "https://gpu-monitor.local",  # implied port 443
+            "Host": "gpu-monitor.local:443",        # explicit port 443
+        },
+    )
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_put_same_origin_with_different_case_is_accepted(client):
+    """Host comparison must be case-insensitive."""
+    resp = await client.put(
+        "/api/settings",
+        json={"power": {"rate_per_kwh": 0.12}},
+        headers={
+            "Origin": "http://GPU-Monitor.Local:8081",
+            "Host": "gpu-monitor.local:8081",
+        },
+    )
+    assert resp.status == 200
+
+
+@pytest.mark.asyncio
+async def test_put_same_origin_ipv6_bracketed_is_accepted(client):
+    """IPv6 bracketed host forms ([::1]:8081) must work for same-
+    origin comparison."""
+    resp = await client.put(
+        "/api/settings",
+        json={"power": {"rate_per_kwh": 0.12}},
+        headers={
+            "Origin": "http://[::1]:8081",
+            "Host": "[::1]:8081",
+        },
+    )
+    assert resp.status == 200
+
+
 # ─── SMTP test endpoint (stub until Phase 6.3) ─────────────────────────────
 
 

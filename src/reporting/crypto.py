@@ -83,21 +83,37 @@ def load_or_create_key(path: Path = DEFAULT_KEY_PATH) -> bytes:
         _assert_valid_key(key_bytes)
         return key_bytes
 
-    # First-run: generate a key, write it atomically, chmod 0600.
-    # Use tempfile.mkstemp rather than a deterministic .tmp path so
-    # concurrent initializers (e.g. the server startup and the
-    # scheduler subprocess racing on the same volume) each get a
-    # unique filename and one of the atomic renames wins cleanly
-    # without clobbering the other's write. Best-effort unlink on
-    # any failure so we never leave a stale tempfile polluting the
-    # directory, and never leave a zero-byte / partial key file
-    # mistaken for a real secret.
+    # First-run generation must be atomic against concurrent
+    # initializers. Two processes starting at the same time (e.g.
+    # the server and the scheduler subprocess) could both observe
+    # the file missing, both generate different keys, both write
+    # their own tempfile, and both call os.replace. The last
+    # os.replace wins — which means any ciphertext produced between
+    # the two reads using the loser's key becomes undecryptable
+    # once the winner clobbers the key file.
+    #
+    # The fix is an exclusive create: O_CREAT | O_EXCL | O_WRONLY
+    # via Path.open("xb") which raises FileExistsError if another
+    # process beat us to it. On collision we re-read the winning
+    # process's file rather than overwriting. The tempfile pattern
+    # from save_settings protects against partial writes (the file
+    # appears atomically via os.replace), but without the O_EXCL
+    # guard on the target, two well-formed tempfile writes could
+    # still race on the rename.
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise CryptoError(
+            f"cannot create key file parent dir {path.parent}: {exc}. "
+            f"Set {ENV_VAR} env var or fix /app/history permissions."
+        ) from exc
+
+    # Write the new key to a unique tempfile first, then attempt
+    # to exclusively create the target by linking. If link fails
+    # with EEXIST, another process won the race — unlink our
+    # tempfile and re-read the winner's key.
+    try:
         key_bytes = Fernet.generate_key()
-        # prefix matches save_settings's convention: dot-prefixed so
-        # ls doesn't expose the tempfile, name includes the target
-        # filename for debuggability if one ever gets orphaned.
         fd, tmp_path_str = tempfile.mkstemp(
             prefix=f".{path.name}.",
             suffix=".tmp",
@@ -110,10 +126,31 @@ def load_or_create_key(path: Path = DEFAULT_KEY_PATH) -> bytes:
                 tmp_fh.flush()
                 os.fsync(tmp_fh.fileno())
             os.chmod(tmp_path, 0o600)
-            os.replace(tmp_path, path)
+
+            # os.link() creates the target atomically IFF it doesn't
+            # already exist — raises FileExistsError otherwise.
+            # This is the kernel-level exclusive-create primitive
+            # the whole atomic-create-or-reuse pattern is built on.
+            try:
+                os.link(tmp_path, path)
+            except FileExistsError:
+                # Lost the race. Unlink our tempfile and re-read
+                # the winner's key.
+                os.unlink(tmp_path)
+                winner_bytes = path.read_bytes().strip()
+                _assert_valid_key(winner_bytes)
+                return winner_bytes
+
+            # Won the race. Remove the tempfile link — the target
+            # now has the real name. If unlink fails that's
+            # cosmetic (the tempfile stays behind) but the key
+            # file is correctly in place.
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
         except OSError:
-            # Best-effort cleanup of the stray tempfile before
-            # re-raising — never leave secret-looking garbage behind.
+            # Best-effort cleanup of the tempfile before re-raising.
             try:
                 if tmp_path.exists():
                     os.unlink(tmp_path)

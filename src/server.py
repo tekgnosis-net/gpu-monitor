@@ -64,6 +64,7 @@ from reporting import crypto  # noqa: E402
 from reporting.settings import (  # noqa: E402
     DEFAULT_SETTINGS,
     Settings,
+    deep_merge,
     load_settings,
     save_settings,
 )
@@ -511,29 +512,94 @@ def _redact_smtp_password(settings_dict: dict) -> dict:
     return redacted
 
 
+def _normalize_host_port(raw: str) -> tuple[str, str]:
+    """Split a `host[:port]` string into (host, port), handling
+    IPv6 brackets and case-insensitive host comparison.
+
+    Returns ("", "") on malformed input. Used by _origin_is_same
+    to produce a canonical (host, port) pair that can be compared
+    across Origin / Host headers regardless of cosmetic
+    differences (case, bracketing, port representation).
+    """
+    if not raw:
+        return ("", "")
+    raw = raw.strip()
+    # IPv6 bracketed form: [::1]:8080 or [::1]
+    if raw.startswith("["):
+        close = raw.find("]")
+        if close == -1:
+            return ("", "")
+        host = raw[1:close].lower()
+        rest = raw[close + 1:]
+        port = rest[1:] if rest.startswith(":") else ""
+        return (host, port)
+    # Plain form: host[:port]
+    if ":" in raw:
+        host, _, port = raw.rpartition(":")
+        return (host.lower(), port)
+    return (raw.lower(), "")
+
+
+# Default ports per URL scheme. Used by the Origin/Host normalizer
+# below so an Origin of "http://foo" (no port) compares equal to a
+# Host of "foo:80" (explicit default port).
+_DEFAULT_PORT = {"http": "80", "https": "443"}
+
+
 def _origin_is_same(request: web.Request) -> bool:
     """Defense-in-depth CSRF check for mutating routes. aiohttp gives
     us Origin and Host headers; a same-origin request has them
-    matching. Cross-origin requests (from a different host or a
-    browser tab on another domain) have an Origin that the Host
-    doesn't match, at which point we refuse. This is a LAN-only
-    defense — it doesn't help against a malicious LAN client — but
-    it costs 4 lines and prevents a drive-by click on a bookmark'd
-    IP from mutating settings."""
+    matching after canonicalization.
+
+    Canonicalization handles three edge cases:
+
+      1. **Case-insensitive host comparison.** "Example.com" and
+         "example.com" are the same host.
+      2. **IPv6 bracket handling.** An Origin of "[::1]:8080" must
+         compare equal to a Host of "[::1]:8080", and the brackets
+         must be stripped before comparison.
+      3. **Default port normalization.** Origin "http://example.com"
+         (no port → default 80) must compare equal to
+         Host "example.com:80", and both should also equal Host
+         "example.com" if the scheme is known.
+
+    Origin is absent on same-origin GETs and direct curl calls. We
+    only enforce when it's present; a None Origin is indistinguishable
+    from a direct client and rejecting on its absence would break
+    legitimate CLI usage.
+
+    This is a LAN-only defense — it doesn't stop a malicious LAN
+    client — but it costs a few lines and prevents a drive-by click
+    on a bookmark'd IP from mutating settings via a malicious page
+    in another tab.
+    """
     origin = request.headers.get("Origin")
-    # Origin is absent on same-origin GETs and some browser contexts.
-    # We only enforce when it's present; a None Origin is indistinguishable
-    # from a direct curl and we don't want to break that for users.
     if not origin:
         return True
-    host = request.headers.get("Host", "")
-    # Origin is "scheme://host[:port]"; normalize to the host portion
-    # and compare against the Host header's host portion.
-    try:
-        origin_host = origin.split("://", 1)[1]
-    except IndexError:
+
+    host_header = request.headers.get("Host", "")
+    if not host_header:
         return False
-    return origin_host == host
+
+    # Parse the Origin with urlparse so we get scheme + netloc + port
+    # without hand-rolling the split. `parsed.hostname` lowercases
+    # and strips IPv6 brackets; `parsed.port` returns an int or None.
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(origin)
+    except ValueError:
+        return False
+
+    origin_host = (parsed.hostname or "").lower()
+    origin_port = str(parsed.port) if parsed.port else _DEFAULT_PORT.get(parsed.scheme, "")
+
+    host_host, host_port = _normalize_host_port(host_header)
+    # If the Host header lacked a port, fill in the scheme default
+    # so the comparison is apples-to-apples.
+    if not host_port:
+        host_port = _DEFAULT_PORT.get(parsed.scheme, "")
+
+    return origin_host == host_host and origin_port == host_port
 
 
 async def handle_get_settings(request: web.Request) -> web.Response:
@@ -572,19 +638,20 @@ async def handle_put_settings(request: web.Request) -> web.Response:
     if not isinstance(body, dict):
         return web.json_response({"error": "body must be a JSON object"}, status=400)
 
-    # SECURITY: strip `smtp.password_enc` from the incoming body
-    # unconditionally. That field is the ciphertext — it must only
-    # ever be computed server-side from the `smtp.password` plaintext
-    # transition below and the existing on-disk value. A client that
-    # PUTs a raw `password_enc` would otherwise bypass Fernet
-    # encryption entirely and persist plaintext or arbitrary junk
-    # into the field that claims to be encrypted. Rejecting with 400
-    # instead of silently dropping makes the attack attempt
-    # observable in the response body; we drop rather than reject
-    # because older client SDKs might round-trip a previously-GET'd
-    # settings object (which never contains password_enc — see
-    # _redact_smtp_password — so this branch is defense against
-    # hand-crafted payloads, not compatibility breakage).
+    # SECURITY: reject PUT bodies that contain `smtp.password_enc`.
+    # That field is the ciphertext — it must only ever be computed
+    # server-side from the `smtp.password` plaintext transition
+    # below and the existing on-disk value. A client that PUTs a
+    # raw `password_enc` would otherwise bypass Fernet encryption
+    # entirely and persist plaintext or arbitrary junk into the
+    # field that claims to be encrypted.
+    #
+    # Rejecting with 400 (rather than silently stripping) makes the
+    # attack attempt observable in both the response body and the
+    # server log. Legitimate clients never need to set this field
+    # because GET /api/settings redacts it to `password_set: bool`
+    # — any round-trip of a GET'd settings object will not contain
+    # password_enc, so no legitimate workflow breaks.
     smtp_body = body.get("smtp")
     if isinstance(smtp_body, dict) and "password_enc" in smtp_body:
         return web.json_response(
@@ -618,10 +685,12 @@ async def handle_put_settings(request: web.Request) -> web.Response:
         plaintext_password = None
 
     # Deep-merge over the existing file, then validate the result.
-    from reporting.settings import _deep_merge  # local import keeps tests happy
-
+    # deep_merge is the public helper from reporting.settings (the
+    # underscore-prefixed `_deep_merge` is a back-compat alias and
+    # should not be used from new code — the Copilot round 2 review
+    # correctly flagged the original import as private-API coupling).
     current = load_settings(SETTINGS_FILE)
-    merged = _deep_merge(current, body)
+    merged = deep_merge(current, body)
 
     try:
         validated = Settings.model_validate(merged)
