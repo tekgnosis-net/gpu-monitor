@@ -33,3 +33,9 @@ __pycache__/
 *.py[cod]
 *.pyo
 
+# Local dev artifacts from Playwright MCP smoke testing —
+# screenshots + MCP runtime state live at the repo root during
+# iterative UX work and should never be committed.
+.playwright-mcp/
+/*.png
+
