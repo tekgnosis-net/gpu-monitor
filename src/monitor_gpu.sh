@@ -91,19 +91,51 @@ log_debug() {
     fi
 }
 
-# Get GPU name + UUID once at startup. UUID is stable across reboots and is
-# the audit identifier written into every metrics row via the process_buffer
-# heredoc. Both values use an explicit empty-check fallback (rather than
-# `|| echo "GPU"` appended to a pipeline) because bash only evaluates the
-# `||` against the final command in the pipeline — `sed` on empty input
-# exits 0, so a failing `nvidia-smi` would otherwise silently leave the
-# variable empty.
-GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-[ -z "$GPU_NAME" ] && GPU_NAME="GPU"
-GPU_UUID=$(nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | head -n1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
-[ -z "$GPU_UUID" ] && GPU_UUID="legacy-unknown"
-export GPU_UUID
+###############################################################################
+# _trim_ws: Strip leading/trailing whitespace from a string using only bash
+# parameter expansion — no subprocess fork, no pipeline. Writes the result
+# to the global $REPLY variable in the caller's scope (idiomatic bash
+# pattern for return-by-reference helpers in hot paths).
+#
+# Used in update_stats()'s per-tick CSV parsing loop. Phase 2's initial
+# version called `echo ... | xargs` per field, which forked one subprocess
+# per CSV field per GPU per tick — ~16 forks per tick on a 4-GPU system.
+# Parameter expansion is strictly cheaper (no fork, no exec).
+#
+# Defined at the top level (not inside update_stats) because bash functions
+# are globally scoped regardless of where they're declared — defining it
+# inside update_stats would re-register the function on every tick.
+###############################################################################
+_trim_ws() {
+    local v="${1#"${1%%[![:space:]]*}"}"
+    REPLY="${v%"${v##*[![:space:]]}"}"
+}
+
+# Paths for GPU inventory and config. Discovery happens later in the
+# startup block once helper functions (safe_write_json, log_*) are in
+# scope — see the GPU inventory section near the end of this file.
+INVENTORY_FILE="$BASE_DIR/gpu_inventory.json"
 CONFIG_FILE="$BASE_DIR/gpu_config.json"
+
+# Multi-GPU state populated by discover_gpus():
+#   NUM_GPUS        — integer count of attached GPUs (>=1)
+#   GPU_INDEXES     — array of integer indexes as reported by nvidia-smi
+#   GPU_NAMES[idx]  — associative: display name per index
+#   GPU_UUIDS[idx]  — associative: stable audit UUID per index
+# The indexes are strings in the associative arrays (bash array semantics)
+# but always parseable as integers since nvidia-smi emits them as such.
+#
+# Legacy GPU_NAME / GPU_UUID / GPU_INDEX scalars are kept in sync with
+# gpus[0] so the Phase 1 code paths (single-GPU flat files, process_buffer
+# env fallback) continue to work unchanged.
+declare -gA GPU_NAMES
+declare -gA GPU_UUIDS
+declare -ga GPU_INDEXES
+NUM_GPUS=0
+GPU_NAME="GPU"
+GPU_UUID="legacy-unknown"
+GPU_INDEX=0
+export GPU_UUID
 
 # NOTE: gpu_config.json is WRITTEN in the startup block near the end of
 # this file, after all helper functions (safe_write_json in particular)
@@ -172,7 +204,25 @@ function load_settings() {
         new_flush="$new_interval"
     fi
 
-    if [ "$new_interval" != "$INTERVAL" ] || [ "$new_flush" != "$FLUSH_INTERVAL" ]; then
+    # Derive the intended BUFFER_SIZE from the CURRENT values of
+    # new_interval / new_flush / NUM_GPUS. Doing this unconditionally means
+    # the diff check below catches three orthogonal sources of change:
+    #   1. User edited settings.json (interval and/or flush)
+    #   2. discover_gpus() ran and populated NUM_GPUS > 1 at startup (the
+    #      first load_settings() call after startup will see the new count)
+    #   3. Some future path that mutates NUM_GPUS live (Phase 2 doesn't
+    #      have one, but the diff check is structured so it would Just Work)
+    # Without this, a multi-GPU install on default settings would never
+    # scale BUFFER_SIZE past the hardcoded 15, shortening the effective
+    # wall-clock flush cadence to 1/N of intended.
+    local ticks_per_flush=$(( (new_flush + new_interval - 1) / new_interval ))
+    [ "$ticks_per_flush" -lt 1 ] && ticks_per_flush=1
+    local new_buffer_size=$(( ticks_per_flush * ${NUM_GPUS:-1} ))
+    [ "$new_buffer_size" -lt 1 ] && new_buffer_size=1
+
+    if [ "$new_interval" != "$INTERVAL" ] \
+       || [ "$new_flush" != "$FLUSH_INTERVAL" ] \
+       || [ "$new_buffer_size" != "$BUFFER_SIZE" ]; then
         # CRITICAL: flush any buffered rows BEFORE applying the new interval
         # so they get written with the cadence they were actually sampled at.
         # Without this, rows buffered under the old INTERVAL would be flushed
@@ -204,10 +254,138 @@ function load_settings() {
 
         INTERVAL="$new_interval"
         FLUSH_INTERVAL="$new_flush"
-        BUFFER_SIZE=$(( (FLUSH_INTERVAL + INTERVAL - 1) / INTERVAL ))
-        [ "$BUFFER_SIZE" -lt 1 ] && BUFFER_SIZE=1
-        log_warning "Collection settings reloaded: interval=${INTERVAL}s flush=${FLUSH_INTERVAL}s buffer_size=${BUFFER_SIZE}"
+        BUFFER_SIZE="$new_buffer_size"
+        log_warning "Collection settings reloaded: interval=${INTERVAL}s flush=${FLUSH_INTERVAL}s buffer_size=${BUFFER_SIZE} (ticks_per_flush=${ticks_per_flush} × num_gpus=${NUM_GPUS:-1})"
     fi
+    return 0
+}
+
+###############################################################################
+# discover_gpus: Queries nvidia-smi for all attached GPUs and populates the
+# global NUM_GPUS / GPU_INDEXES / GPU_NAMES / GPU_UUIDS state used by
+# update_stats, process_buffer, and the gpu_config.json / gpu_inventory.json
+# writers. Called once at startup; not re-run on every tick (hot-add/remove
+# of GPUs in a running container is outside Phase 2 scope).
+#
+# Also writes /app/gpu_inventory.json, which process_buffer.py reads to
+# look up gpu_uuid per gpu_index. safe_write_json provides atomic replace.
+#
+# Falls back cleanly when nvidia-smi is unavailable (test harness, dev env):
+#   - Produces one synthetic GPU with index=0, name="GPU",
+#     uuid="legacy-unknown", memory_total_mib=0, power_limit_w=0
+#   - Everything downstream continues to work in single-GPU mode
+###############################################################################
+function discover_gpus() {
+    # Clear any prior state (useful if this is ever called more than once).
+    GPU_INDEXES=()
+    GPU_NAMES=()
+    GPU_UUIDS=()
+    NUM_GPUS=0
+
+    # Structured query: one row per GPU, comma-separated, no header.
+    # Fields: index, uuid, name, memory.total (MiB), power.max_limit (W).
+    local csv
+    csv=$(nvidia-smi \
+        --query-gpu=index,uuid,name,memory.total,power.max_limit \
+        --format=csv,noheader,nounits 2>/dev/null)
+
+    # Collect per-GPU entries for the inventory JSON.
+    local inventory_entries=""
+
+    if [ -n "$csv" ]; then
+        while IFS=',' read -r idx uuid name mem_total power_limit; do
+            # Strip leading/trailing whitespace that nvidia-smi adds after
+            # every comma separator.
+            idx=$(echo "$idx" | xargs)
+            uuid=$(echo "$uuid" | xargs)
+            name=$(echo "$name" | xargs)
+            mem_total=$(echo "$mem_total" | xargs)
+            power_limit=$(echo "$power_limit" | xargs)
+
+            # Validate idx as a non-negative integer before touching any
+            # accumulator state. A non-numeric row (error message leaked
+            # past 2>/dev/null, unexpected nvidia-smi output format) that
+            # only failed the empty-string check would corrupt the
+            # NUM_GPUS counter and build an invalid jq --argjson entry,
+            # preventing the synthetic-fallback path below from rescuing
+            # the startup.
+            if [[ ! "$idx" =~ ^[0-9]+$ ]]; then
+                log_warning "discover_gpus: skipping non-numeric index from nvidia-smi: ${idx:-(empty)}"
+                continue
+            fi
+            [ -z "$uuid" ] && uuid="legacy-unknown"
+            [ -z "$name" ] && name="GPU"
+            # mem_total and power_limit may be [N/A] or [Not Supported]
+            # on some hardware. Use proper JSON-number regexes (not
+            # loose [0-9.]) so edge cases like "." or "1.2.3" don't slip
+            # through and break `jq --argjson` downstream.
+            [[ ! "$mem_total" =~ ^[0-9]+$ ]] && mem_total=0
+            [[ ! "$power_limit" =~ ^[0-9]+(\.[0-9]+)?$ ]] && power_limit=0
+
+            GPU_INDEXES+=("$idx")
+            GPU_NAMES[$idx]="$name"
+            GPU_UUIDS[$idx]="$uuid"
+            NUM_GPUS=$(( NUM_GPUS + 1 ))
+
+            # Build a JSON entry per GPU. jq would be cleaner but we'd have
+            # to build and merge per-GPU fragments; a plain string is fine
+            # here because every field is already sanitised (indexes/memory
+            # are numeric, uuid/name are trusted vendor output).
+            local entry
+            entry=$(jq -n \
+                --argjson index "$idx" \
+                --arg uuid "$uuid" \
+                --arg name "$name" \
+                --argjson memory_total_mib "$mem_total" \
+                --argjson power_limit_w "$power_limit" \
+                '{index: $index, uuid: $uuid, name: $name, memory_total_mib: $memory_total_mib, power_limit_w: $power_limit_w}')
+            if [ -z "$inventory_entries" ]; then
+                inventory_entries="$entry"
+            else
+                inventory_entries="$inventory_entries"$'\n'"$entry"
+            fi
+        done <<< "$csv"
+    fi
+
+    # Synthetic single-GPU fallback when nvidia-smi returned nothing.
+    if [ "$NUM_GPUS" -eq 0 ]; then
+        log_warning "discover_gpus: nvidia-smi returned no GPUs; falling back to synthetic single-GPU inventory"
+        GPU_INDEXES=("0")
+        GPU_NAMES[0]="GPU"
+        GPU_UUIDS[0]="legacy-unknown"
+        NUM_GPUS=1
+        inventory_entries=$(jq -n \
+            '{index: 0, uuid: "legacy-unknown", name: "GPU", memory_total_mib: 0, power_limit_w: 0}')
+    fi
+
+    # Update the legacy scalar state so Phase 1 code paths that still refer
+    # to GPU_NAME / GPU_UUID / GPU_INDEX keep working (flat-file writers,
+    # process_buffer env fallback).
+    GPU_INDEX="${GPU_INDEXES[0]}"
+    GPU_NAME="${GPU_NAMES[$GPU_INDEX]}"
+    GPU_UUID="${GPU_UUIDS[$GPU_INDEX]}"
+    export GPU_UUID
+
+    # Wrap the per-GPU entries in a top-level object and write atomically.
+    # Two separate failure modes to catch:
+    #  (a) jq can't parse/merge the per-GPU entries — indicates a bug
+    #      in the entry-building code above, fail fast rather than
+    #      letting safe_write_json persist an empty/invalid inventory.
+    #  (b) safe_write_json can't write the file — disk full, permissions,
+    #      read-only mount. Fail fast rather than running with a stale
+    #      inventory file and silently falling back to the single-UUID
+    #      env var for multi-GPU installs.
+    local inventory_json
+    if ! inventory_json=$(jq -s '{gpus: .}' <<< "$inventory_entries"); then
+        log_error "discover_gpus: failed to build GPU inventory JSON (jq error)"
+        return 1
+    fi
+    if ! safe_write_json "$INVENTORY_FILE" "$inventory_json"; then
+        log_error "discover_gpus: failed to write GPU inventory to $INVENTORY_FILE"
+        return 1
+    fi
+
+    log_debug "discover_gpus: detected $NUM_GPUS GPU(s): ${GPU_INDEXES[*]}"
     return 0
 }
 
@@ -451,12 +629,16 @@ def export_history_json(db_path, output_path, retention_seconds):
         # is exactly one retention value in the whole codebase.
         cutoff_time = int(datetime.now().timestamp()) - retention_seconds
         
-        # Query the database for everything newer than the computed cutoff
+        # Query the database for everything newer than the computed cutoff.
+        # Phase 2: filter on gpu_index = 0 so the legacy flat file stays a
+        # single-GPU rendering for the pre-Phase-3 frontend, even when the
+        # underlying DB contains rows for multiple GPUs. Phase 3 replaces
+        # this flat file with a per-GPU API endpoint.
         cur = conn.cursor()
         cur.execute('''
             SELECT timestamp, temperature, utilization, memory, power
             FROM gpu_metrics
-            WHERE timestamp_epoch > ?
+            WHERE gpu_index = 0 AND timestamp_epoch > ?
             ORDER BY timestamp_epoch ASC
         ''', (cutoff_time,))
         
@@ -538,10 +720,13 @@ def get_24hr_stats(db_path):
         # Calculate cutoff time (24 hours ago)
         cutoff_time = int((datetime.now() - timedelta(hours=24)).timestamp())
         
-        # Execute query to get min/max values
+        # Execute query to get min/max values.
+        # Phase 2: filter on gpu_index = 0 so the legacy 24h stats file
+        # keeps showing single-GPU numbers for the pre-Phase-3 frontend,
+        # even when the DB contains rows for multiple GPUs.
         cur = conn.cursor()
         cur.execute('''
-            SELECT 
+            SELECT
                 MIN(temperature) as temp_min,
                 MAX(temperature) as temp_max,
                 MIN(utilization) as util_min,
@@ -551,7 +736,7 @@ def get_24hr_stats(db_path):
                 MIN(CASE WHEN power > 0 THEN power ELSE NULL END) as power_min,
                 MAX(power) as power_max
             FROM gpu_metrics
-            WHERE timestamp_epoch > ?
+            WHERE gpu_index = 0 AND timestamp_epoch > ?
         ''', (cutoff_time,))
         
         row = cur.fetchone()
@@ -728,29 +913,73 @@ import sys
 import sqlite3
 from datetime import datetime
 
+def load_gpu_uuid_by_index(inventory_path):
+    """Load a map of gpu_index (int) -> gpu_uuid (str) from gpu_inventory.json.
+
+    Returns an empty dict if the file is missing, unreadable, or malformed.
+    Callers fall back to the GPU_MONITOR_GPU_UUID env var for single-GPU
+    deployments where the inventory file somehow doesn't exist yet."""
+    try:
+        import json
+        with open(inventory_path, 'r') as f:
+            inv = json.load(f)
+        return {int(g['index']): g['uuid'] for g in inv.get('gpus', [])}
+    except (IOError, ValueError, KeyError, TypeError):
+        return {}
+
+
+def _safe_float(s, default=0.0):
+    """Parse a CSV cell to float, returning `default` for N/A-style values
+    or any non-numeric input. nvidia-smi emits '[Not Supported]' and 'N/A'
+    for missing-telemetry fields (compute-only GPUs, vGPUs, older cards
+    where the sensor isn't wired up), and a bare float() call on those
+    aborts the whole buffer flush transaction, losing every row."""
+    try:
+        if s is None:
+            return default
+        cleaned = s.strip()
+        if cleaned in ('N/A', '[N/A]', '[Not Supported]', ''):
+            return default
+        return float(cleaned)
+    except (ValueError, AttributeError):
+        return default
+
+
 def process_buffer(db_path, buffer_lines):
-    # interval_s (the cadence the collector is currently running at) and
-    # gpu_uuid (the sampled GPU) come from environment variables set by
-    # the bash caller, not from the buffer lines themselves. This keeps
-    # the buffer file format small and line-position stable across ticks.
+    # interval_s (the cadence the collector is currently running at) comes
+    # from the GPU_MONITOR_INTERVAL_S env var set by the bash caller.
+    # gpu_uuid is looked up per-row from the gpu_inventory.json file that
+    # discover_gpus() writes at startup. Two distinct fallback modes:
+    #
+    #   1. Inventory file is empty/unreadable (single-GPU dev env without
+    #      nvidia-smi): use GPU_MONITOR_GPU_UUID env var for every row.
+    #      This is the expected legacy single-GPU path.
+    #
+    #   2. Inventory file has data but is missing a specific gpu_index
+    #      (hot-add/remove after startup, partial corruption): use the
+    #      'legacy-unknown' sentinel rather than silently attributing the
+    #      row to some other GPU's UUID. Silent misattribution would
+    #      corrupt per-GPU analytics in a way that is hard to detect later.
     try:
         interval_s = int(os.environ.get('GPU_MONITOR_INTERVAL_S', '4'))
     except ValueError:
         interval_s = 4
-    gpu_uuid = os.environ.get('GPU_MONITOR_GPU_UUID', 'legacy-unknown') or 'legacy-unknown'
+    legacy_env_uuid = os.environ.get('GPU_MONITOR_GPU_UUID', 'legacy-unknown') or 'legacy-unknown'
+    uuid_by_index = load_gpu_uuid_by_index('/app/gpu_inventory.json')
+    inventory_empty = not uuid_by_index
 
     try:
         conn = sqlite3.connect(db_path)
         conn.execute('BEGIN TRANSACTION')
 
-        # Phase 1 widens the INSERT to carry gpu_index, gpu_uuid, and
-        # interval_s. Phase 2 makes gpu_index dynamic per-row; for now it
-        # is pinned to 0 because the collector still only samples one GPU.
+        # Phase 2 insert: gpu_index is per-row (from the buffer line),
+        # gpu_uuid is looked up from the inventory, interval_s is the
+        # current collector cadence.
         stmt = '''
             INSERT INTO gpu_metrics
             (timestamp, timestamp_epoch, temperature, utilization, memory, power,
              gpu_index, gpu_uuid, interval_s)
-            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         '''
 
         for line in buffer_lines:
@@ -759,19 +988,36 @@ def process_buffer(db_path, buffer_lines):
                 continue
 
             parts = line.split(',')
-            if len(parts) < 5:
+            # Two supported formats:
+            #   Phase 2 (6 fields): timestamp,gpu_index,temp,util,mem,power
+            #   Phase 1 (5 fields): timestamp,temp,util,mem,power — legacy
+            # The 5-field path keeps a pre-upgrade on-disk buffer readable
+            # even after the bash script swaps to the 6-field format.
+            if len(parts) == 6:
+                timestamp = parts[0]
+                try:
+                    gpu_index = int(parts[1])
+                except ValueError:
+                    gpu_index = 0
+                metric_parts = parts[2:]
+            elif len(parts) == 5:
+                timestamp = parts[0]
+                gpu_index = 0
+                metric_parts = parts[1:]
+            else:
                 continue
 
-            timestamp = parts[0]
-            temperature = float(parts[1])
-            utilization = float(parts[2])
-            memory = float(parts[3])
-
-            # Handle N/A power values
-            try:
-                power = float(parts[4]) if parts[4].strip() != 'N/A' else 0
-            except (ValueError, AttributeError):
-                power = 0
+            # Use _safe_float for every metric field. Previously only
+            # power had N/A-aware handling, so a temperature/utilization/
+            # memory field of 'N/A' or '[Not Supported]' would raise
+            # ValueError out of float() and abort the whole flush,
+            # losing all buffered rows. Now one bad reading defaults to
+            # 0 and the flush proceeds — partial data is better than no
+            # data for a homelab GPU monitor.
+            temperature = _safe_float(metric_parts[0])
+            utilization = _safe_float(metric_parts[1])
+            memory = _safe_float(metric_parts[2])
+            power = _safe_float(metric_parts[3])
 
             # Parse timestamp to epoch. New format is "%Y-%m-%d %H:%M:%S";
             # fall back to the legacy yearless format for any stragglers in an
@@ -783,9 +1029,28 @@ def process_buffer(db_path, buffer_lines):
                 dt = datetime.strptime(f"{current_year} {timestamp}", "%Y %m-%d %H:%M:%S")
             timestamp_epoch = int(dt.timestamp())
 
+            # Dual-mode fallback per the comment at the top of this
+            # function. Three distinct cases:
+            #
+            #   (a) inventory present with an entry for this gpu_index
+            #       → use the real UUID from the inventory.
+            #   (b) inventory present but missing this gpu_index → use
+            #       'legacy-unknown' sentinel (partial corruption case).
+            #   (c) inventory empty / unreadable:
+            #       - gpu_index == 0 → env var (single-GPU legacy path)
+            #       - gpu_index != 0 → 'legacy-unknown' sentinel,
+            #         NOT the env var. The env var is specifically GPU 0's
+            #         UUID, so using it for non-zero indexes would silently
+            #         misattribute their rows to GPU 0 — exactly the
+            #         data-integrity issue we fixed in the (b) branch.
+            if inventory_empty:
+                gpu_uuid = legacy_env_uuid if gpu_index == 0 else 'legacy-unknown'
+            else:
+                gpu_uuid = uuid_by_index.get(gpu_index, 'legacy-unknown')
+
             conn.execute(stmt,
                 (timestamp, timestamp_epoch, temperature, utilization, memory, power,
-                 gpu_uuid, interval_s))
+                 gpu_index, gpu_uuid, interval_s))
         
         conn.commit()
         return True
@@ -869,80 +1134,193 @@ update_stats() {
     # records were misassigned to the flush-time year (e.g. a Dec 31 23:59 reading
     # flushed at Jan 1 00:00 would land an entire year in the future).
     local timestamp=$(date '+%Y-%m-%d %H:%M:%S')
-    local gpu_stats=$(nvidia-smi --query-gpu=temperature.gpu,utilization.gpu,memory.used,power.draw \
-                     --format=csv,noheader,nounits 2>/dev/null)
-    
-    if [[ -n "$gpu_stats" ]]; then
-        # Verify write access before proceeding
-        if ! touch "$BUFFER_FILE" 2>/dev/null; then
-            log_error "Cannot write to buffer file"
-            return 1
-        fi
 
-        # Buffer write with error handling
-        if ! echo "$timestamp,$gpu_stats" >> "$BUFFER_FILE"; then
-            log_error "Failed to write to buffer"
-            write_failed=1
-        fi
+    # Multi-GPU query: one row per attached GPU, prefixed with the GPU index
+    # so rows can be disambiguated downstream. The `index` field is always
+    # emitted first and the remaining field order matches Phase 1.
+    local gpu_stats
+    gpu_stats=$(nvidia-smi \
+        --query-gpu=index,temperature.gpu,utilization.gpu,memory.used,power.draw \
+        --format=csv,noheader,nounits 2>/dev/null)
 
-        # Detailed error logging for debugging
-        if [[ $write_failed -eq 1 ]]; then
-            log_error "Buffer write details:"
-            ls -l "$BUFFER_FILE" 2>&1 | log_error
-            df -h "$(dirname "$BUFFER_FILE")" 2>&1 | log_error
-        fi
+    if [[ -z "$gpu_stats" ]]; then
+        # Return 1 so the main retry loop engages its nvidia-smi-hiccup
+        # backoff (3 × 1s retries). Phase 2 initially returned 0 here
+        # which silently suppressed the retry mechanism and contradicted
+        # the "Returns: 0 on success, 1 on failure" contract.
+        log_error "Failed to get GPU stats output"
+        return 1
+    fi
 
-        # Update current stats JSON for real-time display
-        local temp=$(echo "$gpu_stats" | cut -d',' -f1 | tr -d ' ')
-        local util=$(echo "$gpu_stats" | cut -d',' -f2 | tr -d ' ')
-        local mem=$(echo "$gpu_stats" | cut -d',' -f3 | tr -d ' ')
-        local power=$(echo "$gpu_stats" | cut -d',' -f4 | tr -d ' []')
+    # Verify buffer write access before proceeding
+    if ! touch "$BUFFER_FILE" 2>/dev/null; then
+        log_error "Cannot write to buffer file"
+        return 1
+    fi
 
-        # Handle N/A power value
+    # Parse each row into the Phase 2 6-field buffer format:
+    #   timestamp,gpu_index,temperature,utilization,memory,power
+    # Also accumulate per-GPU values for the legacy single-GPU
+    # gpu_current_stats.json.
+    #
+    # gpu0_*   — specifically GPU with nvidia-smi index 0 (preferred)
+    # first_*  — whatever GPU came back first, used only as a fallback
+    #            if index 0 isn't present in the current query result
+    #            (rare edge case where a GPU was hot-removed after
+    #            discover_gpus ran).
+    local gpu0_temp="" gpu0_util="" gpu0_mem="" gpu0_power=""
+    local first_temp="" first_util="" first_mem="" first_power=""
+    local row_count=0
+    while IFS=',' read -r idx temp util mem power; do
+        # _trim_ws is a top-level helper (defined earlier in this file).
+        # Defining it inside this function would redefine a GLOBAL bash
+        # function on every tick — bash functions aren't locally scoped,
+        # regardless of where they're declared.
+        _trim_ws "$idx";   idx="$REPLY"
+        _trim_ws "$temp";  temp="$REPLY"
+        _trim_ws "$util";  util="$REPLY"
+        _trim_ws "$mem";   mem="$REPLY"
+        # power has additional [N/A] bracket handling; strip spaces and
+        # brackets using parameter-expansion substitutions.
+        power="${power// /}"
+        power="${power//[/}"
+        power="${power//]/}"
+
+        [ -z "$idx" ] && continue
+
+        # Handle [N/A] power per-row; some laptop/dGPU combos don't report
+        # power telemetry at all.
         if [[ "$power" == "N/A" || -z "$power" || "$power" == "[N/A]" ]]; then
             power="0"
         fi
-        
-        # Create JSON content
-        local json_content=$(cat << EOF
-{
-    "timestamp": "$timestamp",
-    "temperature": $temp,
-    "utilization": $util,
-    "memory": $mem,
-    "power": $power
-}
-EOF
-)
-        # Write JSON safely
-        safe_write_json "$JSON_FILE" "$json_content"
 
-        # Process buffer when full
-        if [[ -f "$BUFFER_FILE" ]] && [[ $(wc -l < "$BUFFER_FILE") -ge $BUFFER_SIZE ]]; then
-            process_buffer
-            process_historical_data
-            process_24hr_stats
+        # Append 6-field buffer line (atomic single-line append is
+        # write-safe across concurrent ticks because each update_stats
+        # call runs to completion before the next `sleep $INTERVAL`.)
+        if ! echo "$timestamp,$idx,$temp,$util,$mem,$power" >> "$BUFFER_FILE"; then
+            log_error "Failed to write GPU $idx line to buffer"
+            write_failed=1
         fi
-    else
-        log_error "Failed to get GPU stats output"
+        row_count=$(( row_count + 1 ))
+
+        # Capture first-seen values as a safety net, and the explicit
+        # index-0 values when we encounter them. The final legacy JSON
+        # write prefers gpu0_* but falls back to first_* if index 0 is
+        # absent. This keeps the Phase 2 "GPU 0 only" contract explicit
+        # in the code rather than relying on nvidia-smi returning GPUs
+        # in index order.
+        if [ -z "$first_temp" ]; then
+            first_temp="$temp"
+            first_util="$util"
+            first_mem="$mem"
+            first_power="$power"
+        fi
+        if [ "$idx" = "0" ]; then
+            gpu0_temp="$temp"
+            gpu0_util="$util"
+            gpu0_mem="$mem"
+            gpu0_power="$power"
+        fi
+    done <<< "$gpu_stats"
+
+    # Sanity-check: did nvidia-smi return as many rows as the inventory
+    # discovered at startup? A mismatch suggests a hot-add/remove event
+    # that discover_gpus hasn't seen yet. Log a warning so the condition
+    # is observable; don't fail the tick — partial data is better than
+    # no data for homelab monitoring.
+    if [ "$row_count" -ne "${NUM_GPUS:-1}" ]; then
+        log_warning "nvidia-smi returned $row_count rows but discover_gpus found $NUM_GPUS GPUs; hardware may have changed since startup"
+    fi
+
+    # Detailed error logging for debugging any write failures.
+    # log_error reads its message from $1, not stdin, so we capture each
+    # diagnostic command's output via $(...) and pass as an argument.
+    # The `ls ... | log_error` pipeline form in earlier revisions of this
+    # code silently dropped the diagnostic because log_error never read
+    # from stdin.
+    if [[ $write_failed -eq 1 ]]; then
+        log_error "Buffer write details:"
+        log_error "$(ls -l "$BUFFER_FILE" 2>&1)"
+        log_error "$(df -h "$(dirname "$BUFFER_FILE")" 2>&1)"
+    fi
+
+    # Prefer GPU-index-0 values; fall back to first-seen if idx 0 is absent
+    # in this tick. This is the "legacy GPU 0" contract made explicit.
+    local legacy_temp="${gpu0_temp:-$first_temp}"
+    local legacy_util="${gpu0_util:-$first_util}"
+    local legacy_mem="${gpu0_mem:-$first_mem}"
+    local legacy_power="${gpu0_power:-$first_power}"
+
+    # Normalize numeric fields to 0 on any parsing failure, so jq --argjson
+    # cannot fail on empty/non-numeric input. Phase 2's earlier form passed
+    # raw captured values directly and would silently produce an empty
+    # CONFIG_JSON on any malformed metric.
+    [[ "$legacy_temp" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || legacy_temp=0
+    [[ "$legacy_util" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || legacy_util=0
+    [[ "$legacy_mem" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || legacy_mem=0
+    [[ "$legacy_power" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || legacy_power=0
+
+    # Write the legacy single-GPU gpu_current_stats.json (GPU 0 only).
+    # Preserves the Phase 1 shape exactly so the existing frontend continues
+    # to render; Phase 3 will replace this with /api/metrics/current.
+    if [ -n "$legacy_temp" ]; then
+        local json_content
+        if json_content=$(jq -n \
+            --arg timestamp "$timestamp" \
+            --argjson temperature "$legacy_temp" \
+            --argjson utilization "$legacy_util" \
+            --argjson memory "$legacy_mem" \
+            --argjson power "$legacy_power" \
+            '{timestamp: $timestamp, temperature: $temperature, utilization: $utilization, memory: $memory, power: $power}'); then
+            safe_write_json "$JSON_FILE" "$json_content"
+        else
+            log_error "Failed to build legacy gpu_current_stats.json (jq error)"
+        fi
+    fi
+
+    # Process buffer when full. BUFFER_SIZE is already scaled by NUM_GPUS
+    # in load_settings(), so this threshold means "~flush_interval_seconds
+    # of wall-clock data buffered" regardless of card count.
+    if [[ -f "$BUFFER_FILE" ]] && [[ $(wc -l < "$BUFFER_FILE") -ge $BUFFER_SIZE ]]; then
+        process_buffer
+        process_historical_data
+        process_24hr_stats
     fi
 }
 
-# Write gpu_config.json using jq for proper JSON escaping (GPU_NAME from
-# nvidia-smi and GPU_MONITOR_VERSION from the VERSION file are both
-# external-ish inputs that could in principle contain JSON-significant
-# characters; jq handles escaping per RFC 8259). safe_write_json gives us
-# atomic temp-file + rename so readers never see a partially-written file.
-# This runs here rather than at the top of the file because both jq and
-# safe_write_json must be available before the call.
+# jq is a hard dependency for the startup path: discover_gpus and the
+# gpu_config.json generation both use it. Fail fast with a clear error.
 if ! command -v jq >/dev/null 2>&1; then
     log_error "jq is required to generate $CONFIG_FILE but was not found in PATH"
     exit 1
 fi
+
+# Discover attached GPUs. Populates NUM_GPUS, GPU_INDEXES, GPU_NAMES,
+# GPU_UUIDS, and writes $INVENTORY_FILE atomically via safe_write_json.
+# Falls back to a synthetic single-GPU entry if nvidia-smi is unavailable,
+# so the rest of the pipeline stays uniform for test and dev environments.
+# Fail-fast on inventory-write failure: running without a valid inventory
+# file would silently degrade multi-GPU lookups to the single-UUID env
+# var fallback, which is much harder to diagnose than a clean startup
+# error.
+if ! discover_gpus; then
+    log_error "Failed to discover GPUs; refusing to start without a valid inventory"
+    exit 1
+fi
+
+# Write gpu_config.json using jq for proper JSON escaping (GPU_NAME from
+# nvidia-smi and GPU_MONITOR_VERSION from the VERSION file are both
+# external-ish inputs that could in principle contain JSON-significant
+# characters; jq handles escaping per RFC 8259). The legacy "gpu_name"
+# top-level key is preserved as gpus[0].name so the existing frontend
+# keeps working unchanged during the Phase 2 → Phase 3 transition.
+# The new "gpus" array carries the full multi-GPU inventory by slurping
+# $INVENTORY_FILE (which discover_gpus just wrote) and projecting .gpus.
 if ! CONFIG_JSON=$(jq -n \
     --arg gpu_name "$GPU_NAME" \
     --arg version "$GPU_MONITOR_VERSION" \
-    '{gpu_name: $gpu_name, version: $version}'); then
+    --slurpfile inv "$INVENTORY_FILE" \
+    '{gpu_name: $gpu_name, version: $version, gpus: $inv[0].gpus}'); then
     log_error "Failed to generate $CONFIG_FILE via jq"
     exit 1
 fi
