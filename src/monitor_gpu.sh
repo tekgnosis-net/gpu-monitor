@@ -184,7 +184,25 @@ function load_settings() {
         new_flush="$new_interval"
     fi
 
-    if [ "$new_interval" != "$INTERVAL" ] || [ "$new_flush" != "$FLUSH_INTERVAL" ]; then
+    # Derive the intended BUFFER_SIZE from the CURRENT values of
+    # new_interval / new_flush / NUM_GPUS. Doing this unconditionally means
+    # the diff check below catches three orthogonal sources of change:
+    #   1. User edited settings.json (interval and/or flush)
+    #   2. discover_gpus() ran and populated NUM_GPUS > 1 at startup (the
+    #      first load_settings() call after startup will see the new count)
+    #   3. Some future path that mutates NUM_GPUS live (Phase 2 doesn't
+    #      have one, but the diff check is structured so it would Just Work)
+    # Without this, a multi-GPU install on default settings would never
+    # scale BUFFER_SIZE past the hardcoded 15, shortening the effective
+    # wall-clock flush cadence to 1/N of intended.
+    local ticks_per_flush=$(( (new_flush + new_interval - 1) / new_interval ))
+    [ "$ticks_per_flush" -lt 1 ] && ticks_per_flush=1
+    local new_buffer_size=$(( ticks_per_flush * ${NUM_GPUS:-1} ))
+    [ "$new_buffer_size" -lt 1 ] && new_buffer_size=1
+
+    if [ "$new_interval" != "$INTERVAL" ] \
+       || [ "$new_flush" != "$FLUSH_INTERVAL" ] \
+       || [ "$new_buffer_size" != "$BUFFER_SIZE" ]; then
         # CRITICAL: flush any buffered rows BEFORE applying the new interval
         # so they get written with the cadence they were actually sampled at.
         # Without this, rows buffered under the old INTERVAL would be flushed
@@ -216,16 +234,7 @@ function load_settings() {
 
         INTERVAL="$new_interval"
         FLUSH_INTERVAL="$new_flush"
-        # BUFFER_SIZE is expressed in rows, and each tick writes one row
-        # per attached GPU. Scaling by NUM_GPUS keeps the flush cadence
-        # (in wall-clock seconds) constant regardless of card count:
-        #   rows_per_flush = ceil(flush_s / interval_s) * num_gpus
-        # NUM_GPUS is 1 before discover_gpus() runs (safe default), and
-        # is updated to the real count at startup.
-        local ticks_per_flush=$(( (FLUSH_INTERVAL + INTERVAL - 1) / INTERVAL ))
-        [ "$ticks_per_flush" -lt 1 ] && ticks_per_flush=1
-        BUFFER_SIZE=$(( ticks_per_flush * ${NUM_GPUS:-1} ))
-        [ "$BUFFER_SIZE" -lt 1 ] && BUFFER_SIZE=1
+        BUFFER_SIZE="$new_buffer_size"
         log_warning "Collection settings reloaded: interval=${INTERVAL}s flush=${FLUSH_INTERVAL}s buffer_size=${BUFFER_SIZE} (ticks_per_flush=${ticks_per_flush} × num_gpus=${NUM_GPUS:-1})"
     fi
     return 0
@@ -1042,8 +1051,12 @@ update_stats() {
         --format=csv,noheader,nounits 2>/dev/null)
 
     if [[ -z "$gpu_stats" ]]; then
+        # Return 1 so the main retry loop engages its nvidia-smi-hiccup
+        # backoff (3 × 1s retries). Phase 2 initially returned 0 here
+        # which silently suppressed the retry mechanism and contradicted
+        # the "Returns: 0 on success, 1 on failure" contract.
         log_error "Failed to get GPU stats output"
-        return 0
+        return 1
     fi
 
     # Verify buffer write access before proceeding
@@ -1054,9 +1067,16 @@ update_stats() {
 
     # Parse each row into the Phase 2 6-field buffer format:
     #   timestamp,gpu_index,temperature,utilization,memory,power
-    # Also accumulate per-GPU objects for the legacy single-GPU
-    # gpu_current_stats.json (GPU 0 only, for pre-Phase-3 frontends).
+    # Also accumulate per-GPU values for the legacy single-GPU
+    # gpu_current_stats.json.
+    #
+    # gpu0_*   — specifically GPU with nvidia-smi index 0 (preferred)
+    # first_*  — whatever GPU came back first, used only as a fallback
+    #            if index 0 isn't present in the current query result
+    #            (rare edge case where a GPU was hot-removed after
+    #            discover_gpus ran).
     local gpu0_temp="" gpu0_util="" gpu0_mem="" gpu0_power=""
+    local first_temp="" first_util="" first_mem="" first_power=""
     local row_count=0
     while IFS=',' read -r idx temp util mem power; do
         idx=$(echo "$idx" | xargs)
@@ -1082,17 +1102,34 @@ update_stats() {
         fi
         row_count=$(( row_count + 1 ))
 
-        # Capture the first GPU's values for the legacy single-GPU
-        # gpu_current_stats.json. Phase 3 replaces this file with a
-        # per-GPU API endpoint; Phase 2 keeps emitting the old shape so
-        # the classic HTML frontend keeps working.
-        if [ -z "$gpu0_temp" ]; then
+        # Capture first-seen values as a safety net, and the explicit
+        # index-0 values when we encounter them. The final legacy JSON
+        # write prefers gpu0_* but falls back to first_* if index 0 is
+        # absent. This keeps the Phase 2 "GPU 0 only" contract explicit
+        # in the code rather than relying on nvidia-smi returning GPUs
+        # in index order.
+        if [ -z "$first_temp" ]; then
+            first_temp="$temp"
+            first_util="$util"
+            first_mem="$mem"
+            first_power="$power"
+        fi
+        if [ "$idx" = "0" ]; then
             gpu0_temp="$temp"
             gpu0_util="$util"
             gpu0_mem="$mem"
             gpu0_power="$power"
         fi
     done <<< "$gpu_stats"
+
+    # Sanity-check: did nvidia-smi return as many rows as the inventory
+    # discovered at startup? A mismatch suggests a hot-add/remove event
+    # that discover_gpus hasn't seen yet. Log a warning so the condition
+    # is observable; don't fail the tick — partial data is better than
+    # no data for homelab monitoring.
+    if [ "$row_count" -ne "${NUM_GPUS:-1}" ]; then
+        log_warning "nvidia-smi returned $row_count rows but discover_gpus found $NUM_GPUS GPUs; hardware may have changed since startup"
+    fi
 
     # Detailed error logging for debugging any write failures.
     if [[ $write_failed -eq 1 ]]; then
@@ -1101,19 +1138,38 @@ update_stats() {
         df -h "$(dirname "$BUFFER_FILE")" 2>&1 | log_error
     fi
 
+    # Prefer GPU-index-0 values; fall back to first-seen if idx 0 is absent
+    # in this tick. This is the "legacy GPU 0" contract made explicit.
+    local legacy_temp="${gpu0_temp:-$first_temp}"
+    local legacy_util="${gpu0_util:-$first_util}"
+    local legacy_mem="${gpu0_mem:-$first_mem}"
+    local legacy_power="${gpu0_power:-$first_power}"
+
+    # Normalize numeric fields to 0 on any parsing failure, so jq --argjson
+    # cannot fail on empty/non-numeric input. Phase 2's earlier form passed
+    # raw captured values directly and would silently produce an empty
+    # CONFIG_JSON on any malformed metric.
+    [[ "$legacy_temp" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || legacy_temp=0
+    [[ "$legacy_util" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || legacy_util=0
+    [[ "$legacy_mem" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || legacy_mem=0
+    [[ "$legacy_power" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || legacy_power=0
+
     # Write the legacy single-GPU gpu_current_stats.json (GPU 0 only).
     # Preserves the Phase 1 shape exactly so the existing frontend continues
     # to render; Phase 3 will replace this with /api/metrics/current.
-    if [ -n "$gpu0_temp" ]; then
+    if [ -n "$legacy_temp" ]; then
         local json_content
-        json_content=$(jq -n \
+        if json_content=$(jq -n \
             --arg timestamp "$timestamp" \
-            --argjson temperature "$gpu0_temp" \
-            --argjson utilization "$gpu0_util" \
-            --argjson memory "$gpu0_mem" \
-            --argjson power "$gpu0_power" \
-            '{timestamp: $timestamp, temperature: $temperature, utilization: $utilization, memory: $memory, power: $power}')
-        safe_write_json "$JSON_FILE" "$json_content"
+            --argjson temperature "$legacy_temp" \
+            --argjson utilization "$legacy_util" \
+            --argjson memory "$legacy_mem" \
+            --argjson power "$legacy_power" \
+            '{timestamp: $timestamp, temperature: $temperature, utilization: $utilization, memory: $memory, power: $power}'); then
+            safe_write_json "$JSON_FILE" "$json_content"
+        else
+            log_error "Failed to build legacy gpu_current_stats.json (jq error)"
+        fi
     fi
 
     # Process buffer when full. BUFFER_SIZE is already scaled by NUM_GPUS
