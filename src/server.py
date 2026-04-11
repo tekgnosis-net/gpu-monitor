@@ -572,11 +572,33 @@ async def handle_put_settings(request: web.Request) -> web.Response:
     if not isinstance(body, dict):
         return web.json_response({"error": "body must be a JSON object"}, status=400)
 
+    # SECURITY: strip `smtp.password_enc` from the incoming body
+    # unconditionally. That field is the ciphertext — it must only
+    # ever be computed server-side from the `smtp.password` plaintext
+    # transition below and the existing on-disk value. A client that
+    # PUTs a raw `password_enc` would otherwise bypass Fernet
+    # encryption entirely and persist plaintext or arbitrary junk
+    # into the field that claims to be encrypted. Rejecting with 400
+    # instead of silently dropping makes the attack attempt
+    # observable in the response body; we drop rather than reject
+    # because older client SDKs might round-trip a previously-GET'd
+    # settings object (which never contains password_enc — see
+    # _redact_smtp_password — so this branch is defense against
+    # hand-crafted payloads, not compatibility breakage).
+    smtp_body = body.get("smtp")
+    if isinstance(smtp_body, dict) and "password_enc" in smtp_body:
+        return web.json_response(
+            {
+                "error": "smtp.password_enc is server-computed and cannot be set directly",
+                "hint": "use smtp.password to set or clear the plaintext",
+            },
+            status=400,
+        )
+
     # Extract the SMTP password transition BEFORE the merge so the
     # deep-merge logic doesn't have to understand the sentinel. We
     # re-inject the encrypted form into the merged dict after
     # validation.
-    smtp_body = body.get("smtp")
     plaintext_password: str | None
     clear_password = False
     if isinstance(smtp_body, dict) and "password" in smtp_body:
@@ -645,18 +667,19 @@ async def handle_smtp_test(request: web.Request) -> web.Response:
     saved* SMTP config. Reports success/failure inline to the Settings
     view so the user gets immediate feedback on their configuration.
 
-    Phase 6.1 stub: the actual mailer lives in 6.3 so this returns a
-    501 Not Implemented until reporting.mailer is wired up. Flagged
-    as stubbed rather than omitted so the route is registered, the
-    URL pattern is stable, and the Settings view's "Test" button has
-    something to call from day one.
+    Phase 6a stub: the actual mailer wrapper (`reporting.mailer`)
+    lands in a later sub-PR of Phase 6. This handler returns a 501
+    Not Implemented until then. Flagged as stubbed rather than
+    omitted so the route is registered, the URL pattern is stable,
+    and the Settings view's "Test" button has something to call
+    from day one.
     """
     if not _origin_is_same(request):
         return web.json_response({"error": "cross-origin rejected"}, status=403)
     return web.json_response(
         {
             "ok": False,
-            "error": "SMTP mailer not yet implemented (Phase 6.3)",
+            "error": "SMTP mailer not yet implemented",
         },
         status=501,
     )

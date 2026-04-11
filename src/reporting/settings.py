@@ -253,12 +253,22 @@ def _deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any
 def load_settings(path: Path) -> dict[str, Any]:
     """Read settings.json and deep-merge over the defaults.
 
-    Missing file → pure defaults. Malformed JSON → pure defaults + a
-    warning (logged by the caller — this helper stays side-effect-free
-    on the log side so tests can call it without a logging fixture).
-    Invalid values that don't pass Pydantic validation → defaults for
-    *that subsection only* (the merge falls back per-section so one
-    bad key doesn't nuke unrelated settings).
+    Fallback rules on the various failure modes:
+
+      * Missing file             → pure defaults
+      * Malformed JSON            → pure defaults
+      * Top-level JSON not a dict → pure defaults
+      * Pydantic validation fails → pure defaults (wholesale, not
+                                    per-subsection)
+
+    The wholesale validation-failure fallback is deliberate: a
+    half-valid settings dict is worse than the documented defaults,
+    because downstream code would trust it. Reviewers considering
+    "per-subsection fallback" should note that Pydantic doesn't
+    surface per-section validity in a single pass — implementing
+    partial fallback would require running `SubModel.model_validate`
+    on each top-level section separately, doubling the validation
+    cost without a clear behavioral win.
 
     Returns the plain `dict` form, not a Settings model instance,
     because the consumers (server handlers, the scheduler) want to

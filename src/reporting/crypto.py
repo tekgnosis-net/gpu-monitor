@@ -37,6 +37,7 @@ re-enter SMTP password.
 from __future__ import annotations
 
 import os
+import tempfile
 from pathlib import Path
 
 from cryptography.fernet import Fernet, InvalidToken
@@ -83,15 +84,42 @@ def load_or_create_key(path: Path = DEFAULT_KEY_PATH) -> bytes:
         return key_bytes
 
     # First-run: generate a key, write it atomically, chmod 0600.
+    # Use tempfile.mkstemp rather than a deterministic .tmp path so
+    # concurrent initializers (e.g. the server startup and the
+    # scheduler subprocess racing on the same volume) each get a
+    # unique filename and one of the atomic renames wins cleanly
+    # without clobbering the other's write. Best-effort unlink on
+    # any failure so we never leave a stale tempfile polluting the
+    # directory, and never leave a zero-byte / partial key file
+    # mistaken for a real secret.
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         key_bytes = Fernet.generate_key()
-        # Write to a temp file in the same directory then rename, so
-        # a partial write never leaves a readable zero-byte key file.
-        tmp_path = path.with_suffix(path.suffix + ".tmp")
-        tmp_path.write_bytes(key_bytes)
-        os.chmod(tmp_path, 0o600)
-        os.replace(tmp_path, path)
+        # prefix matches save_settings's convention: dot-prefixed so
+        # ls doesn't expose the tempfile, name includes the target
+        # filename for debuggability if one ever gets orphaned.
+        fd, tmp_path_str = tempfile.mkstemp(
+            prefix=f".{path.name}.",
+            suffix=".tmp",
+            dir=str(path.parent),
+        )
+        tmp_path = Path(tmp_path_str)
+        try:
+            with os.fdopen(fd, "wb") as tmp_fh:
+                tmp_fh.write(key_bytes)
+                tmp_fh.flush()
+                os.fsync(tmp_fh.fileno())
+            os.chmod(tmp_path, 0o600)
+            os.replace(tmp_path, path)
+        except OSError:
+            # Best-effort cleanup of the stray tempfile before
+            # re-raising — never leave secret-looking garbage behind.
+            try:
+                if tmp_path.exists():
+                    os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
     except OSError as exc:
         raise CryptoError(
             f"cannot create key file {path}: {exc}. "

@@ -246,6 +246,34 @@ async def test_put_smtp_password_wrong_type_returns_400(client):
     assert resp.status == 400
 
 
+@pytest.mark.asyncio
+async def test_put_smtp_password_enc_directly_is_rejected(client, tmp_base):
+    """SECURITY: a client cannot set smtp.password_enc directly — that
+    would bypass Fernet encryption and let plaintext (or arbitrary
+    garbage) land in the field that's supposed to be ciphertext.
+    The server must reject the request with 400 before writing
+    anything to disk."""
+    # Pre-set a legitimate encrypted password so we can prove the
+    # rejected request didn't overwrite it.
+    await client.put("/api/settings", json={"smtp": {"password": "legitimate"}})
+    before = json.loads((tmp_base / "settings.json").read_text())["smtp"]["password_enc"]
+    assert before != ""
+
+    # Attempt to inject plaintext as if it were ciphertext
+    resp = await client.put(
+        "/api/settings",
+        json={"smtp": {"password_enc": "plaintext-attacker-controlled"}},
+    )
+    assert resp.status == 400
+    data = await resp.json()
+    assert "password_enc" in data["error"]
+
+    # Disk state must be unchanged — the rejection happens before
+    # the deep-merge + save path.
+    after = json.loads((tmp_base / "settings.json").read_text())["smtp"]["password_enc"]
+    assert after == before
+
+
 # ─── Cross-origin defense ──────────────────────────────────────────────────
 
 
@@ -270,10 +298,11 @@ async def test_put_cross_origin_is_rejected(client):
 
 @pytest.mark.asyncio
 async def test_smtp_test_returns_501_stub(client):
-    """Phase 6.1 stubs /api/settings/smtp/test as 501 Not Implemented so
-    the route is registered and the UI can call it once 6.3 lands."""
+    """Phase 6a stubs /api/settings/smtp/test as 501 Not Implemented so
+    the route is registered and the UI can call it once the real
+    mailer lands in a later sub-PR."""
     resp = await client.post("/api/settings/smtp/test")
     assert resp.status == 501
     data = await resp.json()
     assert data["ok"] is False
-    assert "Phase 6.3" in data["error"]
+    assert "not yet implemented" in data["error"]
