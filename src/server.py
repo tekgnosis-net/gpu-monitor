@@ -12,6 +12,12 @@ frontend. Routes:
     GET  /api/metrics/history?range=24h&gpu=0 timeseries for one GPU
     GET  /api/stats/24h                       per-GPU min/max array
     GET  /api/stats/power?range=24h&gpu=0     integrated energy + power stats
+    GET  /api/settings                        current settings.json (pw redacted)
+    PUT  /api/settings                        partial-merge update with validation
+    POST /api/settings/smtp/test              send a test email with current config
+    GET  /api/housekeeping/db-info            size, row count, oldest/newest, per-GPU
+    POST /api/housekeeping/vacuum             run SQLite VACUUM, return freed bytes
+    POST /api/housekeeping/purge              delete rows older than N days
 
 The API reads from:
   * /app/VERSION             (single source of truth for version)
@@ -39,15 +45,38 @@ point; Phase 3 does not.
 import json
 import logging
 import sqlite3
+import sys
 from pathlib import Path
 
 from aiohttp import web
+
+# Allow `from reporting import ...` even when server.py is run via
+# `python3 /app/server.py` rather than as part of a package. The
+# Dockerfile lays out /app with server.py at the root and reporting/
+# as a sibling directory; adding the parent directory (BASE_DIR) to
+# sys.path mirrors how the module discovery would work if we had a
+# setup.py or pyproject.toml in the image.
+_SERVER_DIR = Path(__file__).resolve().parent
+if str(_SERVER_DIR) not in sys.path:
+    sys.path.insert(0, str(_SERVER_DIR))
+
+from reporting import crypto  # noqa: E402
+from reporting.settings import (  # noqa: E402
+    DEFAULT_SETTINGS,
+    Settings,
+    deep_merge,
+    load_settings,
+    save_settings,
+)
+from pydantic import ValidationError  # noqa: E402
 
 
 BASE_DIR = Path("/app")
 VERSION_FILE = BASE_DIR / "VERSION"
 INVENTORY_FILE = BASE_DIR / "gpu_inventory.json"
 DB_FILE = BASE_DIR / "history" / "gpu_metrics.db"
+SETTINGS_FILE = BASE_DIR / "settings.json"
+SECRET_KEY_FILE = BASE_DIR / "history" / ".secret"
 SCHEMA_VERSION = 2  # Matches Phase 1 migration (gpu_index, gpu_uuid, interval_s)
 
 # Allowed `range` query parameter values and their durations in seconds.
@@ -122,6 +151,20 @@ def _open_db_readonly() -> sqlite3.Connection:
     rather than relying on reviewer discipline."""
     uri = f"file:{DB_FILE}?mode=ro"
     conn = sqlite3.connect(uri, uri=True, timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _open_db_readwrite() -> sqlite3.Connection:
+    """Open a read/write connection to the metrics database. Used only
+    by the Phase 6 housekeeping routes (VACUUM, purge). The collector
+    remains the only writer of measurements; these routes mutate
+    *user-triggered* housekeeping operations on the same data.
+    Longer timeout than the read-only path because VACUUM can be
+    slow on large databases — SQLite will hold a write lock the
+    whole time."""
+    uri = f"file:{DB_FILE}?mode=rw"
+    conn = sqlite3.connect(uri, uri=True, timeout=30.0)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -437,6 +480,492 @@ async def handle_stats_power(request: web.Request) -> web.Response:
     })
 
 
+# ─── Settings (Phase 6) ────────────────────────────────────────────────────
+
+
+# Sentinel used by PUT /api/settings: smtp.password field semantics.
+#
+#   Field absent            → do not touch password_enc (preserve existing)
+#   Field present = null    → same as absent (explicit "no change")
+#   Field present = ""      → clear password_enc to ""
+#   Field present = "X"     → encrypt "X" and store in password_enc
+#
+# The sentinel lets clients distinguish "I didn't send this field" from
+# "I want to explicitly clear it". Without it, a PUT body containing
+# everything *except* smtp.password would have to gymnastically preserve
+# the existing ciphertext on the server side — this way the server just
+# follows the rule table above.
+
+
+def _redact_smtp_password(settings_dict: dict) -> dict:
+    """Replace `smtp.password_enc` (ciphertext) with `smtp.password_set`
+    (boolean) before sending settings to the client. The client should
+    never see the ciphertext — even though it's encrypted, leaking it
+    into browser DevTools / network logs would be an unnecessary
+    attack surface. Display the boolean "is a password configured"
+    instead, and let the user re-enter the plaintext in Settings if
+    they want to change it."""
+    redacted = json.loads(json.dumps(settings_dict))  # cheap deep copy
+    smtp = redacted.get("smtp", {})
+    password_enc = smtp.pop("password_enc", "")
+    smtp["password_set"] = bool(password_enc)
+    return redacted
+
+
+def _normalize_host_port(raw: str) -> tuple[str, str]:
+    """Split a `host[:port]` string into (host, port), handling
+    IPv6 brackets and case-insensitive host comparison.
+
+    Returns ("", "") on malformed input. Used by _origin_is_same
+    to produce a canonical (host, port) pair that can be compared
+    across Origin / Host headers regardless of cosmetic
+    differences (case, bracketing, port representation).
+    """
+    if not raw:
+        return ("", "")
+    raw = raw.strip()
+    # IPv6 bracketed form: [::1]:8080 or [::1]
+    if raw.startswith("["):
+        close = raw.find("]")
+        if close == -1:
+            return ("", "")
+        host = raw[1:close].lower()
+        rest = raw[close + 1:]
+        port = rest[1:] if rest.startswith(":") else ""
+        return (host, port)
+    # Plain form: host[:port]
+    if ":" in raw:
+        host, _, port = raw.rpartition(":")
+        return (host.lower(), port)
+    return (raw.lower(), "")
+
+
+# Default ports per URL scheme. Used by the Origin/Host normalizer
+# below so an Origin of "http://foo" (no port) compares equal to a
+# Host of "foo:80" (explicit default port).
+_DEFAULT_PORT = {"http": "80", "https": "443"}
+
+
+def _origin_is_same(request: web.Request) -> bool:
+    """Defense-in-depth CSRF check for mutating routes. aiohttp gives
+    us Origin and Host headers; a same-origin request has them
+    matching after canonicalization.
+
+    Canonicalization handles three edge cases:
+
+      1. **Case-insensitive host comparison.** "Example.com" and
+         "example.com" are the same host.
+      2. **IPv6 bracket handling.** An Origin of "[::1]:8080" must
+         compare equal to a Host of "[::1]:8080", and the brackets
+         must be stripped before comparison.
+      3. **Default port normalization.** Origin "http://example.com"
+         (no port → default 80) must compare equal to
+         Host "example.com:80", and both should also equal Host
+         "example.com" if the scheme is known.
+
+    Origin is absent on same-origin GETs and direct curl calls. We
+    only enforce when it's present; a None Origin is indistinguishable
+    from a direct client and rejecting on its absence would break
+    legitimate CLI usage.
+
+    This is a LAN-only defense — it doesn't stop a malicious LAN
+    client — but it costs a few lines and prevents a drive-by click
+    on a bookmark'd IP from mutating settings via a malicious page
+    in another tab.
+    """
+    origin = request.headers.get("Origin")
+    if not origin:
+        return True
+
+    host_header = request.headers.get("Host", "")
+    if not host_header:
+        return False
+
+    # Parse the Origin with urlparse so we get scheme + netloc + port
+    # without hand-rolling the split. `parsed.hostname` lowercases
+    # and strips IPv6 brackets; `parsed.port` returns an int or None.
+    try:
+        from urllib.parse import urlparse
+        parsed = urlparse(origin)
+    except ValueError:
+        return False
+
+    origin_host = (parsed.hostname or "").lower()
+    origin_port = str(parsed.port) if parsed.port else _DEFAULT_PORT.get(parsed.scheme, "")
+
+    host_host, host_port = _normalize_host_port(host_header)
+    # If the Host header lacked a port, fill in the scheme default
+    # so the comparison is apples-to-apples.
+    if not host_port:
+        host_port = _DEFAULT_PORT.get(parsed.scheme, "")
+
+    return origin_host == host_host and origin_port == host_port
+
+
+async def handle_get_settings(request: web.Request) -> web.Response:
+    """Return current settings with SMTP password ciphertext redacted.
+
+    Missing settings.json is a valid state — returns the DEFAULT_SETTINGS
+    shape so first-run UIs render identically to post-save UIs.
+    """
+    try:
+        data = load_settings(SETTINGS_FILE)
+    except Exception as exc:  # pragma: no cover — load_settings swallows its own errors
+        log.warning("get_settings: load failed: %s", exc)
+        data = json.loads(json.dumps(DEFAULT_SETTINGS))
+
+    return web.json_response(_redact_smtp_password(data))
+
+
+async def handle_put_settings(request: web.Request) -> web.Response:
+    """Partial-merge update: deep-merge the request body over the
+    current settings, validate via Pydantic, encrypt smtp.password
+    transition if present, atomically write.
+
+    Errors returned as JSON:
+        400 — body not JSON, or validation failure (with field detail)
+        403 — same-origin check failed
+        500 — filesystem / crypto failure
+    """
+    if not _origin_is_same(request):
+        return web.json_response({"error": "cross-origin rejected"}, status=403)
+
+    try:
+        body = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+
+    if not isinstance(body, dict):
+        return web.json_response({"error": "body must be a JSON object"}, status=400)
+
+    # SECURITY: reject PUT bodies that contain `smtp.password_enc`.
+    # That field is the ciphertext — it must only ever be computed
+    # server-side from the `smtp.password` plaintext transition
+    # below and the existing on-disk value. A client that PUTs a
+    # raw `password_enc` would otherwise bypass Fernet encryption
+    # entirely and persist plaintext or arbitrary junk into the
+    # field that claims to be encrypted.
+    #
+    # Rejecting with 400 (rather than silently stripping) makes the
+    # attack attempt observable in both the response body and the
+    # server log. Legitimate clients never need to set this field
+    # because GET /api/settings redacts it to `password_set: bool`
+    # — any round-trip of a GET'd settings object will not contain
+    # password_enc, so no legitimate workflow breaks.
+    smtp_body = body.get("smtp")
+    if isinstance(smtp_body, dict) and "password_enc" in smtp_body:
+        return web.json_response(
+            {
+                "error": "smtp.password_enc is server-computed and cannot be set directly",
+                "hint": "use smtp.password to set or clear the plaintext",
+            },
+            status=400,
+        )
+
+    # Extract the SMTP password transition BEFORE the merge so the
+    # deep-merge logic doesn't have to understand the sentinel. We
+    # re-inject the encrypted form into the merged dict after
+    # validation.
+    plaintext_password: str | None
+    clear_password = False
+    if isinstance(smtp_body, dict) and "password" in smtp_body:
+        raw = smtp_body.pop("password")
+        if raw is None:
+            plaintext_password = None   # absent / unchanged
+        elif raw == "":
+            plaintext_password = None   # still "no change to plaintext"
+            clear_password = True       # but explicitly clear the ciphertext
+        elif isinstance(raw, str):
+            plaintext_password = raw
+        else:
+            return web.json_response(
+                {"error": "smtp.password must be a string or null"}, status=400
+            )
+    else:
+        plaintext_password = None
+
+    # Deep-merge over the existing file, then validate the result.
+    # deep_merge is the public helper from reporting.settings (the
+    # underscore-prefixed `_deep_merge` is a back-compat alias and
+    # should not be used from new code — the Copilot round 2 review
+    # correctly flagged the original import as private-API coupling).
+    current = load_settings(SETTINGS_FILE)
+    merged = deep_merge(current, body)
+
+    try:
+        validated = Settings.model_validate(merged)
+    except ValidationError as exc:
+        return web.json_response(
+            {"error": "validation failed", "detail": exc.errors()},
+            status=400,
+        )
+
+    validated_dict = validated.model_dump(by_alias=True)
+
+    # Apply the SMTP password transition after validation (Pydantic
+    # doesn't know about the plaintext field, only password_enc).
+    if clear_password:
+        validated_dict.setdefault("smtp", {})["password_enc"] = ""
+    elif plaintext_password is not None:
+        try:
+            key = crypto.load_or_create_key(SECRET_KEY_FILE)
+            validated_dict.setdefault("smtp", {})["password_enc"] = crypto.encrypt(
+                plaintext_password, key
+            )
+        except crypto.CryptoError as exc:
+            log.error("put_settings: encryption failed: %s", exc)
+            return web.json_response(
+                {"error": "encryption failed", "detail": str(exc)},
+                status=500,
+            )
+
+    try:
+        save_settings(SETTINGS_FILE, validated_dict)
+    except OSError as exc:
+        log.error("put_settings: write failed: %s", exc)
+        return web.json_response(
+            {"error": "could not persist settings", "detail": str(exc)},
+            status=500,
+        )
+
+    return web.json_response(_redact_smtp_password(validated_dict))
+
+
+async def handle_smtp_test(request: web.Request) -> web.Response:
+    """Send a "Hello from GPU Monitor" test email using the *currently
+    saved* SMTP config. Reports success/failure inline to the Settings
+    view so the user gets immediate feedback on their configuration.
+
+    Phase 6a stub: the actual mailer wrapper (`reporting.mailer`)
+    lands in a later sub-PR of Phase 6. This handler returns a 501
+    Not Implemented until then. Flagged as stubbed rather than
+    omitted so the route is registered, the URL pattern is stable,
+    and the Settings view's "Test" button has something to call
+    from day one.
+    """
+    if not _origin_is_same(request):
+        return web.json_response({"error": "cross-origin rejected"}, status=403)
+    return web.json_response(
+        {
+            "ok": False,
+            "error": "SMTP mailer not yet implemented",
+        },
+        status=501,
+    )
+
+
+# ─── Housekeeping (Phase 6.2) ───────────────────────────────────────────────
+
+
+async def handle_db_info(request: web.Request) -> web.Response:
+    """Return a snapshot of the metrics database's physical state:
+    file size, total row count, oldest/newest sample epoch, and per-GPU
+    row counts. Used by the Settings → Housekeeping tab to show the
+    user what the container is currently storing.
+
+    The file size includes the main .db file only — the WAL / SHM
+    sidecar files from Phase 1's WAL mode are transient and their
+    size depends on recent write activity, so including them would
+    make the reported size flap.
+    """
+    try:
+        size_bytes = DB_FILE.stat().st_size if DB_FILE.exists() else 0
+    except OSError as exc:
+        log.warning("db_info: stat failed: %s", exc)
+        size_bytes = 0
+
+    try:
+        conn = _open_db_readonly()
+    except sqlite3.OperationalError as exc:
+        log.warning("db_info: cannot open DB: %s", exc)
+        return web.json_response({
+            "size_bytes": size_bytes,
+            "row_count": 0,
+            "oldest_epoch": None,
+            "newest_epoch": None,
+            "row_count_per_gpu": [],
+        })
+
+    try:
+        try:
+            summary = conn.execute("""
+                SELECT
+                    COUNT(*)             AS row_count,
+                    MIN(timestamp_epoch) AS oldest,
+                    MAX(timestamp_epoch) AS newest
+                FROM gpu_metrics
+            """).fetchone()
+            per_gpu_rows = conn.execute("""
+                SELECT gpu_index, COUNT(*) AS n
+                FROM gpu_metrics
+                GROUP BY gpu_index
+                ORDER BY gpu_index ASC
+            """).fetchall()
+        except sqlite3.OperationalError as exc:
+            log.warning("db_info: query failed: %s", exc)
+            return web.json_response({
+                "size_bytes": size_bytes,
+                "row_count": 0,
+                "oldest_epoch": None,
+                "newest_epoch": None,
+                "row_count_per_gpu": [],
+            })
+    finally:
+        conn.close()
+
+    return web.json_response({
+        "size_bytes": size_bytes,
+        "row_count": int(summary["row_count"] or 0),
+        "oldest_epoch": summary["oldest"],
+        "newest_epoch": summary["newest"],
+        "row_count_per_gpu": [
+            {"gpu_index": r["gpu_index"], "row_count": int(r["n"])}
+            for r in per_gpu_rows
+        ],
+    })
+
+
+async def handle_vacuum(request: web.Request) -> web.Response:
+    """Run SQLite VACUUM on the metrics database and return the freed
+    bytes. VACUUM rebuilds the file from scratch, compacting free
+    pages that accumulated from DELETE operations (notably
+    clean_old_data running nightly).
+
+    VACUUM requires the database to not be held in any transaction by
+    another connection, and holds an exclusive write lock for the
+    duration. On a homelab-sized DB (~100 MB) this takes a few
+    seconds; on a 1 GB+ DB it can take a minute or more. The 30 s
+    connection timeout above caps the worst case — if we can't
+    acquire the lock in 30 s we return 503 rather than hanging the
+    request forever.
+    """
+    if not _origin_is_same(request):
+        return web.json_response({"error": "cross-origin rejected"}, status=403)
+
+    try:
+        before = DB_FILE.stat().st_size if DB_FILE.exists() else 0
+    except OSError:
+        before = 0
+
+    try:
+        conn = _open_db_readwrite()
+    except sqlite3.OperationalError as exc:
+        log.warning("vacuum: cannot open DB for write: %s", exc)
+        return web.json_response(
+            {"error": "database unavailable", "detail": str(exc)},
+            status=503,
+        )
+
+    try:
+        try:
+            # VACUUM cannot run inside a transaction. isolation_level=None
+            # disables the implicit BEGIN sqlite3 normally wraps around
+            # executes — essential for VACUUM, harmless for everything
+            # else we might run here.
+            conn.isolation_level = None
+            conn.execute("VACUUM")
+        except sqlite3.OperationalError as exc:
+            log.warning("vacuum: execute failed: %s", exc)
+            return web.json_response(
+                {"error": "vacuum failed", "detail": str(exc)},
+                status=503,
+            )
+    finally:
+        conn.close()
+
+    try:
+        after = DB_FILE.stat().st_size if DB_FILE.exists() else before
+    except OSError:
+        after = before
+
+    # freed_bytes can be negative if VACUUM actually grew the file
+    # (uncommon but possible if fragmentation was minimal and the
+    # rebuilt version pads). Report the raw delta; the UI shows "0 MB
+    # freed" for non-positive deltas.
+    freed = before - after
+    return web.json_response({
+        "ok": True,
+        "size_before": before,
+        "size_after": after,
+        "freed_bytes": freed,
+    })
+
+
+async def handle_purge(request: web.Request) -> web.Response:
+    """Delete rows older than N days. Body: {"days": N} where
+    N is a positive integer. Returns the number of rows deleted.
+
+    This is the user-triggered version of the collector's nightly
+    clean_old_data, for cases where someone wants to manually reclaim
+    space without waiting for the daily sweep. Always safe: the
+    DELETE is bounded by `timestamp_epoch < (now - N days)`, so the
+    same request run twice is idempotent (the second run deletes
+    zero rows).
+    """
+    if not _origin_is_same(request):
+        return web.json_response({"error": "cross-origin rejected"}, status=403)
+
+    try:
+        body = await request.json()
+    except (ValueError, json.JSONDecodeError):
+        return web.json_response({"error": "invalid JSON body"}, status=400)
+
+    if not isinstance(body, dict):
+        return web.json_response({"error": "body must be a JSON object"}, status=400)
+
+    days_raw = body.get("days")
+    if not isinstance(days_raw, int) or isinstance(days_raw, bool):
+        return web.json_response(
+            {"error": "days must be a positive integer"}, status=400
+        )
+    # Upper bound: 365 (one year). Lower bound: 1 (purging with days=0
+    # would wipe everything, which the UI should never do — manual
+    # factory-reset is a different operation).
+    if days_raw < 1 or days_raw > 365:
+        return web.json_response(
+            {"error": "days must be between 1 and 365"}, status=400
+        )
+
+    cutoff_seconds = days_raw * 86400
+
+    try:
+        conn = _open_db_readwrite()
+    except sqlite3.OperationalError as exc:
+        log.warning("purge: cannot open DB for write: %s", exc)
+        return web.json_response(
+            {"error": "database unavailable", "detail": str(exc)},
+            status=503,
+        )
+
+    try:
+        try:
+            cursor = conn.execute(
+                """
+                DELETE FROM gpu_metrics
+                WHERE timestamp_epoch < (strftime('%s', 'now') - ?)
+                """,
+                (cutoff_seconds,),
+            )
+            rows_deleted = cursor.rowcount
+            conn.commit()
+        except sqlite3.OperationalError as exc:
+            log.warning("purge: execute failed: %s", exc)
+            return web.json_response(
+                {"error": "purge failed", "detail": str(exc)},
+                status=503,
+            )
+    finally:
+        conn.close()
+
+    return web.json_response({
+        "ok": True,
+        "days": days_raw,
+        "rows_deleted": int(rows_deleted or 0),
+    })
+
+
+# ─── Static ─────────────────────────────────────────────────────────────────
+
 async def handle_static(request: web.Request) -> web.Response:
     """Catch-all static file serving for the legacy frontend and assets.
     Registered LAST in the route table so /api/* prefixes take precedence.
@@ -477,6 +1006,19 @@ def make_app() -> web.Application:
     app.router.add_get("/api/stats/24h",       handle_stats_24h)
     app.router.add_get("/api/stats/power",     handle_stats_power)
 
+    # Phase 6 — settings CRUD. GET is read-only and unauthenticated;
+    # PUT and POST routes enforce the same-origin header check via
+    # handler-level guards.
+    app.router.add_get ("/api/settings",           handle_get_settings)
+    app.router.add_put ("/api/settings",           handle_put_settings)
+    app.router.add_post("/api/settings/smtp/test", handle_smtp_test)
+
+    # Phase 6.2 — housekeeping. Read-only db-info is unauthenticated;
+    # vacuum/purge enforce same-origin because they mutate data.
+    app.router.add_get ("/api/housekeeping/db-info", handle_db_info)
+    app.router.add_post("/api/housekeeping/vacuum",  handle_vacuum)
+    app.router.add_post("/api/housekeeping/purge",   handle_purge)
+
     # Static catch-all LAST.
     app.router.add_get("/{tail:.*}", handle_static)
 
@@ -492,5 +1034,6 @@ if __name__ == "__main__":
     log.info("  API: /api/health, /api/version, /api/gpus")
     log.info("       /api/metrics/current, /api/metrics/history")
     log.info("       /api/stats/24h, /api/stats/power")
+    log.info("       /api/settings (GET/PUT), /api/settings/smtp/test")
     log.info("========================================")
     web.run_app(make_app(), port=8081, access_log=None)
