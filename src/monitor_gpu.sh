@@ -147,6 +147,23 @@ function load_settings() {
     fi
 
     if [ "$new_interval" != "$INTERVAL" ] || [ "$new_flush" != "$FLUSH_INTERVAL" ]; then
+        # CRITICAL: flush any buffered rows BEFORE applying the new interval
+        # so they get written with the cadence they were actually sampled at.
+        # Without this, rows buffered under the old INTERVAL would be flushed
+        # with the new $INTERVAL as their interval_s, silently corrupting
+        # Phase 5's power-integration math around every cadence change.
+        # process_buffer reads GPU_MONITOR_INTERVAL_S from the environment,
+        # which is still the OLD $INTERVAL at this point.
+        if [ -f "$BUFFER_FILE" ] && [ -s "$BUFFER_FILE" ]; then
+            log_debug "Flushing ${INTERVAL}s-interval buffer before applying new cadence"
+            process_buffer
+            # Run the post-flush maintenance that update_stats normally does
+            # at a buffer-full boundary, so the API consumers see fresh data
+            # immediately rather than waiting a full new-flush-interval.
+            process_historical_data
+            process_24hr_stats
+        fi
+
         INTERVAL="$new_interval"
         FLUSH_INTERVAL="$new_flush"
         BUFFER_SIZE=$(( (FLUSH_INTERVAL + INTERVAL - 1) / INTERVAL ))
@@ -155,18 +172,6 @@ function load_settings() {
     fi
 }
 
-###############################################################################
-# migrate_database: Idempotently upgrades the gpu_metrics table to the Phase 1
-# schema. Adds three columns on existing installs:
-#   - gpu_index  (multi-GPU groundwork; Phase 2 starts writing values > 0)
-#   - gpu_uuid   (audit trail / robustness against nvidia-smi index shuffle)
-#   - interval_s (per-row sample interval, so future power integration stays
-#                 correct across settings changes — see Phase 5)
-# Also enables WAL journal mode for concurrent reader support.
-#
-# Safe to call every boot — every change uses an IF NOT EXISTS or checks
-# PRAGMA table_info first.
-###############################################################################
 ###############################################################################
 # gpu_metrics_has_column: Asks SQLite whether the given column exists on the
 # gpu_metrics table. Uses the queryable pragma_table_info() form rather than
@@ -185,6 +190,18 @@ function gpu_metrics_has_column() {
     [ "$result" = "1" ]
 }
 
+###############################################################################
+# migrate_database: Idempotently upgrades the gpu_metrics table to the Phase 1
+# schema. Adds three columns on existing installs:
+#   - gpu_index  (multi-GPU groundwork; Phase 2 starts writing values > 0)
+#   - gpu_uuid   (audit trail / robustness against nvidia-smi index shuffle)
+#   - interval_s (per-row sample interval, so future power integration stays
+#                 correct across settings changes — see Phase 5)
+# Also enables WAL journal mode for concurrent reader support.
+#
+# Safe to call every boot. Returns 0 on success (including no-op), 1 on
+# any ALTER/PRAGMA failure. Callers must check the return status.
+###############################################################################
 function migrate_database() {
     log_debug "Checking database schema at $DB_FILE"
 
@@ -193,9 +210,31 @@ function migrate_database() {
     # with the new schema.
     [ -f "$DB_FILE" ] || return 0
 
+    # A DB file can exist without the gpu_metrics table (empty file, manually
+    # dropped, partial recovery). In that case there is nothing to migrate —
+    # initialize_database() runs right after this and will CREATE TABLE IF
+    # NOT EXISTS the fresh schema. Without this check, the first ALTER TABLE
+    # below would fail and fail-fast would exit the container unnecessarily.
+    local table_exists
+    table_exists=$(sqlite3 -init /dev/null "$DB_FILE" \
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='gpu_metrics';" 2>/dev/null)
+    if [ -z "$table_exists" ]; then
+        log_debug "gpu_metrics table absent; skipping migration (initialize_database will create fresh schema)"
+        return 0
+    fi
+
     # Enable WAL once. WAL persists as a database attribute, so setting it
-    # here is equivalent to setting it at database creation.
-    sqlite3 -init /dev/null "$DB_FILE" "PRAGMA journal_mode=WAL;" >/dev/null 2>&1
+    # here is equivalent to setting it at database creation. Only log when
+    # we actually change the mode — keeps no-op runs quiet.
+    local current_mode
+    current_mode=$(sqlite3 -init /dev/null "$DB_FILE" "PRAGMA journal_mode;" 2>/dev/null)
+    if [ "$current_mode" != "wal" ]; then
+        log_warning "Migrating gpu_metrics: enabling WAL journal mode (was: ${current_mode:-unknown})"
+        sqlite3 -init /dev/null "$DB_FILE" "PRAGMA journal_mode=WAL;" >/dev/null 2>&1 || {
+            log_error "Failed to enable WAL journal mode"
+            return 1
+        }
+    fi
 
     # Add gpu_index if missing
     if ! gpu_metrics_has_column gpu_index; then
@@ -269,7 +308,9 @@ function initialize_database() {
     # Create SQLite tables and indexes. Fresh databases get the Phase 1
     # schema directly; existing databases are brought forward by
     # migrate_database() which runs just before this function.
-    sqlite3 "$DB_FILE" << EOF
+    # stdout is redirected because `PRAGMA journal_mode=WAL` returns the
+    # resulting mode and would otherwise leak "wal" into container logs.
+    sqlite3 -init /dev/null "$DB_FILE" >/dev/null << EOF
     PRAGMA journal_mode=WAL;
 
     CREATE TABLE IF NOT EXISTS gpu_metrics (
