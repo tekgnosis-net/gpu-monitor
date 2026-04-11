@@ -20,7 +20,14 @@
  * pre-Phase-4 legacy HTML had baked in.
  */
 
-import { LitElement, html, css } from 'https://cdn.jsdelivr.net/npm/lit@3/index.js+esm';
+// jsDelivr's `+esm` flag goes directly after the package name (not
+// after a file path). An earlier version had `lit@3/index.js+esm`
+// which jsDelivr interprets as a literal path and serves 404,
+// silently breaking every Lit component in the browser. Pinned to
+// 3.2.1 for reproducibility — v1.0.0 test suites are server-side
+// pytest only and would not have caught a URL format bug before
+// it reached a real browser.
+import { LitElement, html, css } from 'https://cdn.jsdelivr.net/npm/lit@3.2.1/+esm';
 
 class GpuGauge extends LitElement {
     static properties = {

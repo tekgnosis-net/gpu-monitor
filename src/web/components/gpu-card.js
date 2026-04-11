@@ -20,7 +20,9 @@
  * to all four gauges without any imperative DOM manipulation.
  */
 
-import { LitElement, html, css } from 'https://cdn.jsdelivr.net/npm/lit@3/index.js+esm';
+// See gauge.js for the jsDelivr +esm suffix rationale. Same fix
+// applied here — URL was 404ing the whole gpu-card component.
+import { LitElement, html, css } from 'https://cdn.jsdelivr.net/npm/lit@3.2.1/+esm';
 
 import './gauge.js';
 

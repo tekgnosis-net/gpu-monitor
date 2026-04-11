@@ -18,7 +18,9 @@
  * Implementation uses Lit from the CDN — no build step, no bundler.
  */
 
-import { LitElement, html, css } from 'https://cdn.jsdelivr.net/npm/lit@3/index.js+esm';
+// See gauge.js for the jsDelivr +esm suffix rationale. Same fix
+// applied here — URL was 404ing the whole info-tip component.
+import { LitElement, html, css } from 'https://cdn.jsdelivr.net/npm/lit@3.2.1/+esm';
 
 class InfoTip extends LitElement {
     static properties = {
