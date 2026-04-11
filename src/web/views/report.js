@@ -63,31 +63,61 @@ function resolvedTheme() {
     return mql && mql.matches ? 'dark' : 'light';
 }
 
-// Apply (or remove) the dark-mode invert filter on the preview
-// iframe. The email template is intentionally hardcoded to light-
-// mode colors because its primary consumer is a mail client, and
-// mail clients predominantly ignore prefers-color-scheme. Inside
-// the dashboard iframe embed, that produces a jarring bright-white
-// block against a dark UI. Inverting via CSS filter is a one-line
-// bridge that keeps the server-side render authentic (WYSIWYG for
-// email recipients) while giving a dark-friendly appearance
-// when embedded in a dark dashboard.
+// Reload the preview iframe with the correct theme query param
+// so the server returns a dark-mode-override'd HTML body when the
+// dashboard is dark, and the default light HTML when the dashboard
+// is light.
 //
-// The invert() + hue-rotate(180deg) combo preserves the subjective
-// lightness of any colored regions while flipping the polarity of
-// grays — it's the standard CSS technique for "cheap dark mode".
-// It works here because the preview endpoint sets include_charts=
-// False, so there are no PNG images to corrupt with inversion.
-// If charts are ever added to the preview, this approach would
-// need to change.
+// An earlier implementation used a client-side CSS `filter:
+// invert(1) hue-rotate(180deg)` on the iframe element, which was
+// cheap but had a fundamental limitation: CSS inversion preserves
+// the relative brightness ordering of elements. In the email
+// template, cards are brighter than body (a standard "elevated
+// surface" pattern), which after inversion makes cards DARKER than
+// body — reversing the visual-depth convention that dark-mode UX
+// relies on. The result was cards dissolving into the background
+// because they were on the wrong side of the body's brightness.
+//
+// The correct fix is server-side: when `?theme=dark` is in the
+// query string, render.py appends a dark-mode `<style>` block
+// that maps specific element classes to proper dark-palette
+// colors (body #1c1c1e, elevated cards #2c2c2e, deepest tiles
+// #3a3a3c) — with cards LIGHTER than body, restoring the
+// depth hierarchy. The email-send path still uses the default
+// light template so real recipients see the intended design.
+//
+// The reload is smoothed by a short opacity fade: zero out the
+// opacity, change the src, wait for the `load` event on the
+// iframe, fade back in. The total transition is fast (~200 ms)
+// because preview HTML is small and local, but the fade prevents
+// the white-flash-then-dark-repaint that raw src reassignment
+// would cause in some browsers.
 function applyPreviewTheme(iframe) {
     if (!iframe) return;
     const theme = resolvedTheme();
-    if (theme === 'dark') {
-        iframe.style.filter = 'invert(1) hue-rotate(180deg)';
-    } else {
-        iframe.style.filter = '';
-    }
+    const newSrc = api.getReportPreviewUrl(
+        state.template,
+        theme === 'dark' ? 'dark' : null,
+    );
+    // Strip the query string off both sides and compare the path
+    // + theme tag so we don't trigger reloads when the theme didn't
+    // actually change (e.g. mount() calls this once and the src is
+    // already right).
+    if (iframe.src === newSrc) return;
+
+    const onLoad = () => {
+        iframe.style.opacity = '1';
+        iframe.removeEventListener('load', onLoad);
+    };
+    iframe.addEventListener('load', onLoad);
+
+    iframe.style.transition = 'opacity var(--motion-fast, 150ms linear)';
+    iframe.style.opacity = '0';
+    // Give the browser a frame to apply the opacity=0 paint before
+    // we change src, so the fade-out is visible rather than instant.
+    requestAnimationFrame(() => {
+        iframe.src = newSrc;
+    });
 }
 
 function el(tag, className, text) {
@@ -265,50 +295,56 @@ export const reportView = {
         }
 
         container.append(buildTemplatePicker((template) => {
+            state.template = template.id;
             const iframe = document.getElementById('report-preview-iframe');
-            if (iframe) {
-                iframe.src = api.getReportPreviewUrl(template.id);
-                // Re-apply the theme filter after src change so the
-                // new preview content honors the current dashboard
-                // theme from its first paint rather than flashing
-                // light and then inverting.
-                applyPreviewTheme(iframe);
-            }
+            applyPreviewTheme(iframe);
         }));
 
         // Iframe for the live HTML preview.
         //
-        // Background is set to match the email template's body
-        // color (#f5f5f7) rather than pure white. When the dashboard
-        // is in light mode, the iframe appears identical to how
-        // Gmail/Outlook/Apple Mail will render the email. When the
-        // dashboard is in dark mode, applyPreviewTheme() applies a
-        // CSS invert+hue-rotate filter that bridges the contrast
-        // without changing the server-rendered HTML — the email
-        // template's "light mode by default" contract stays intact
-        // for real mail-client consumers.
+        // The initial src is built with the current theme baked in so
+        // there's no "light-mode flash, then reload to dark" sequence
+        // on view mount. applyPreviewTheme()'s early-return short-circuits
+        // when the src already matches the resolved theme, so the fade
+        // reload path only fires when the user actually changes themes
+        // or switches templates.
+        //
+        // The iframe's own background matches the theme for the ~100ms
+        // window before the loaded HTML paints — dark body under light
+        // iframe background would flash white on every reload, which is
+        // the exact "white-flash-of-death" that theme-aware sites fight
+        // on page load.
+        const initialTheme = resolvedTheme();
         const iframe = document.createElement('iframe');
         iframe.id = 'report-preview-iframe';
-        iframe.src = api.getReportPreviewUrl(state.template);
+        iframe.src = api.getReportPreviewUrl(
+            state.template,
+            initialTheme === 'dark' ? 'dark' : null,
+        );
         iframe.style.width = '100%';
         iframe.style.height = '600px';
         iframe.style.border = 'none';
         iframe.style.borderRadius = 'var(--radius-md)';
-        iframe.style.background = '#f5f5f7';
+        iframe.style.background = initialTheme === 'dark' ? '#1c1c1e' : '#f5f5f7';
         iframe.setAttribute('sandbox', 'allow-same-origin');
         iframe.setAttribute('title', 'Report preview');
-        applyPreviewTheme(iframe);
 
         container.append(buildPreviewCard(iframe));
         container.append(buildScheduleList());
 
         // Subscribe to theme changes so toggling the sidebar theme
-        // updates the iframe filter in place without requiring a
-        // page reload or a view re-mount. theme.js emits the
-        // 'themechange' window event on every initTheme call and
-        // every cycleTheme call (Phase 4).
+        // reloads the iframe with the correct server-rendered variant
+        // (light or dark) without requiring a page reload or a view
+        // re-mount. theme.js emits the 'themechange' window event on
+        // every initTheme call and every cycleTheme call (Phase 4).
         themeChangeHandler = () => {
             const liveIframe = document.getElementById('report-preview-iframe');
+            if (!liveIframe) return;
+            // Keep the iframe's own background in sync with the theme
+            // so the brief blank between src change and the loaded
+            // HTML's first paint doesn't flash the opposite color.
+            const theme = resolvedTheme();
+            liveIframe.style.background = theme === 'dark' ? '#1c1c1e' : '#f5f5f7';
             applyPreviewTheme(liveIframe);
         };
         window.addEventListener('themechange', themeChangeHandler);

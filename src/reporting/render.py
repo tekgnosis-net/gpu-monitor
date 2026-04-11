@@ -341,6 +341,139 @@ def _format_cost(wh: float, rate_per_kwh: float, currency: str) -> str:
 # ─── Main entrypoint ───────────────────────────────────────────────────────
 
 
+# ─── Preview dark-mode override ────────────────────────────────────────────
+#
+# The email template (`daily_report.html.j2`) hardcodes light-mode
+# colors because its primary consumer is a mail client, and mail
+# clients predominantly ignore prefers-color-scheme. When the same
+# rendered HTML is shown inside the dashboard's Report view iframe,
+# a light block on a dark UI is jarring.
+#
+# An earlier attempt used a client-side CSS `filter: invert(1)` on
+# the iframe element, but CSS inversion preserves the relative
+# brightness ordering of elements: cards which were lighter than
+# body in light mode become DARKER than body after inversion, which
+# inverts the visual depth hierarchy. Dark-mode UX expects elevated
+# surfaces (cards) to be LIGHTER than ambient (body), because that
+# matches real-world light models.
+#
+# The correct fix is a server-side dark-mode override: when the
+# preview endpoint is called with `?theme=dark`, we append a
+# `<style>` block AFTER premailer runs that maps specific element
+# classes to proper dark-mode color values. The rules use `!important`
+# to defeat the inline-style specificity that premailer set on
+# every element. The template's original class names (`.wrap`,
+# `.header`, `.gpu-card`, `.aggregate-tile`, etc.) survive premailer
+# — it inlines styles but doesn't strip classes — so class selectors
+# continue to work.
+#
+# The palette here is lifted from Apple's HIG dark system colors
+# (the same palette as `src/web/styles/tokens.css [data-theme="dark"]`):
+#   body              → #1c1c1e (secondary background)
+#   elevated cards    → #2c2c2e (tertiary background, +1 level)
+#   aggregate tiles   → #3a3a3c (quaternary, +2 level)
+#   primary text      → #f5f5f7 (high contrast)
+#   secondary text    → rgba(235,235,245,0.6) (label secondary)
+#   borders           → rgba(235,235,245,0.15) (subtle separator)
+#
+# Note the IMPORTANT reversal: cards at #2c2c2e are LIGHTER than body
+# at #1c1c1e, which correctly conveys depth. This is the property that
+# filter inversion could not preserve.
+_PREVIEW_DARK_OVERRIDE_CSS = """
+<style id="preview-dark-override">
+html, body {
+  background: #1c1c1e !important;
+  color: #f5f5f7 !important;
+}
+.wrap {
+  background: #1c1c1e !important;
+}
+.header, .gpu-card {
+  background: #2c2c2e !important;
+  border-color: rgba(235, 235, 245, 0.15) !important;
+}
+.header h1,
+.gpu-card h2,
+.gpu-stats .stat-row .value,
+.aggregate-tile .value {
+  color: #f5f5f7 !important;
+}
+.header .subtitle,
+.gpu-card .meta,
+.gpu-stats .stat-row .label,
+.aggregate-tile .label,
+.aggregate-tile .unit,
+.footer {
+  color: rgba(235, 235, 245, 0.6) !important;
+}
+.aggregate-tile {
+  background: #3a3a3c !important;
+}
+.gpu-stats .stat-row .label,
+.gpu-stats .stat-row .value {
+  border-bottom-color: rgba(235, 235, 245, 0.1) !important;
+}
+</style>
+"""
+
+
+# ─── Preview-only light-mode hierarchy override ──────────────────────────
+#
+# The authored email template uses #f5f5f7 body / #ffffff cards / #fafafa
+# tiles — a ~3% brightness delta that works when email clients render the
+# template against their own pure-white body (the #f5f5f7 becomes
+# "invisible chrome" and cards float on the client's background). In the
+# dashboard's preview iframe the body IS visible, so the 3% delta makes
+# card boundaries nearly disappear.
+#
+# This override preserves the light aesthetic but strengthens the depth
+# hierarchy for in-dashboard viewing only:
+#
+#   body   #ebebf0  ← darker than the authored #f5f5f7, closer to Apple's
+#                    iOS "systemGroupedBackground" tone (~5% delta vs card)
+#   cards  #ffffff  ← unchanged, pure white
+#   tiles  #f5f5f7  ← slightly darker than card (was #fafafa, now matches
+#                    the authored body color — gives tiles a visible
+#                    "inset surface" feel inside the card)
+#   borders rgba(60,60,67,0.18)  ← ~80% stronger than authored 0.1 alpha,
+#                                   makes card boundaries crisp in the
+#                                   preview at the cost of being a bit
+#                                   sharper than real client rendering.
+#
+# The email-send path (preview_theme="light" with include_charts=True,
+# but critically injected only when preview_theme != "none") leaves the
+# template untouched so recipients see the designed palette.
+#
+# Why not just change the template? Because the template IS correct for
+# email clients. Gmail/Outlook/Apple Mail render the template against
+# their own backgrounds, and the 3% delta disappears naturally. Changing
+# the template would fix the preview at the cost of making real sends
+# look slightly off on white-background clients.
+_PREVIEW_LIGHT_OVERRIDE_CSS = """
+<style id="preview-light-override">
+html, body {
+  background: #ebebf0 !important;
+}
+.wrap {
+  background: #ebebf0 !important;
+}
+.header, .gpu-card {
+  background: #ffffff !important;
+  border-color: rgba(60, 60, 67, 0.18) !important;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.04) !important;
+}
+.aggregate-tile {
+  background: #f5f5f7 !important;
+  border: 1px solid rgba(60, 60, 67, 0.08) !important;
+}
+.gpu-stats .stat-row .label,
+.gpu-stats .stat-row .value {
+  border-bottom-color: rgba(60, 60, 67, 0.12) !important;
+}
+</style>
+"""
+
+
 def generate_report(
     *,
     template: str,
@@ -349,6 +482,7 @@ def generate_report(
     settings_file: Path,
     version: str,
     include_charts: bool = True,
+    preview_theme: str = "none",
 ) -> EmailMessage:
     """Build a full multipart/alternative EmailMessage for the given
     template ("daily"/"weekly"/"monthly"). Caller sets the Subject/
@@ -367,6 +501,43 @@ def generate_report(
     the GET /api/reports/preview endpoint which streams the HTML
     straight to an <iframe srcdoc> without needing to round-trip
     images through a server-side CID resolver.
+
+    preview_theme controls whether a post-premailer <style> block
+    is injected to tweak colors for in-dashboard preview. Three
+    values are recognized:
+
+      "none"  (default)  ─ no injection. The authored email template
+                           is returned unchanged. Used by the
+                           scheduler and run-now endpoints because
+                           real email recipients must see the
+                           designed palette, not a preview
+                           approximation.
+
+      "dark"             ─ inject _PREVIEW_DARK_OVERRIDE_CSS — full
+                           Apple HIG dark palette (body #1c1c1e,
+                           cards #2c2c2e, tiles #3a3a3c). Cards are
+                           LIGHTER than body so depth hierarchy
+                           holds. Used by the preview endpoint when
+                           the dashboard is in dark mode.
+
+      "light"            ─ inject _PREVIEW_LIGHT_OVERRIDE_CSS —
+                           strengthens the authored light palette's
+                           body/card contrast from ~3% to ~5%, adds
+                           a soft shadow + stronger border to cards.
+                           Needed because the authored template's
+                           #f5f5f7 body / #ffffff cards delta works
+                           in email clients (where the body is
+                           invisible behind the client's own white
+                           chrome) but washes out in the visible
+                           preview iframe. Used by the preview
+                           endpoint when the dashboard is in light
+                           mode.
+
+    The preview_theme flag is only meaningful when
+    include_charts=False; with charts enabled the overrides would
+    also need to handle the embedded PNG contrast, which is out of
+    scope for the preview use case. The preview endpoint already
+    sets include_charts=False so this constraint is automatic.
     """
     if template not in RANGE_BY_TEMPLATE:
         raise RenderError(f"unknown template {template!r}")
@@ -498,6 +669,44 @@ def generate_report(
         # <style> block and the email looks plain.
         log.warning("render: premailer failed, using non-inlined HTML: %s", exc)
         html_inlined = html
+
+    # Inject the preview override <style> block AFTER premailer runs.
+    # Appending before `</head>` means the override lives at the end of
+    # <head>, winning the "last rule wins" tiebreaker against anything
+    # else in there. The !important flags on the override beat
+    # premailer's inline-style specificity, so the class selectors can
+    # remap colors across the whole document. str.replace is sufficient
+    # because the Jinja template emits exactly one `</head>` tag and the
+    # replacement target is stable.
+    #
+    # Two preview variants are supported:
+    #
+    #   "dark"  — full Apple HIG dark palette (body #1c1c1e, cards
+    #             #2c2c2e, tiles #3a3a3c) to match the dashboard's
+    #             dark mode. Cards are LIGHTER than body so the depth
+    #             hierarchy holds.
+    #
+    #   "light" — preserves the authored light aesthetic but darkens
+    #             body from #f5f5f7 → #ebebf0 and strengthens card
+    #             borders + adds a soft shadow. Fixes the "cards
+    #             wash out against body" effect that only shows up in
+    #             the iframe preview (email clients render cards against
+    #             their own white body so the effect is invisible there).
+    #
+    # The real email-send path (scheduler.py + run-now endpoint)
+    # never passes preview_theme explicitly and so gets the default
+    # "none" — which falls through both branches below untouched,
+    # guaranteeing recipients see the authored template.
+    if preview_theme == "dark" and "</head>" in html_inlined:
+        html_inlined = html_inlined.replace(
+            "</head>",
+            _PREVIEW_DARK_OVERRIDE_CSS + "</head>",
+        )
+    elif preview_theme == "light" and "</head>" in html_inlined:
+        html_inlined = html_inlined.replace(
+            "</head>",
+            _PREVIEW_LIGHT_OVERRIDE_CSS + "</head>",
+        )
 
     # Plain-text fallback for clients that can't render HTML. Keep it
     # minimal — it's a pure fallback, not a second rendering path.

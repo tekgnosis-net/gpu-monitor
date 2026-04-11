@@ -945,16 +945,29 @@ async def handle_schedule_run_now(request: web.Request) -> web.Response:
 
 
 async def handle_report_preview(request: web.Request) -> web.Response:
-    """GET /api/reports/preview?template=daily — return the rendered
-    HTML body of a report (no images, no charts). Used by the
-    Report view's <iframe src=...> so the user can see roughly
-    what their scheduled email will look like before wiring up SMTP.
+    """GET /api/reports/preview?template=daily[&theme=dark] — return
+    the rendered HTML body of a report (no images, no charts). Used
+    by the Report view's <iframe src=...> so the user can see
+    roughly what their scheduled email will look like before wiring
+    up SMTP.
 
     include_charts=False mode skips matplotlib entirely so this
     endpoint is cheap to hit repeatedly. The iframe wouldn't
     display cid: references anyway — it's not a MIME client.
+
+    The optional `?theme=dark` query param appends a dark-mode
+    CSS override <style> block to the rendered HTML so the
+    iframe embed matches the dashboard's dark theme. Recognized
+    values: "dark" (explicit dark), anything else (default light).
+    The email-send path in POST /api/schedules/{id}/run-now does
+    NOT pass this flag — real email recipients always get the
+    light template.
     """
     template = request.query.get("template") or "daily"
+    # Only "dark" flips the override; any other value (absent,
+    # empty, "light", typos) falls back to the light default so
+    # the mail-send behavior is never accidentally dark-themed.
+    preview_theme = "dark" if request.query.get("theme") == "dark" else "light"
 
     try:
         message = render.generate_report(
@@ -964,6 +977,7 @@ async def handle_report_preview(request: web.Request) -> web.Response:
             settings_file=SETTINGS_FILE,
             version=_read_version(),
             include_charts=False,
+            preview_theme=preview_theme,
         )
     except render.RenderError as exc:
         # SECURITY: The RenderError message can embed the caller-
