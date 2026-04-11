@@ -52,6 +52,7 @@
  */
 
 import * as api from '../api.js';
+import * as alerts from '../alerts.js';
 import '../components/info-tip.js';
 
 const TABS = [
@@ -530,6 +531,30 @@ function renderAlertsTab() {
 
     panel.append(checkboxRow('alerts-notifications', 'Desktop notifications', a.notifications_enabled,
         'Use the browser\'s Notification API for system-level alerts. Browser permission is requested the first time you enable this.'));
+
+    // Phase 7: request browser Notification permission ONLY when
+    // the user explicitly flips the checkbox ON — never on page
+    // load. This fixes the "spooky unprompted permission request"
+    // UX smell that the Phase 4 hardcoded-to-configurable audit
+    // specifically called out. We listen on the change event
+    // rather than waiting for Save so the permission prompt is
+    // tightly coupled to the user's intent expression.
+    const notificationsCheckbox = panel.querySelector('#alerts-notifications');
+    if (notificationsCheckbox) {
+        notificationsCheckbox.addEventListener('change', async () => {
+            if (notificationsCheckbox.checked) {
+                const result = await alerts.requestNotificationPermission();
+                if (result === 'denied') {
+                    // User declined — untick the box so they
+                    // don't get confused about why nothing
+                    // happens. They can re-enable in browser
+                    // settings and try again.
+                    notificationsCheckbox.checked = false;
+                    alert('Notification permission was denied by your browser. Re-enable it in your browser settings and try again.');
+                }
+            }
+        });
+    }
 
     panel.append(saveButton('alerts', async () => {
         const temp = numericValue(tempInput);

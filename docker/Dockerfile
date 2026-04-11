@@ -70,6 +70,8 @@ COPY src/web/api.js         /app/
 COPY src/web/theme.js       /app/
 COPY src/web/router.js      /app/
 COPY src/web/sidebar.js     /app/
+COPY src/web/alerts.js      /app/
+COPY src/web/keybindings.js /app/
 COPY src/web/styles/       /app/styles/
 COPY src/web/components/   /app/components/
 COPY src/web/views/        /app/views/

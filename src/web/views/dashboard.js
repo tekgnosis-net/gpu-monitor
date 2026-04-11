@@ -18,6 +18,7 @@
  */
 
 import * as api from '../api.js';
+import * as alerts from '../alerts.js';
 import '../components/gauge.js';
 import '../components/gpu-card.js';
 import { attachTablistKeyboard, markTabSelected } from '../widgets/tablist.js';
@@ -218,6 +219,17 @@ async function refreshCurrent() {
             power: metrics.power ?? 0,
         };
     });
+
+    // Phase 7: hand the fresh metrics to the alert state machine.
+    // It compares each per-GPU value against the thresholds loaded
+    // at mount from /api/settings.alerts and fires a toast/sound/
+    // notification on breach. Cooldown logic is inside alerts.js —
+    // dashboard.js just needs to call it on every poll.
+    try {
+        alerts.checkMetrics(state.currentMetrics, state.gpus);
+    } catch (err) {
+        console.warn('dashboard: alert check failed:', err);
+    }
 }
 
 // Read the current theme's chart-relevant CSS custom properties into a plain
@@ -340,6 +352,13 @@ export const dashboardView = {
     name: 'dashboard',
 
     async mount(container) {
+        // Phase 7: load alert thresholds from /api/settings.alerts
+        // before the first poll arrives. The alerts module falls
+        // back to pre-Phase-4 hardcoded defaults (80/100/300) on
+        // any fetch failure, so this call is "best effort" and
+        // never blocks mount on the alerts path.
+        alerts.loadThresholdsFromServer().catch(() => { /* fallback ok */ });
+
         // Fetch GPU inventory once — the inventory is stable per session
         // (hot-add/remove requires a container restart per Phase 2 scope).
         // Sort by index so "the lowest-index GPU" comment in the default

@@ -18,6 +18,7 @@
 import { initTheme } from './theme.js';
 import { initRouter, registerRoute } from './router.js';
 import { mountSidebar, mountMobileMenuButton } from './sidebar.js';
+import { installKeybindings } from './keybindings.js';
 import * as api from './api.js';
 
 import { dashboardView } from './views/dashboard.js';
@@ -60,6 +61,11 @@ async function main() {
     } else {
         console.error('app: no <main class="content"> element found');
     }
+
+    // Phase 7: install global keyboard shortcuts (g-prefix nav,
+    // t = theme, \\ = sidebar, ? = cheat sheet). Must be after
+    // router init so navigate() resolves to registered views.
+    installKeybindings();
 }
 
 main().catch((err) => {
