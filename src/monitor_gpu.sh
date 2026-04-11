@@ -1129,6 +1129,40 @@ SERVER_PID=$!
 log_debug "Web server supervisor started (pid=$SERVER_PID)"
 
 ###############################################################################
+# run_report_scheduler: Runs reporting/scheduler.py in a supervised respawn
+# loop. The scheduler is a standalone asyncio loop that wakes every 60s,
+# reads settings.json, fires any due report schedules, and sleeps again.
+# If it dies (unhandled exception, disk full, etc.), this wrapper logs the
+# exit and relaunches after a 2s backoff — same pattern as run_web_server.
+#
+# The scheduler subprocess shares settings.json and the SQLite DB with the
+# collector and the server; all three talk through files, not shared
+# memory, so crash isolation is trivial. WAL mode (from Phase 1) lets all
+# three coexist as concurrent readers + one writer (the collector).
+#
+# Skipped entirely if reporting/scheduler.py is missing — allows users to
+# ship a pared-down image without the matplotlib/jinja/premailer deps by
+# deleting the reporting/ subtree from their custom build.
+###############################################################################
+run_report_scheduler() {
+    cd /app
+    while true; do
+        python3 reporting/scheduler.py
+        local rc=$?
+        log_warning "reporting/scheduler.py exited with code $rc; respawning in 2s"
+        sleep 2
+    done
+}
+
+if [ -f /app/reporting/scheduler.py ]; then
+    run_report_scheduler &
+    SCHEDULER_PID=$!
+    log_debug "Report scheduler supervisor started (pid=$SCHEDULER_PID)"
+else
+    log_debug "reporting/scheduler.py not present; skipping scheduler launch"
+fi
+
+###############################################################################
 # Main Process Loop
 # Manages the continuous monitoring process with:
 # - Retry mechanism for failed updates

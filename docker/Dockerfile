@@ -1,14 +1,42 @@
 FROM python:3.13.3-slim-bookworm
 
-# Install required packages
+# Install required packages.
+#
+# fonts-dejavu-core gives matplotlib a predictable font stack for the
+# email report charts (Phase 6). Without it matplotlib falls back to a
+# bitmap font and logs warnings on every chart render, which both
+# looks cheap in the email and clutters the collector log.
 RUN apt-get update && apt-get install -y \
     curl \
     jq \
     sqlite3 \
+    fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
-# Install aiohttp
-RUN pip install aiohttp
+# Install Python dependencies.
+#
+# Phase 3 baseline:  aiohttp (server)
+# Phase 6a added:    pydantic (settings validation),
+#                    cryptography (Fernet for SMTP password at rest)
+# Phase 6b added:    aiosmtplib (async SMTP send),
+#                    jinja2 + premailer (HTML email templating),
+#                    matplotlib (PNG chart rendering for email),
+#                    croniter (cron schedule evaluation)
+#
+# Image-size cost: ~80 MB on top of the Phase 3 baseline, dominated by
+# matplotlib's numpy runtime. The alternative (SVG inline or external
+# chart rendering) was considered and rejected — matplotlib's PNG +
+# MIME multipart/related gives the best compatibility across Gmail,
+# Outlook, and Apple Mail without per-client tuning.
+RUN pip install \
+    aiohttp \
+    pydantic \
+    cryptography \
+    aiosmtplib \
+    jinja2 \
+    premailer \
+    matplotlib \
+    croniter
 
 # Create app directory
 WORKDIR /app
@@ -41,6 +69,11 @@ COPY src/web/images/       /app/images/
 COPY src/web/sounds/       /app/sounds/
 COPY src/monitor_gpu.sh    /app/
 COPY src/server.py         /app/
+# Phase 6 — reporting subpackage (settings, crypto, mailer, render,
+# scheduler + Jinja template). Copied as a directory tree so
+# `from reporting import ...` resolves correctly when server.py and
+# the scheduler subprocess run at /app/ root.
+COPY src/reporting/        /app/reporting/
 
 # Make scripts executable
 RUN chmod +x /app/monitor_gpu.sh
