@@ -328,11 +328,45 @@ async def test_stats_power_gpu_filter(client):
 
 @pytest.mark.asyncio
 async def test_stats_power_invalid_range_falls_back(client):
-    """Unknown range values fall back to 24h, matching metrics/history."""
+    """Unknown range values fall back to 24h, matching metrics/history.
+
+    Also asserts that `data["range"]` reports the *effective* normalized
+    key ("24h") rather than echoing back the raw invalid query string,
+    so clients that display response metadata to the user see the
+    actual window used for the query.
+    """
     resp = await client.get("/api/stats/power?range=eternity&gpu=0")
     assert resp.status == 200
     data = await resp.json()
-    assert data["samples_total"] == 5  # same as 24h result
+    assert data["samples_total"] == 5
+    assert data["range"] == "24h"  # normalized, not the raw "eternity"
+
+
+@pytest.mark.asyncio
+async def test_stats_power_30d_accepted(client):
+    """30d is a valid range for /api/stats/power even though the
+    history endpoint rejects it — the SUM aggregation returns a handful
+    of floats regardless of window size, so 30 days is cheap."""
+    resp = await client.get("/api/stats/power?range=30d&gpu=0")
+    assert resp.status == 200
+    data = await resp.json()
+    assert data["range"] == "30d"
+    # Fixture has 5 rows in the last minute, all within 30 days, so
+    # the sample count matches the 24h result.
+    assert data["samples_total"] == 5
+
+
+@pytest.mark.asyncio
+async def test_metrics_history_30d_rejected(client):
+    """30d is NOT a valid range for /api/metrics/history because it
+    would return ~648k points on a real install. The endpoint uses
+    HISTORY_RANGE_SECONDS which falls back to 24h on 30d."""
+    resp = await client.get("/api/metrics/history?range=30d&gpu=0")
+    assert resp.status == 200
+    data = await resp.json()
+    # Falls back to 24h; fixture's 5 rows are all in the last minute
+    # so they still show up in a 24h window.
+    assert len(data["timestamps"]) == 5
 
 
 @pytest.mark.asyncio

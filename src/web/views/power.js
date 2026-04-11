@@ -301,6 +301,7 @@ function buildChartCard() {
     h3.textContent = 'Power draw';
     const subtitle = document.createElement('div');
     subtitle.className = 'subtitle';
+    subtitle.id = 'power-chart-subtitle';
     subtitle.textContent = 'Instantaneous power over the selected window';
 
     const left = document.createElement('div');
@@ -320,10 +321,24 @@ function buildChartCard() {
 
 /* ─── Data refresh ──────────────────────────────────────────────────────── */
 
+// The chart shows raw per-sample power, so its window must stay small
+// enough that the JSON payload and Chart.js point array don't crush the
+// browser. 30 days × 4s sampling × per-GPU = ~648k points — unusably
+// large. The integrated SUM tile (which only returns eight floats
+// regardless of window) is the one that actually supports 30d. When the
+// user picks 30d, cap the chart fetch at 7d and annotate the chart
+// subtitle so they know the chart and the KPI window have diverged.
+const CHART_MAX_WINDOW = '7d';
+
+function chartWindow() {
+    return state.window === '30d' ? CHART_MAX_WINDOW : state.window;
+}
+
 async function refresh() {
+    const fetchChartWindow = chartWindow();
     const [stats, history] = await Promise.all([
         api.getPowerStats(state.window, state.selectedGpuIndex),
-        api.getHistory(state.window, state.selectedGpuIndex),
+        api.getHistory(fetchChartWindow, state.selectedGpuIndex),
     ]);
 
     // Update KPI tiles
@@ -351,6 +366,15 @@ async function refresh() {
             ? `At ${state.currency}${state.electricityRate.toFixed(4)}/kWh`
             : 'Set your electricity rate in Settings';
         updateKpiCard(costCard, cost, '', sub);
+    }
+
+    // Update chart subtitle when the chart window diverges from the KPI
+    // window (i.e. the user picked 30d but we capped the chart at 7d).
+    const chartSub = document.getElementById('power-chart-subtitle');
+    if (chartSub) {
+        chartSub.textContent = (state.window === '30d')
+            ? `Instantaneous power — last ${CHART_MAX_WINDOW} (KPI tiles use the full 30 d)`
+            : 'Instantaneous power over the selected window';
     }
 
     // Update chart

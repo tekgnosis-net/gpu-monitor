@@ -94,8 +94,15 @@ export async function getPowerStats(range = '24h', gpuIndex = 0) {
         insufficient_telemetry: true,
     };
     const data = await _fetchJson(`/stats/power?${params}`, fallback);
-    // Guard against a partial upstream response — treat missing keys as
-    // zero rather than propagating undefined into chart / formatting code.
+    // Guard against a partial upstream response — treat missing numeric
+    // keys as zero rather than propagating undefined into chart /
+    // formatting code. Safety flag rule: a missing `insufficient_telemetry`
+    // defaults to TRUE, not false. The flag exists to warn the user, and
+    // silently treating an incomplete response as "telemetry OK" would
+    // give false confidence. Only an *explicit* false from the server
+    // should produce the "sufficient" state.
+    const hasTelemetryFlag = Object.prototype.hasOwnProperty
+        .call(data, 'insufficient_telemetry');
     return {
         range:        data.range ?? range,
         gpu_index:    Number.isFinite(data.gpu_index) ? data.gpu_index : gpuIndex,
@@ -104,6 +111,8 @@ export async function getPowerStats(range = '24h', gpuIndex = 0) {
         avg_power_w:  Number.isFinite(data.avg_power_w)  ? data.avg_power_w  : 0,
         samples_total:   Number.isFinite(data.samples_total)   ? data.samples_total   : 0,
         samples_invalid: Number.isFinite(data.samples_invalid) ? data.samples_invalid : 0,
-        insufficient_telemetry: Boolean(data.insufficient_telemetry),
+        insufficient_telemetry: hasTelemetryFlag
+            ? Boolean(data.insufficient_telemetry)
+            : true,
     };
 }

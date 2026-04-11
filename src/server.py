@@ -51,13 +51,23 @@ DB_FILE = BASE_DIR / "history" / "gpu_metrics.db"
 SCHEMA_VERSION = 2  # Matches Phase 1 migration (gpu_index, gpu_uuid, interval_s)
 
 # Allowed `range` query parameter values and their durations in seconds.
-# Keep this tight — the frontend picks from a fixed set of timeframe
-# buttons (15m, 30m, 1h, 6h, 12h, 24h, 3d, 7d, 30d) and free-form values
-# would just invite confusion. Phase 5 adds 30d for the Power view's
-# "month-to-date" tile; the history chart still uses the shorter ranges
-# because 30 days of 4-second samples is ~648k points — too dense for a
-# line chart but fine for a single integrated SUM query.
-RANGE_SECONDS: dict[str, int] = {
+# Two dicts intentionally, not one — the set of legal ranges differs per
+# endpoint:
+#
+#   * HISTORY_RANGE_SECONDS is used by /api/metrics/history, which returns
+#     every sampled row in the window. 30 days × 4s sampling × 2 GPUs is
+#     ~1.3M points — enough to freeze the browser and slam SQLite. The
+#     history endpoint caps at 7d.
+#
+#   * POWER_RANGE_SECONDS is used by /api/stats/power, which returns a
+#     single SUM across the window. 30 days is fine because the cost
+#     for the aggregation is O(n) over an index-served range scan and
+#     the response shape is a handful of floats regardless of window.
+#
+# Shared entries are duplicated rather than computed via set operations
+# so a future change (e.g. removing 7d for some reason) touches the
+# endpoint whose behavior is actually changing.
+HISTORY_RANGE_SECONDS: dict[str, int] = {
     "15m": 15 * 60,
     "30m": 30 * 60,
     "1h": 1 * 3600,
@@ -66,6 +76,9 @@ RANGE_SECONDS: dict[str, int] = {
     "24h": 24 * 3600,
     "3d": 3 * 86400,
     "7d": 7 * 86400,
+}
+POWER_RANGE_SECONDS: dict[str, int] = {
+    **HISTORY_RANGE_SECONDS,
     "30d": 30 * 86400,
 }
 DEFAULT_RANGE = "24h"
@@ -113,14 +126,26 @@ def _open_db_readonly() -> sqlite3.Connection:
     return conn
 
 
-def _range_seconds(param: str | None) -> int:
-    """Translate a range query-parameter (e.g. '24h', '3d') into seconds,
-    defaulting to 24h when missing or unrecognized. A stricter approach
-    would 400 on unknown values; for Phase 3 we prefer a friendly default
-    over breaking the dashboard if the frontend sends something unexpected."""
+def _resolve_range(param: str | None, allowlist: dict[str, int]) -> tuple[int, str]:
+    """Translate a range query-parameter (e.g. '24h', '3d') into
+    (seconds, effective_key) against the given allowlist, defaulting to
+    24h when missing or unrecognized.
+
+    Returning both lets the response include the *effective* key (what
+    the query actually used) rather than whatever raw string the client
+    sent. This avoids a class of client-side confusion where a partial
+    or invalid ?range=... produces response data for one window but the
+    response metadata says another.
+
+    A stricter alternative would 400 on unknown values; we prefer a
+    friendly default so a stale frontend build never breaks the page.
+    """
     if not param:
-        return RANGE_SECONDS[DEFAULT_RANGE]
-    return RANGE_SECONDS.get(param.lower(), RANGE_SECONDS[DEFAULT_RANGE])
+        return allowlist[DEFAULT_RANGE], DEFAULT_RANGE
+    key = param.lower()
+    if key in allowlist:
+        return allowlist[key], key
+    return allowlist[DEFAULT_RANGE], DEFAULT_RANGE
 
 
 def _parse_gpu_param(param: str | None) -> int:
@@ -204,8 +229,16 @@ async def handle_metrics_history(request: web.Request) -> web.Response:
     """Timeseries for a single GPU over a time range. Shape matches the
     legacy history/history.json contract exactly so the Phase 3 retrofit
     of gpu-stats.html is a pure URL change — Phase 4 rewrites the
-    frontend and can introduce a richer shape then."""
-    range_s = _range_seconds(request.query.get("range"))
+    frontend and can introduce a richer shape then.
+
+    Phase 5 note: this endpoint deliberately uses HISTORY_RANGE_SECONDS
+    (no 30d) because 30 days of 4s sampling is ~648k rows per GPU and
+    returning every one as JSON would freeze the browser. The
+    /api/stats/power endpoint accepts 30d because it only returns
+    aggregate scalars, not raw rows."""
+    range_s, _effective_range = _resolve_range(
+        request.query.get("range"), HISTORY_RANGE_SECONDS
+    )
     gpu_index = _parse_gpu_param(request.query.get("gpu"))
 
     try:
@@ -317,15 +350,19 @@ async def handle_stats_power(request: web.Request) -> web.Response:
           "insufficient_telemetry": false
         }
     """
-    range_s = _range_seconds(request.query.get("range"))
+    range_s, effective_range = _resolve_range(
+        request.query.get("range"), POWER_RANGE_SECONDS
+    )
     gpu_index = _parse_gpu_param(request.query.get("gpu"))
 
-    try:
-        conn = _open_db_readonly()
-    except sqlite3.OperationalError as exc:
-        log.warning("stats_power: cannot open DB: %s", exc)
-        return web.json_response({
-            "range": request.query.get("range") or DEFAULT_RANGE,
+    # Single fallback shape used for every failure path below so the
+    # client always gets the same keys. `range` is the *effective*
+    # (normalized) key — not the raw query string — so a partial/
+    # unknown ?range=... doesn't confuse clients that display the
+    # response metadata back to the user.
+    def _empty_response() -> dict:
+        return {
+            "range": effective_range,
             "gpu_index": gpu_index,
             "energy_wh": 0.0,
             "peak_power_w": 0.0,
@@ -333,32 +370,49 @@ async def handle_stats_power(request: web.Request) -> web.Response:
             "samples_total": 0,
             "samples_invalid": 0,
             "insufficient_telemetry": True,
-        }, status=200)
+        }
 
     try:
-        # Single aggregation query — all metrics fall out of one scan of
-        # the windowed rows for this GPU. The CASE WHEN guards ensure
-        # NULL / non-positive power rows don't corrupt peak/avg/energy
-        # but still get counted in samples_total via an unconditional
-        # COUNT(*) so the frontend can compute the invalid ratio.
-        row = conn.execute(
-            """
-            SELECT
-                COALESCE(
-                    SUM(CASE WHEN power > 0 THEN power * interval_s ELSE 0 END),
-                    0
-                ) / 3600.0 AS energy_wh,
-                COALESCE(MAX(CASE WHEN power > 0 THEN power END), 0) AS peak_power_w,
-                COALESCE(AVG(CASE WHEN power > 0 THEN power END), 0) AS avg_power_w,
-                COUNT(*) AS samples_total,
-                SUM(CASE WHEN power IS NULL OR power <= 0 THEN 1 ELSE 0 END)
-                    AS samples_invalid
-            FROM gpu_metrics
-            WHERE gpu_index = ?
-              AND timestamp_epoch > strftime('%s', 'now') - ?
-            """,
-            (gpu_index, range_s),
-        ).fetchone()
+        conn = _open_db_readonly()
+    except sqlite3.OperationalError as exc:
+        log.warning("stats_power: cannot open DB: %s", exc)
+        return web.json_response(_empty_response(), status=200)
+
+    try:
+        try:
+            # Single aggregation query — all metrics fall out of one
+            # scan of the windowed rows for this GPU. The CASE WHEN
+            # guards ensure NULL / non-positive power rows don't corrupt
+            # peak/avg/energy but still get counted in samples_total via
+            # an unconditional COUNT(*) so the frontend can compute the
+            # invalid ratio.
+            row = conn.execute(
+                """
+                SELECT
+                    COALESCE(
+                        SUM(CASE WHEN power > 0 THEN power * interval_s ELSE 0 END),
+                        0
+                    ) / 3600.0 AS energy_wh,
+                    COALESCE(MAX(CASE WHEN power > 0 THEN power END), 0) AS peak_power_w,
+                    COALESCE(AVG(CASE WHEN power > 0 THEN power END), 0) AS avg_power_w,
+                    COUNT(*) AS samples_total,
+                    SUM(CASE WHEN power IS NULL OR power <= 0 THEN 1 ELSE 0 END)
+                        AS samples_invalid
+                FROM gpu_metrics
+                WHERE gpu_index = ?
+                  AND timestamp_epoch > strftime('%s', 'now') - ?
+                """,
+                (gpu_index, range_s),
+            ).fetchone()
+        except sqlite3.OperationalError as exc:
+            # A DB-open that succeeded can still race a schema change,
+            # WAL-checkpoint lock, or (in pathological cases) a missing
+            # table. Match the DB-open fallback shape so callers see the
+            # same "insufficient_telemetry: true" notice in both
+            # failure modes rather than one silent 5xx and one graceful
+            # placeholder.
+            log.warning("stats_power: query failed: %s", exc)
+            return web.json_response(_empty_response(), status=200)
     finally:
         conn.close()
 
@@ -372,7 +426,7 @@ async def handle_stats_power(request: web.Request) -> web.Response:
     insufficient = samples_total == 0 or samples_invalid > 0
 
     return web.json_response({
-        "range": request.query.get("range") or DEFAULT_RANGE,
+        "range": effective_range,
         "gpu_index": gpu_index,
         "energy_wh": float(row["energy_wh"] or 0.0),
         "peak_power_w": float(row["peak_power_w"] or 0.0),
