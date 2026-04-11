@@ -22,4 +22,8 @@ Thumbs.db
 # In .gitignore
 history/*
 !history/.gitkeep
+CLAUDE.md
+
+# Session-local tooling state (Claude Code remember hook, etc.)
+.remember/
 

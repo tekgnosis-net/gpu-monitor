@@ -1,5 +1,11 @@
 #!/bin/bash
 
+# Resolve repo root regardless of where the script is invoked from.
+# setup.sh now lives in scripts/, so the repo root is its parent directory.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$REPO_ROOT"
+
 # Colors for output
 GREEN='\033[0;32m'
 RED='\033[0;31m'

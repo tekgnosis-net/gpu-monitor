@@ -247,41 +247,41 @@ The dashboard is accessible at: [http://localhost:8081](http://localhost:8081)
 
 A setup script is provided for convenience. It checks prerequisites and manages the service:
 
-- If you have issues then make sure `setup.sh` is executable
+- If you have issues then make sure `scripts/setup.sh` is executable
 
 ```bash
-chmod +x ./setup.sh
+chmod +x ./scripts/setup.sh
 ```
 
 ---
 - Check prerequisites and start the service
 ```bash
-./setup.sh start
+./scripts/setup.sh start
 ```
 ---
 - Stop the service
 ```bash
-./setup.sh stop
+./scripts/setup.sh stop
 ```
 ---
 - Restart the service
 ```bash
-./setup.sh restart
+./scripts/setup.sh restart
 ```
 ---
 - Check service status
 ```bash
-./setup.sh status
+./scripts/setup.sh status
 ```
 ---
 - View logs
 ```bash
-./setup.sh logs
+./scripts/setup.sh logs
 ```
 
 Example of script running
 ```bash
-~/gpu-monitor ./setup.sh start
+~/gpu-monitor ./scripts/setup.sh start
 [+] Checking prerequisites...
 [+] Docker: Found
 [+] Docker Compose: Found
