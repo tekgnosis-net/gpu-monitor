@@ -167,6 +167,24 @@ function load_settings() {
 # Safe to call every boot — every change uses an IF NOT EXISTS or checks
 # PRAGMA table_info first.
 ###############################################################################
+###############################################################################
+# gpu_metrics_has_column: Asks SQLite whether the given column exists on the
+# gpu_metrics table. Uses the queryable pragma_table_info() form rather than
+# piping CLI output through awk, which would be fragile if the sqlite3 CLI
+# output format is changed by a user sqliterc (-header/-csv/etc.). Returns 0
+# when the column exists, 1 otherwise.
+#
+# The column name is always a hardcoded identifier from this file (never
+# external input), so direct string interpolation into the SQL is safe.
+###############################################################################
+function gpu_metrics_has_column() {
+    local col="$1"
+    local result
+    result=$(sqlite3 -init /dev/null "$DB_FILE" \
+        "SELECT 1 FROM pragma_table_info('gpu_metrics') WHERE name='${col}';" 2>/dev/null)
+    [ "$result" = "1" ]
+}
+
 function migrate_database() {
     log_debug "Checking database schema at $DB_FILE"
 
@@ -177,12 +195,13 @@ function migrate_database() {
 
     # Enable WAL once. WAL persists as a database attribute, so setting it
     # here is equivalent to setting it at database creation.
-    sqlite3 "$DB_FILE" "PRAGMA journal_mode=WAL;" >/dev/null 2>&1
+    sqlite3 -init /dev/null "$DB_FILE" "PRAGMA journal_mode=WAL;" >/dev/null 2>&1
 
     # Add gpu_index if missing
-    if ! sqlite3 "$DB_FILE" "PRAGMA table_info(gpu_metrics);" 2>/dev/null | awk -F'|' '{print $2}' | grep -qx gpu_index; then
+    if ! gpu_metrics_has_column gpu_index; then
         log_warning "Migrating gpu_metrics: adding gpu_index column (default 0)"
-        sqlite3 "$DB_FILE" "ALTER TABLE gpu_metrics ADD COLUMN gpu_index INTEGER NOT NULL DEFAULT 0;" || {
+        sqlite3 -init /dev/null "$DB_FILE" \
+            "ALTER TABLE gpu_metrics ADD COLUMN gpu_index INTEGER NOT NULL DEFAULT 0;" || {
             log_error "Failed to add gpu_index column"
             return 1
         }
@@ -190,15 +209,20 @@ function migrate_database() {
 
     # Add gpu_uuid if missing. Backfill existing rows to the current GPU's
     # UUID (the fork was single-GPU until now, so this is correct attribution).
-    if ! sqlite3 "$DB_FILE" "PRAGMA table_info(gpu_metrics);" 2>/dev/null | awk -F'|' '{print $2}' | grep -qx gpu_uuid; then
-        local current_uuid
+    if ! gpu_metrics_has_column gpu_uuid; then
+        local current_uuid escaped_uuid
         current_uuid=$(nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | head -n1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         [ -z "$current_uuid" ] && current_uuid="legacy-unknown"
 
+        # SQL-escape single quotes (external command output — UUIDs are
+        # well-formed in practice but the escape keeps the pattern safe
+        # and robust to future driver changes).
+        escaped_uuid=${current_uuid//\'/\'\'}
+
         log_warning "Migrating gpu_metrics: adding gpu_uuid column (backfilling to '$current_uuid')"
-        sqlite3 "$DB_FILE" <<SQL
+        sqlite3 -init /dev/null "$DB_FILE" <<SQL
 ALTER TABLE gpu_metrics ADD COLUMN gpu_uuid TEXT;
-UPDATE gpu_metrics SET gpu_uuid = '$current_uuid' WHERE gpu_uuid IS NULL;
+UPDATE gpu_metrics SET gpu_uuid = '$escaped_uuid' WHERE gpu_uuid IS NULL;
 SQL
         if [ $? -ne 0 ]; then
             log_error "Failed to add gpu_uuid column"
@@ -208,9 +232,10 @@ SQL
 
     # Add interval_s if missing. DEFAULT 4 is correct for all existing rows
     # because the pre-overhaul script only ever sampled at 4s.
-    if ! sqlite3 "$DB_FILE" "PRAGMA table_info(gpu_metrics);" 2>/dev/null | awk -F'|' '{print $2}' | grep -qx interval_s; then
+    if ! gpu_metrics_has_column interval_s; then
         log_warning "Migrating gpu_metrics: adding interval_s column (default 4)"
-        sqlite3 "$DB_FILE" "ALTER TABLE gpu_metrics ADD COLUMN interval_s INTEGER NOT NULL DEFAULT 4;" || {
+        sqlite3 -init /dev/null "$DB_FILE" \
+            "ALTER TABLE gpu_metrics ADD COLUMN interval_s INTEGER NOT NULL DEFAULT 4;" || {
             log_error "Failed to add interval_s column"
             return 1
         }
@@ -218,7 +243,8 @@ SQL
 
     # Composite index for the (gpu_index, timestamp_epoch) queries Phase 3
     # introduces. IF NOT EXISTS makes this a no-op on re-runs.
-    sqlite3 "$DB_FILE" "CREATE INDEX IF NOT EXISTS idx_gpu_metrics_gpu_epoch ON gpu_metrics(gpu_index, timestamp_epoch);" || {
+    sqlite3 -init /dev/null "$DB_FILE" \
+        "CREATE INDEX IF NOT EXISTS idx_gpu_metrics_gpu_epoch ON gpu_metrics(gpu_index, timestamp_epoch);" || {
         log_error "Failed to create composite (gpu_index, timestamp_epoch) index"
         return 1
     }
@@ -787,7 +813,15 @@ EOF
 # Run schema migrations on the existing DB (no-op on fresh installs), then
 # initialize / open the database for writes. Migration must run BEFORE
 # initialize_database so CREATE TABLE IF NOT EXISTS does not race the ALTER.
-migrate_database
+#
+# Fail-fast on migration error: a half-migrated schema would leave the
+# collector silently writing to a DB that process_buffer.py can no longer
+# INSERT into, producing an infinite error loop with no clear signal.
+# Exiting here lets the container supervisor surface the error and restart.
+if ! migrate_database; then
+    log_error "Database migration failed; refusing to start in a half-migrated state"
+    exit 1
+fi
 initialize_database
 # Pick up any user-defined collection cadence from settings.json on startup
 # so the very first tick honours it (later ticks re-read each iteration).
