@@ -302,13 +302,25 @@ function discover_gpus() {
             mem_total=$(echo "$mem_total" | xargs)
             power_limit=$(echo "$power_limit" | xargs)
 
-            # Guard against partial rows.
-            [ -z "$idx" ] && continue
+            # Validate idx as a non-negative integer before touching any
+            # accumulator state. A non-numeric row (error message leaked
+            # past 2>/dev/null, unexpected nvidia-smi output format) that
+            # only failed the empty-string check would corrupt the
+            # NUM_GPUS counter and build an invalid jq --argjson entry,
+            # preventing the synthetic-fallback path below from rescuing
+            # the startup.
+            if [[ ! "$idx" =~ ^[0-9]+$ ]]; then
+                log_warning "discover_gpus: skipping non-numeric index from nvidia-smi: ${idx:-(empty)}"
+                continue
+            fi
             [ -z "$uuid" ] && uuid="legacy-unknown"
             [ -z "$name" ] && name="GPU"
-            # mem_total and power_limit may be [N/A] on some hardware.
+            # mem_total and power_limit may be [N/A] or [Not Supported]
+            # on some hardware. Use proper JSON-number regexes (not
+            # loose [0-9.]) so edge cases like "." or "1.2.3" don't slip
+            # through and break `jq --argjson` downstream.
             [[ ! "$mem_total" =~ ^[0-9]+$ ]] && mem_total=0
-            [[ ! "$power_limit" =~ ^[0-9.]+$ ]] && power_limit=0
+            [[ ! "$power_limit" =~ ^[0-9]+(\.[0-9]+)?$ ]] && power_limit=0
 
             GPU_INDEXES+=("$idx")
             GPU_NAMES[$idx]="$name"
