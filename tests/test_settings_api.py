@@ -340,16 +340,15 @@ async def test_put_same_origin_ipv6_bracketed_is_accepted(client):
     assert resp.status == 200
 
 
-# ─── SMTP test endpoint (stub until Phase 6.3) ─────────────────────────────
+# ─── SMTP test endpoint (Phase 6b real implementation) ─────────────────────
 
 
 @pytest.mark.asyncio
-async def test_smtp_test_returns_501_stub(client):
-    """Phase 6a stubs /api/settings/smtp/test as 501 Not Implemented so
-    the route is registered and the UI can call it once the real
-    mailer lands in a later sub-PR."""
+async def test_smtp_test_with_empty_host_returns_400(client):
+    """Phase 6b real impl — no SMTP host configured → 400 with a
+    clear message pointing at the Settings view."""
     resp = await client.post("/api/settings/smtp/test")
-    assert resp.status == 501
+    assert resp.status == 400
     data = await resp.json()
     assert data["ok"] is False
-    assert "not yet implemented" in data["error"]
+    assert "not configured" in data["error"]
