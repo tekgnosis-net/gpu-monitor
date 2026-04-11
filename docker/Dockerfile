@@ -30,6 +30,19 @@ COPY src/server.py         /app/
 # Make scripts executable
 RUN chmod +x /app/monitor_gpu.sh
 
+# Application version: APP_VERSION is the SINGLE source of truth at build
+# time. CI (see .github/workflows/docker-publish.yml) reads the tracked
+# VERSION file at workflow time and plumbs it here; local builds can run
+# `docker build --build-arg APP_VERSION=$(cat VERSION) ...` to match.
+# Local builds that forget the flag get "dev" in both places — never a
+# divergence between the OCI label and runtime /app/VERSION.
+#
+# Placed late in the Dockerfile so that layer caching for the COPYs above
+# is not invalidated every time APP_VERSION changes.
+ARG APP_VERSION=dev
+LABEL org.opencontainers.image.version="${APP_VERSION}"
+RUN printf '%s\n' "${APP_VERSION}" > /app/VERSION
+
 # Expose port for web server
 EXPOSE 8081
 

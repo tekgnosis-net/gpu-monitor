@@ -29,13 +29,23 @@ DEBUG_LOG="$LOG_DIR/debug.log"
 BUFFER_FILE="/tmp/stats_buffer"
 # SQLite database location
 DB_FILE="$HISTORY_DIR/gpu_metrics.db"
-INTERVAL=4  # Time between GPU checks (seconds)
-BUFFER_SIZE=15  # Number of readings before writing to history (15 * 4s = 1 minute)
+# Settings file (read each tick for live reload, see load_settings())
+SETTINGS_FILE="$BASE_DIR/settings.json"
+# Version file (written into gpu_config.json at startup for the frontend)
+VERSION_FILE="$BASE_DIR/VERSION"
+
+# Collection cadence — these are the DEFAULTS. The real values are overridden
+# by settings.json at runtime via load_settings() if that file exists, which
+# lets the user tune cadence live without a container restart.
+INTERVAL=4           # Time between GPU checks (seconds)
+FLUSH_INTERVAL=60    # Buffered readings are committed to the DB this often (seconds)
+BUFFER_SIZE=15       # Derived: ceil(FLUSH_INTERVAL / INTERVAL). Recomputed in load_settings().
 
 # Single source of truth for the history retention window.
 # Used by clean_old_data (DB purge) AND by export_history_json (JSON export
 # cutoff). Keep them in lockstep by deriving both from this one value.
 # Default: 3 days + 10 minutes of slack to avoid chart gaps at the edge.
+# Phase 6 will source this from housekeeping.retention_days in settings.json.
 RETENTION_SECONDS=$(( 3 * 86400 + 600 ))
 
 # Debug toggle (comment out to disable debug logging)
@@ -44,6 +54,17 @@ RETENTION_SECONDS=$(( 3 * 86400 + 600 ))
 # Create required directories
 mkdir -p "$LOG_DIR"
 mkdir -p "$HISTORY_DIR"
+
+# Read the application version once at startup. Used by the frontend (via
+# gpu_config.json) and by the Phase 3 /api/version route. A missing VERSION
+# file falls back to "unknown" rather than crashing so local/dev runs are
+# forgiving.
+if [ -r "$VERSION_FILE" ]; then
+    GPU_MONITOR_VERSION=$(tr -d '[:space:]' < "$VERSION_FILE")
+else
+    GPU_MONITOR_VERSION="unknown"
+fi
+export GPU_MONITOR_VERSION
 
 ###############################################################################
 # Logging Functions
@@ -70,16 +91,275 @@ log_debug() {
     fi
 }
 
-# Get GPU name and save to config
-GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || echo "GPU")
+# Get GPU name + UUID once at startup. UUID is stable across reboots and is
+# the audit identifier written into every metrics row via the process_buffer
+# heredoc. Both values use an explicit empty-check fallback (rather than
+# `|| echo "GPU"` appended to a pipeline) because bash only evaluates the
+# `||` against the final command in the pipeline — `sed` on empty input
+# exits 0, so a failing `nvidia-smi` would otherwise silently leave the
+# variable empty.
+GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+[ -z "$GPU_NAME" ] && GPU_NAME="GPU"
+GPU_UUID=$(nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | head -n1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+[ -z "$GPU_UUID" ] && GPU_UUID="legacy-unknown"
+export GPU_UUID
 CONFIG_FILE="$BASE_DIR/gpu_config.json"
 
-# Create config JSON with GPU name
-cat > "$CONFIG_FILE" << EOF
-{
-    "gpu_name": "${GPU_NAME}"
+# NOTE: gpu_config.json is WRITTEN in the startup block near the end of
+# this file, after all helper functions (safe_write_json in particular)
+# have been defined. Top-level script flow in bash runs line-by-line, so
+# calling safe_write_json up here would fail because its definition is
+# further down.
+
+###############################################################################
+# load_settings: Recomputes the effective collection cadence every tick and
+# applies any change to INTERVAL / FLUSH_INTERVAL / BUFFER_SIZE. Called once
+# per collector tick so the user can change cadence live from the Settings UI
+# without restarting the container (propagation delay: at most one tick).
+#
+# Behaviour matrix:
+#   - settings.json missing / unreadable / malformed        → defaults
+#   - settings.json present but collection.* keys missing   → defaults
+#   - settings.json present but values out of range         → defaults
+#   - settings.json present with valid values               → those values
+#
+# Crucially the defaults case is re-asserted every tick, so deleting
+# settings.json while the container is running reverts the cadence to
+# (4s / 60s / 15), matching the pre-overhaul script behaviour.
+#
+# Note on jq: at the function level this file appears to tolerate jq
+# being absent (we fall back to defaults), but jq is NOT optional for
+# the collector as a whole. The startup block later runs `jq -n` to
+# generate gpu_config.json and exits 1 if jq is missing. Keeping the
+# local jq-availability check here is belt-and-suspenders for test
+# harnesses that exercise load_settings in isolation.
+#
+# Validation: interval_seconds must be in [2, 300]; flush_interval_seconds
+# must be in [5, 3600]; anything outside falls back to the default. BUFFER_SIZE
+# is derived as ceil(FLUSH_INTERVAL / INTERVAL) with a minimum of 1.
+#
+# Only logs a message when a value actually changes — keeps the logs quiet
+# in the steady state.
+###############################################################################
+function load_settings() {
+    local default_interval=4
+    local default_flush=60
+    local new_interval="$default_interval"
+    local new_flush="$default_flush"
+
+    # Compute the candidate values from settings.json if it's readable AND
+    # jq is installed; otherwise stick with the defaults already assigned.
+    if [ -r "$SETTINGS_FILE" ] && command -v jq >/dev/null 2>&1; then
+        new_interval=$(jq -r '.collection.interval_seconds // empty' "$SETTINGS_FILE" 2>/dev/null)
+        new_flush=$(jq -r '.collection.flush_interval_seconds // empty' "$SETTINGS_FILE" 2>/dev/null)
+    fi
+
+    # Validate interval_seconds ∈ [2, 300]; fall back to default otherwise.
+    if ! [[ "$new_interval" =~ ^[0-9]+$ ]] || [ "$new_interval" -lt 2 ] || [ "$new_interval" -gt 300 ]; then
+        new_interval="$default_interval"
+    fi
+    # Validate flush_interval_seconds ∈ [5, 3600]; fall back to default otherwise.
+    if ! [[ "$new_flush" =~ ^[0-9]+$ ]] || [ "$new_flush" -lt 5 ] || [ "$new_flush" -gt 3600 ]; then
+        new_flush="$default_flush"
+    fi
+
+    # Cross-field coherence: the flush cadence must be at least as long as
+    # the collection cadence, otherwise BUFFER_SIZE collapses to 1 and we
+    # commit every tick. Clamping up (rather than rejecting) honours the
+    # user's intent of "as tight a flush as possible" while keeping the
+    # logged/advertised value matched to actual behaviour.
+    if [ "$new_flush" -lt "$new_interval" ]; then
+        new_flush="$new_interval"
+    fi
+
+    if [ "$new_interval" != "$INTERVAL" ] || [ "$new_flush" != "$FLUSH_INTERVAL" ]; then
+        # CRITICAL: flush any buffered rows BEFORE applying the new interval
+        # so they get written with the cadence they were actually sampled at.
+        # Without this, rows buffered under the old INTERVAL would be flushed
+        # with the new $INTERVAL as their interval_s, silently corrupting
+        # Phase 5's power-integration math around every cadence change.
+        # process_buffer reads GPU_MONITOR_INTERVAL_S from the environment,
+        # which is still the OLD $INTERVAL at this point.
+        if [ -f "$BUFFER_FILE" ] && [ -s "$BUFFER_FILE" ]; then
+            log_debug "Flushing ${INTERVAL}s-interval buffer before applying new cadence"
+            if ! process_buffer; then
+                # Best-effort semantics: log the failure for visibility and
+                # leave $INTERVAL / $FLUSH_INTERVAL / $BUFFER_SIZE untouched.
+                # Swapping cadence on a failed flush would attribute future
+                # rows to the new interval even though the user's request
+                # was never fully honoured for the current data. The diff
+                # check above keeps firing until the values match, so the
+                # NEXT tick automatically retries the flush — no propagation
+                # into update_stats' data-collection retry loop (which is
+                # tuned for nvidia-smi hiccups, not settings-reload issues).
+                log_warning "Failed to flush ${INTERVAL}s-interval buffer; postponing cadence change (will retry next tick)"
+                return 0
+            fi
+            # Run the post-flush maintenance that update_stats normally does
+            # at a buffer-full boundary, so the API consumers see fresh data
+            # immediately rather than waiting a full new-flush-interval.
+            process_historical_data
+            process_24hr_stats
+        fi
+
+        INTERVAL="$new_interval"
+        FLUSH_INTERVAL="$new_flush"
+        BUFFER_SIZE=$(( (FLUSH_INTERVAL + INTERVAL - 1) / INTERVAL ))
+        [ "$BUFFER_SIZE" -lt 1 ] && BUFFER_SIZE=1
+        log_warning "Collection settings reloaded: interval=${INTERVAL}s flush=${FLUSH_INTERVAL}s buffer_size=${BUFFER_SIZE}"
+    fi
+    return 0
 }
-EOF
+
+###############################################################################
+# gpu_metrics_has_column: Asks SQLite whether the given column exists on the
+# gpu_metrics table. Uses the queryable pragma_table_info() form rather than
+# piping CLI output through awk, which would be fragile if the sqlite3 CLI
+# output format is changed by a user sqliterc (-header/-csv/etc.). Returns 0
+# when the column exists, 1 otherwise.
+#
+# The column name is always a hardcoded identifier from this file (never
+# external input), so direct string interpolation into the SQL is safe.
+###############################################################################
+function gpu_metrics_has_column() {
+    local col="$1"
+    local result
+    result=$(sqlite3 -init /dev/null "$DB_FILE" \
+        "SELECT 1 FROM pragma_table_info('gpu_metrics') WHERE name='${col}';" 2>/dev/null)
+    [ "$result" = "1" ]
+}
+
+###############################################################################
+# migrate_database: Idempotently upgrades the gpu_metrics table to the Phase 1
+# schema. Adds three columns on existing installs:
+#   - gpu_index  (multi-GPU groundwork; Phase 2 starts writing values > 0)
+#   - gpu_uuid   (audit trail / robustness against nvidia-smi index shuffle)
+#   - interval_s (per-row sample interval, so future power integration stays
+#                 correct across settings changes — see Phase 5)
+# Also enables WAL journal mode for concurrent reader support.
+#
+# Safe to call every boot. Returns 0 on success (including no-op), 1 on
+# any ALTER/PRAGMA failure. Callers must check the return status.
+###############################################################################
+function migrate_database() {
+    log_debug "Checking database schema at $DB_FILE"
+
+    # If the database doesn't exist yet there is nothing to migrate;
+    # initialize_database() runs immediately after this and creates it fresh
+    # with the new schema.
+    [ -f "$DB_FILE" ] || return 0
+
+    # A DB file can exist without the gpu_metrics table (empty file, manually
+    # dropped, partial recovery). In that case there is nothing to migrate —
+    # initialize_database() runs right after this and will CREATE TABLE IF
+    # NOT EXISTS the fresh schema. Without this check, the first ALTER TABLE
+    # below would fail and fail-fast would exit the container unnecessarily.
+    local table_exists
+    table_exists=$(sqlite3 -init /dev/null "$DB_FILE" \
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='gpu_metrics';" 2>/dev/null)
+    if [ -z "$table_exists" ]; then
+        log_debug "gpu_metrics table absent; skipping migration (initialize_database will create fresh schema)"
+        return 0
+    fi
+
+    # Enable WAL once. WAL persists as a database attribute, so setting it
+    # here is equivalent to setting it at database creation. Only log when
+    # we actually change the mode — keeps no-op runs quiet.
+    #
+    # `PRAGMA journal_mode=WAL` always exits 0, but returns whatever mode
+    # SQLite actually applied. On filesystems that do not support WAL (tmpfs,
+    # some NFS configurations, FAT) it silently falls back to rollback
+    # journal mode. We capture the returned mode and warn (not fail) if it
+    # is not "wal": losing concurrent-reader scalability is a perf
+    # degradation, not a correctness issue — the collector is the only
+    # writer and the API's reads are single-row SELECTs that rollback
+    # mode handles correctly. Failing hard here would be user-hostile for
+    # ephemeral dev deployments on tmpfs.
+    local current_mode new_mode
+    current_mode=$(sqlite3 -init /dev/null "$DB_FILE" "PRAGMA journal_mode;" 2>/dev/null)
+    if [ "$current_mode" != "wal" ]; then
+        log_warning "Migrating gpu_metrics: enabling WAL journal mode (was: ${current_mode:-unknown})"
+        new_mode=$(sqlite3 -init /dev/null "$DB_FILE" "PRAGMA journal_mode=WAL;" 2>/dev/null) || {
+            log_error "Failed to enable WAL journal mode (sqlite3 error)"
+            return 1
+        }
+        if [ "$new_mode" != "wal" ]; then
+            log_warning "WAL not supported on this filesystem; SQLite reported '${new_mode:-unknown}'. Concurrent-reader scalability will be reduced but correctness is unaffected."
+        fi
+    fi
+
+    # Add gpu_index if missing
+    if ! gpu_metrics_has_column gpu_index; then
+        log_warning "Migrating gpu_metrics: adding gpu_index column (default 0)"
+        sqlite3 -init /dev/null "$DB_FILE" \
+            "ALTER TABLE gpu_metrics ADD COLUMN gpu_index INTEGER NOT NULL DEFAULT 0;" || {
+            log_error "Failed to add gpu_index column"
+            return 1
+        }
+    fi
+
+    # Add gpu_uuid column if missing (separate from backfill so a partial
+    # previous failure — ALTER succeeded but UPDATE didn't — can still be
+    # recovered by the idempotent backfill below).
+    if ! gpu_metrics_has_column gpu_uuid; then
+        log_warning "Migrating gpu_metrics: adding gpu_uuid column"
+        sqlite3 -init /dev/null "$DB_FILE" \
+            "ALTER TABLE gpu_metrics ADD COLUMN gpu_uuid TEXT;" || {
+            log_error "Failed to add gpu_uuid column"
+            return 1
+        }
+    fi
+
+    # Backfill any NULL gpu_uuid rows with the current GPU's UUID.
+    # This runs on EVERY boot regardless of whether we just added the column,
+    # so:
+    #   (a) a partial previous migration (ALTER ok, UPDATE failed) recovers;
+    #   (b) rows inserted by a bug elsewhere with NULL gpu_uuid get fixed;
+    #   (c) the operation is a cheap COUNT-then-UPDATE on steady-state runs
+    #       where nothing is NULL.
+    local null_count
+    null_count=$(sqlite3 -init /dev/null "$DB_FILE" \
+        "SELECT COUNT(*) FROM gpu_metrics WHERE gpu_uuid IS NULL;" 2>/dev/null)
+    if [ "${null_count:-0}" -gt 0 ]; then
+        local current_uuid escaped_uuid
+        current_uuid=$(nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | head -n1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+        [ -z "$current_uuid" ] && current_uuid="legacy-unknown"
+
+        # SQL-escape single quotes (external command output — UUIDs are
+        # well-formed in practice but the escape keeps the pattern safe
+        # and robust to future driver changes).
+        escaped_uuid=${current_uuid//\'/\'\'}
+
+        log_warning "Backfilling $null_count gpu_metrics row(s) with NULL gpu_uuid → '$current_uuid'"
+        sqlite3 -init /dev/null "$DB_FILE" \
+            "UPDATE gpu_metrics SET gpu_uuid = '$escaped_uuid' WHERE gpu_uuid IS NULL;" || {
+            log_error "Failed to backfill gpu_uuid"
+            return 1
+        }
+    fi
+
+    # Add interval_s if missing. DEFAULT 4 is correct for all existing rows
+    # because the pre-overhaul script only ever sampled at 4s.
+    if ! gpu_metrics_has_column interval_s; then
+        log_warning "Migrating gpu_metrics: adding interval_s column (default 4)"
+        sqlite3 -init /dev/null "$DB_FILE" \
+            "ALTER TABLE gpu_metrics ADD COLUMN interval_s INTEGER NOT NULL DEFAULT 4;" || {
+            log_error "Failed to add interval_s column"
+            return 1
+        }
+    fi
+
+    # Composite index for the (gpu_index, timestamp_epoch) queries Phase 3
+    # introduces. IF NOT EXISTS makes this a no-op on re-runs.
+    sqlite3 -init /dev/null "$DB_FILE" \
+        "CREATE INDEX IF NOT EXISTS idx_gpu_metrics_gpu_epoch ON gpu_metrics(gpu_index, timestamp_epoch);" || {
+        log_error "Failed to create composite (gpu_index, timestamp_epoch) index"
+        return 1
+    }
+
+    log_debug "Schema migration complete"
+    return 0
+}
 
 ###############################################################################
 # initialize_database: Creates and initializes the SQLite database
@@ -94,8 +374,14 @@ function initialize_database() {
         chmod 666 "$DB_FILE"  # Ensure proper permissions
     fi
     
-    # Create SQLite tables and indexes
-    sqlite3 "$DB_FILE" << EOF
+    # Create SQLite tables and indexes. Fresh databases get the Phase 1
+    # schema directly; existing databases are brought forward by
+    # migrate_database() which runs just before this function.
+    # stdout is redirected because `PRAGMA journal_mode=WAL` returns the
+    # resulting mode and would otherwise leak "wal" into container logs.
+    sqlite3 -init /dev/null "$DB_FILE" >/dev/null << EOF
+    PRAGMA journal_mode=WAL;
+
     CREATE TABLE IF NOT EXISTS gpu_metrics (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         timestamp TEXT NOT NULL,
@@ -103,10 +389,14 @@ function initialize_database() {
         temperature REAL NOT NULL,
         utilization REAL NOT NULL,
         memory REAL NOT NULL,
-        power REAL NOT NULL
+        power REAL NOT NULL,
+        gpu_index INTEGER NOT NULL DEFAULT 0,
+        gpu_uuid TEXT,
+        interval_s INTEGER NOT NULL DEFAULT 4
     );
-    
+
     CREATE INDEX IF NOT EXISTS idx_gpu_metrics_timestamp_epoch ON gpu_metrics(timestamp_epoch);
+    CREATE INDEX IF NOT EXISTS idx_gpu_metrics_gpu_epoch ON gpu_metrics(gpu_index, timestamp_epoch);
     
     -- Create a view for the legacy JSON format to maintain compatibility
     CREATE VIEW IF NOT EXISTS history_json_view AS
@@ -433,37 +723,50 @@ function process_buffer() {
         
         # Process buffer with Python and write to database
         cat > /tmp/process_buffer.py << 'PYTHONSCRIPT'
+import os
 import sys
 import sqlite3
-import time
 from datetime import datetime
 
 def process_buffer(db_path, buffer_lines):
+    # interval_s (the cadence the collector is currently running at) and
+    # gpu_uuid (the sampled GPU) come from environment variables set by
+    # the bash caller, not from the buffer lines themselves. This keeps
+    # the buffer file format small and line-position stable across ticks.
+    try:
+        interval_s = int(os.environ.get('GPU_MONITOR_INTERVAL_S', '4'))
+    except ValueError:
+        interval_s = 4
+    gpu_uuid = os.environ.get('GPU_MONITOR_GPU_UUID', 'legacy-unknown') or 'legacy-unknown'
+
     try:
         conn = sqlite3.connect(db_path)
         conn.execute('BEGIN TRANSACTION')
-        
-        # Prepare statement for insertion
+
+        # Phase 1 widens the INSERT to carry gpu_index, gpu_uuid, and
+        # interval_s. Phase 2 makes gpu_index dynamic per-row; for now it
+        # is pinned to 0 because the collector still only samples one GPU.
         stmt = '''
-            INSERT INTO gpu_metrics 
-            (timestamp, timestamp_epoch, temperature, utilization, memory, power)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO gpu_metrics
+            (timestamp, timestamp_epoch, temperature, utilization, memory, power,
+             gpu_index, gpu_uuid, interval_s)
+            VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)
         '''
-        
+
         for line in buffer_lines:
             line = line.strip()
             if not line:
                 continue
-                
+
             parts = line.split(',')
             if len(parts) < 5:
                 continue
-                
+
             timestamp = parts[0]
             temperature = float(parts[1])
             utilization = float(parts[2])
             memory = float(parts[3])
-            
+
             # Handle N/A power values
             try:
                 power = float(parts[4]) if parts[4].strip() != 'N/A' else 0
@@ -479,9 +782,10 @@ def process_buffer(db_path, buffer_lines):
                 current_year = datetime.now().year
                 dt = datetime.strptime(f"{current_year} {timestamp}", "%Y %m-%d %H:%M:%S")
             timestamp_epoch = int(dt.timestamp())
-            
-            # Insert record
-            conn.execute(stmt, (timestamp, timestamp_epoch, temperature, utilization, memory, power))
+
+            conn.execute(stmt,
+                (timestamp, timestamp_epoch, temperature, utilization, memory, power,
+                 gpu_uuid, interval_s))
         
         conn.commit()
         return True
@@ -504,15 +808,29 @@ if __name__ == "__main__":
     sys.exit(0 if success else 1)
 PYTHONSCRIPT
 
-        # Execute the script with buffer data
-        if cat "$temp_file" | python3 /tmp/process_buffer.py "$DB_FILE"; then
+        # Execute the script with buffer data. GPU_MONITOR_INTERVAL_S and
+        # GPU_MONITOR_GPU_UUID are read by process_buffer.py and written
+        # into every inserted row so that Phase 5's power integration stays
+        # correct across interval changes and multi-GPU installs.
+        if cat "$temp_file" \
+            | GPU_MONITOR_INTERVAL_S="$INTERVAL" \
+              GPU_MONITOR_GPU_UUID="${GPU_UUID:-legacy-unknown}" \
+              python3 /tmp/process_buffer.py "$DB_FILE"; then
             log_debug "Successfully processed buffer data into database"
             success=1
-            # Also append to log file for backup
-            cat "$temp_file" >> "$LOG_FILE"
         else
             log_error "Failed to process buffer into database"
         fi
+        # Append buffered samples to the audit log REGARDLESS of DB insert
+        # success. Without this, a transient DB-insert failure meant the
+        # buffer had already been truncated (line 715) and the temp file was
+        # about to be deleted, so there was no record of the failed samples
+        # anywhere. Appending unconditionally means every sample is
+        # recoverable from $LOG_FILE even if the DB write failed. (The
+        # proper retry mechanism — rename temp_file to a pending-retry
+        # artifact and pick it up on the next flush — is still future work
+        # that deserves its own focused PR.)
+        cat "$temp_file" >> "$LOG_FILE"
         
         # Clean up
         rm -f /tmp/process_buffer.py
@@ -539,7 +857,13 @@ PYTHONSCRIPT
 ###############################################################################
 update_stats() {
     local write_failed=0
-    
+
+    # Pick up any live changes to collection.interval_seconds /
+    # collection.flush_interval_seconds from settings.json. No-op if the
+    # file is missing or unchanged. See load_settings() definition for
+    # validation range and fallback behaviour.
+    load_settings
+
     # Collect current GPU metrics.
     # Timestamp includes the year to avoid the year-rollover bug where buffered
     # records were misassigned to the flush-time year (e.g. a Dec 31 23:59 reading
@@ -604,8 +928,42 @@ EOF
     fi
 }
 
-# Initialize the SQLite database before starting monitoring
+# Write gpu_config.json using jq for proper JSON escaping (GPU_NAME from
+# nvidia-smi and GPU_MONITOR_VERSION from the VERSION file are both
+# external-ish inputs that could in principle contain JSON-significant
+# characters; jq handles escaping per RFC 8259). safe_write_json gives us
+# atomic temp-file + rename so readers never see a partially-written file.
+# This runs here rather than at the top of the file because both jq and
+# safe_write_json must be available before the call.
+if ! command -v jq >/dev/null 2>&1; then
+    log_error "jq is required to generate $CONFIG_FILE but was not found in PATH"
+    exit 1
+fi
+if ! CONFIG_JSON=$(jq -n \
+    --arg gpu_name "$GPU_NAME" \
+    --arg version "$GPU_MONITOR_VERSION" \
+    '{gpu_name: $gpu_name, version: $version}'); then
+    log_error "Failed to generate $CONFIG_FILE via jq"
+    exit 1
+fi
+safe_write_json "$CONFIG_FILE" "$CONFIG_JSON"
+
+# Run schema migrations on the existing DB (no-op on fresh installs), then
+# initialize / open the database for writes. Migration must run BEFORE
+# initialize_database so CREATE TABLE IF NOT EXISTS does not race the ALTER.
+#
+# Fail-fast on migration error: a half-migrated schema would leave the
+# collector silently writing to a DB that process_buffer.py can no longer
+# INSERT into, producing an infinite error loop with no clear signal.
+# Exiting here lets the container supervisor surface the error and restart.
+if ! migrate_database; then
+    log_error "Database migration failed; refusing to start in a half-migrated state"
+    exit 1
+fi
 initialize_database
+# Pick up any user-defined collection cadence from settings.json on startup
+# so the very first tick honours it (later ticks re-read each iteration).
+load_settings
 
 ###############################################################################
 # run_web_server: Runs server.py in a supervised respawn loop.

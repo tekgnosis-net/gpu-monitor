@@ -60,14 +60,24 @@ jobs:
             org.opencontainers.image.description=Real-time NVIDIA GPU monitoring dashboard
             org.opencontainers.image.vendor=${{ github.repository_owner }}
 
+      - name: Read VERSION file
+        id: version
+        # Reads the tracked VERSION file from the repo (not untrusted input)
+        # and exposes it as a step output for the build-args stanza below.
+        run: |
+          printf 'app_version=%s\n' "$(tr -d '[:space:]' < VERSION)" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: docker/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            APP_VERSION=${{ steps.version.outputs.app_version }}
           sbom: true
           provenance: mode=max
           cache-from: type=gha
