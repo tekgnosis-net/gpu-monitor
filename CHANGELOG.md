@@ -6,6 +6,23 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 ## [Unreleased]
 
 ### Added
+- **Phase 4** — Complete frontend rewrite applying Apple HIG design vocabulary. The single 1,200-line `gpu-stats.html` is replaced by a 47-line shell plus ES modules and Lit web components:
+  - `src/web/app.js` — entrypoint that wires theme, router, sidebar, and the four views together
+  - `src/web/api.js` — thin wrapper around the Phase 3 `/api/*` endpoints
+  - `src/web/theme.js` — three-mode theming (auto / light / dark) with OS-preference tracking and live toggle
+  - `src/web/router.js` — hash-based routing with safe-DOM error rendering (no innerHTML with untrusted content)
+  - `src/web/sidebar.js` — collapsible sidebar with nav + version footer + theme toggle
+  - `src/web/views/{dashboard,report,power,settings}.js` — Dashboard ships with content; the other three are Phase 5/6 placeholders with styled empty states
+  - `src/web/components/info-tip.js`, `gauge.js`, `gpu-card.js` — Lit web components loaded via CDN ES modules
+  - `src/web/styles/tokens.css` — Apple-HIG-flavored design tokens (palette, typography, 4pt grid, shadows, motion)
+  - `src/web/styles/layout.css` — shell grid, sidebar, mobile drawer responsive breakpoints
+  - `src/web/styles/components.css` — card / button / tab / input / chart-container / empty-state shared styles
+- **Phase 4** — Dynamic gauge ceilings: the `<gpu-card>` reads `memory_total_mib` and `power_limit_w` per GPU from `/api/gpus` instead of the hardcoded 24576 MiB / 250 W ceilings the legacy HTML baked in.
+- **Phase 4** — Multi-GPU tab strip in the Dashboard view, shown only when `gpus.length > 1`. Single-GPU installs see the classic single-card layout with no picker.
+- **Phase 4** — Sidebar footer: version from `/api/version` + "Built with love ❤️ by Tekgnosis" byline.
+- **Phase 4** — Keyboard-accessible `<info-tip>` component with a fading tooltip, `role="tooltip"`, `aria-describedby`, and Escape-to-close — ready for Phase 6's settings form to attach per-field hints.
+- **Phase 4** — `prefers-color-scheme` auto-theme with a live `matchMedia` listener: toggling OS theme flips the dashboard instantly without reload.
+- **Phase 4** — `prefers-reduced-motion` honored: transitions collapse to 0ms when the user has the OS accessibility preference set.
 - **Phase 3** — aiohttp-based API routes on `src/server.py`:
   - `GET /api/health` — liveness + version + schema version
   - `GET /api/version` — `{version}`
@@ -40,7 +57,9 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 - **Phase 2** — Legacy flat files (`gpu_current_stats.json`, `history/history.json`, `gpu_24hr_stats.txt`) now filter on `gpu_index = 0` so the pre-Phase-3 frontend continues to see a single-GPU rendering even when the DB contains multi-GPU rows. Phase 3 will replace these with per-GPU API endpoints and delete the flat files.
 
 ### Removed
-- **Phase 3** — `process_historical_data` and `process_24hr_stats` functions (and their embedded Python heredocs `export_json.py` / `process_stats.py`) deleted from `src/monitor_gpu.sh`. The collector no longer writes `history/history.json` or `gpu_24hr_stats.txt` — those files will simply stop appearing in the volume after the upgrade. `STATS_FILE` bash constant removed. Stale references to `export_history_json` in comments updated. `gpu_current_stats.json` is still written as a transitional shim for the pre-Phase-4 frontend and will be removed in Phase 4.
+- **Phase 4** — Legacy single-file `gpu-stats.html` (~1,200 lines of inlined CSS+JS+DOM) replaced by the 47-line shell. The old dark navy palette, inline alert system, inline threshold configuration, and inline stats table are all rewritten as proper ES modules under `src/web/`. The legacy frontend's `gpu_config.json` static fetch is also gone — the new frontend reads `/api/gpus` instead.
+- **Phase 4** — `gpu_current_stats.json` shim deleted from `src/monitor_gpu.sh`. The collector no longer writes a legacy single-GPU current-state JSON file; the new frontend reads `/api/metrics/current` directly. `JSON_FILE` bash constant removed along with the per-row GPU-0 capture logic and the normalization + `jq --argjson` build inside `update_stats`. Net: ~50 lines of collector code deleted on top of Phase 3's -227 lines.
+- **Phase 3** — `process_historical_data` and `process_24hr_stats` functions (and their embedded Python heredocs `export_json.py` / `process_stats.py`) deleted from `src/monitor_gpu.sh`. The collector no longer writes `history/history.json` or `gpu_24hr_stats.txt` — those files will simply stop appearing in the volume after the upgrade. `STATS_FILE` bash constant removed. Stale references to `export_history_json` in comments updated.
 - **Phase 2** — `process_buffer.py` heredoc looks up `gpu_uuid` per row via `gpu_inventory.json` (with `GPU_MONITOR_GPU_UUID` env var as last-resort fallback) instead of unconditionally using a single env var.
 - **Phase 2** — CSV whitespace trimming in `update_stats()` uses bash parameter expansion instead of `echo | xargs`, removing a subprocess fork per field per GPU per tick.
 

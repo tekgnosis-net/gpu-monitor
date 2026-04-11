@@ -18,10 +18,25 @@ RUN mkdir -p /app/history /app/logs
 
 # Copy application files
 # Repo layout differs from container layout: src/web/ holds the frontend
-# (HTML, images, sounds) and src/ holds the bash collector and python server.
-# Inside the container everything lives flat at /app/ so that the static
-# server resolves relative paths (images/, sounds/) the same way the browser does.
+# (HTML shell, ES modules, Lit components, design-token CSS, images,
+# sounds) and src/ holds the bash collector and python server.
+# Inside the container everything lives flat at /app/ so the static
+# server in server.py resolves relative paths (images/, sounds/,
+# styles/, components/, views/, app.js) the same way the browser does.
+#
+# Phase 4 restructures the frontend from a single 1200-line HTML file
+# into a 50-line HTML shell plus ~15 ES modules and 3 CSS files. The
+# COPY below preserves the directory hierarchy for app.js / styles/ /
+# components/ / views/ so the browser's relative imports resolve.
 COPY src/web/gpu-stats.html /app/
+COPY src/web/app.js         /app/
+COPY src/web/api.js         /app/
+COPY src/web/theme.js       /app/
+COPY src/web/router.js      /app/
+COPY src/web/sidebar.js     /app/
+COPY src/web/styles/       /app/styles/
+COPY src/web/components/   /app/components/
+COPY src/web/views/        /app/views/
 COPY src/web/images/       /app/images/
 COPY src/web/sounds/       /app/sounds/
 COPY src/monitor_gpu.sh    /app/

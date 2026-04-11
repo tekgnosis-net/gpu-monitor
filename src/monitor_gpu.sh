@@ -19,12 +19,12 @@
 
 BASE_DIR="/app"
 LOG_FILE="$BASE_DIR/gpu_stats.log"
-# JSON_FILE is the legacy single-GPU current-stats shim kept alive for the
-# pre-Phase-4 frontend. Phase 3 deleted the history.json and 24h-stats
-# flat files in favour of /api/metrics/history and /api/stats/24h; Phase 4
-# deletes this one too once the UI rewrite reads exclusively from
-# /api/metrics/current.
-JSON_FILE="$BASE_DIR/gpu_current_stats.json"
+# NOTE (Phase 4): JSON_FILE (gpu_current_stats.json) has been deleted.
+# The pre-Phase-4 frontend read it as a legacy single-GPU current-stats
+# shim; Phase 4's UI rewrite reads /api/metrics/current directly from
+# the DB via server.py. Phase 3 already deleted history.json and
+# gpu_24hr_stats.txt; Phase 4 now removes the last flat-file write
+# from the collector, leaving only the SQLite DB + inventory + config.
 HISTORY_DIR="$BASE_DIR/history"
 LOG_DIR="$BASE_DIR/logs"
 ERROR_LOG="$LOG_DIR/error.log"
@@ -988,16 +988,9 @@ update_stats() {
 
     # Parse each row into the Phase 2 6-field buffer format:
     #   timestamp,gpu_index,temperature,utilization,memory,power
-    # Also accumulate per-GPU values for the legacy single-GPU
-    # gpu_current_stats.json.
-    #
-    # gpu0_*   — specifically GPU with nvidia-smi index 0 (preferred)
-    # first_*  — whatever GPU came back first, used only as a fallback
-    #            if index 0 isn't present in the current query result
-    #            (rare edge case where a GPU was hot-removed after
-    #            discover_gpus ran).
-    local gpu0_temp="" gpu0_util="" gpu0_mem="" gpu0_power=""
-    local first_temp="" first_util="" first_mem="" first_power=""
+    # Phase 4 deleted the gpu_current_stats.json shim — the new
+    # frontend reads /api/metrics/current directly from the DB, so
+    # the per-row capture of GPU 0's values is no longer needed.
     local row_count=0
     while IFS=',' read -r idx temp util mem power; do
         # _trim_ws is a top-level helper (defined earlier in this file).
@@ -1030,25 +1023,6 @@ update_stats() {
             write_failed=1
         fi
         row_count=$(( row_count + 1 ))
-
-        # Capture first-seen values as a safety net, and the explicit
-        # index-0 values when we encounter them. The final legacy JSON
-        # write prefers gpu0_* but falls back to first_* if index 0 is
-        # absent. This keeps the Phase 2 "GPU 0 only" contract explicit
-        # in the code rather than relying on nvidia-smi returning GPUs
-        # in index order.
-        if [ -z "$first_temp" ]; then
-            first_temp="$temp"
-            first_util="$util"
-            first_mem="$mem"
-            first_power="$power"
-        fi
-        if [ "$idx" = "0" ]; then
-            gpu0_temp="$temp"
-            gpu0_util="$util"
-            gpu0_mem="$mem"
-            gpu0_power="$power"
-        fi
     done <<< "$gpu_stats"
 
     # Sanity-check: did nvidia-smi return as many rows as the inventory
@@ -1063,47 +1037,10 @@ update_stats() {
     # Detailed error logging for debugging any write failures.
     # log_error reads its message from $1, not stdin, so we capture each
     # diagnostic command's output via $(...) and pass as an argument.
-    # The `ls ... | log_error` pipeline form in earlier revisions of this
-    # code silently dropped the diagnostic because log_error never read
-    # from stdin.
     if [[ $write_failed -eq 1 ]]; then
         log_error "Buffer write details:"
         log_error "$(ls -l "$BUFFER_FILE" 2>&1)"
         log_error "$(df -h "$(dirname "$BUFFER_FILE")" 2>&1)"
-    fi
-
-    # Prefer GPU-index-0 values; fall back to first-seen if idx 0 is absent
-    # in this tick. This is the "legacy GPU 0" contract made explicit.
-    local legacy_temp="${gpu0_temp:-$first_temp}"
-    local legacy_util="${gpu0_util:-$first_util}"
-    local legacy_mem="${gpu0_mem:-$first_mem}"
-    local legacy_power="${gpu0_power:-$first_power}"
-
-    # Normalize numeric fields to 0 on any parsing failure, so jq --argjson
-    # cannot fail on empty/non-numeric input. Phase 2's earlier form passed
-    # raw captured values directly and would silently produce an empty
-    # CONFIG_JSON on any malformed metric.
-    [[ "$legacy_temp" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || legacy_temp=0
-    [[ "$legacy_util" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || legacy_util=0
-    [[ "$legacy_mem" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || legacy_mem=0
-    [[ "$legacy_power" =~ ^-?[0-9]+(\.[0-9]+)?$ ]] || legacy_power=0
-
-    # Write the legacy single-GPU gpu_current_stats.json (GPU 0 only).
-    # Preserves the Phase 1 shape exactly so the existing frontend continues
-    # to render; Phase 3 will replace this with /api/metrics/current.
-    if [ -n "$legacy_temp" ]; then
-        local json_content
-        if json_content=$(jq -n \
-            --arg timestamp "$timestamp" \
-            --argjson temperature "$legacy_temp" \
-            --argjson utilization "$legacy_util" \
-            --argjson memory "$legacy_mem" \
-            --argjson power "$legacy_power" \
-            '{timestamp: $timestamp, temperature: $temperature, utilization: $utilization, memory: $memory, power: $power}'); then
-            safe_write_json "$JSON_FILE" "$json_content"
-        else
-            log_error "Failed to build legacy gpu_current_stats.json (jq error)"
-        fi
     fi
 
     # Process buffer when full. BUFFER_SIZE is already scaled by NUM_GPUS

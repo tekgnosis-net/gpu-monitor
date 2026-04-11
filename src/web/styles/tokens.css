@@ -1,0 +1,187 @@
+/*
+ * Design tokens — Apple HIG-flavored palette, typography, spacing.
+ *
+ * Phase 4 of the v1.0.0 overhaul. Defines the CSS custom properties that
+ * every other stylesheet and component references. Dark/light theming is
+ * driven entirely by toggling data-theme="light|dark" on <html>; the
+ * ":root" block below holds the default (auto) values that track
+ * prefers-color-scheme, then explicit [data-theme="light"] and
+ * [data-theme="dark"] blocks override when the user has a manual choice.
+ *
+ * Palette sourced from Apple's Human Interface Guidelines system colors:
+ *   - systemBlue, systemGreen, systemOrange, systemRed, systemIndigo
+ *   - Label / secondaryLabel / tertiaryLabel hierarchy
+ *   - systemBackground and secondarySystemBackground for surface layers
+ *
+ * Type stack uses native system fonts so we inherit the OS's real font
+ * (SF Pro on macOS/iOS, Segoe UI on Windows, Roboto on Android/Linux).
+ * No web-font download, no FOUT, no layout shift on first paint.
+ */
+
+:root {
+    /* Typography */
+    --font-system:
+        -apple-system,
+        BlinkMacSystemFont,
+        "SF Pro Text",
+        "SF Pro Display",
+        "Segoe UI",
+        Roboto,
+        Oxygen-Sans,
+        Ubuntu,
+        Cantarell,
+        "Helvetica Neue",
+        sans-serif;
+    --font-mono:
+        ui-monospace,
+        "SF Mono",
+        Menlo,
+        Monaco,
+        Consolas,
+        "Liberation Mono",
+        monospace;
+
+    --font-size-xs:  11px;
+    --font-size-sm:  13px;
+    --font-size-md:  15px;
+    --font-size-lg:  17px;
+    --font-size-xl:  22px;
+    --font-size-2xl: 28px;
+    --font-size-3xl: 34px;
+
+    --font-weight-normal:   400;
+    --font-weight-medium:   500;
+    --font-weight-semibold: 600;
+    --font-weight-bold:     700;
+
+    --line-height-tight:  1.2;
+    --line-height-normal: 1.4;
+    --line-height-loose:  1.6;
+
+    /* 4pt grid (matches Apple's spacing unit) */
+    --space-0: 0;
+    --space-1: 4px;
+    --space-2: 8px;
+    --space-3: 12px;
+    --space-4: 16px;
+    --space-5: 24px;
+    --space-6: 32px;
+    --space-7: 48px;
+    --space-8: 64px;
+
+    /* Border radius — HIG uses 6–13 for most containers */
+    --radius-sm: 6px;
+    --radius-md: 10px;
+    --radius-lg: 14px;
+    --radius-xl: 20px;
+    --radius-full: 9999px;
+
+    /* System colors — constant across light/dark */
+    --color-blue:   #007aff;
+    --color-green:  #34c759;
+    --color-orange: #ff9500;
+    --color-red:    #ff3b30;
+    --color-indigo: #5856d6;
+    --color-teal:   #5ac8fa;
+    --color-yellow: #ffcc00;
+    --color-purple: #af52de;
+
+    /* Semantic colors — remap per theme */
+    /* Default (light) values; dark overrides below. */
+    --bg-primary:    #f5f5f7;
+    --bg-secondary:  #ffffff;
+    --bg-tertiary:   #fafafa;
+    --bg-elevated:   rgba(255, 255, 255, 0.8);
+    --bg-overlay:    rgba(0, 0, 0, 0.4);
+
+    --text-primary:   #1d1d1f;
+    --text-secondary: #3c3c43;
+    --text-tertiary:  rgba(60, 60, 67, 0.6);
+    --text-quaternary: rgba(60, 60, 67, 0.3);
+    --text-on-accent: #ffffff;
+
+    --border-subtle:  rgba(60, 60, 67, 0.1);
+    --border-regular: rgba(60, 60, 67, 0.18);
+    --border-strong:  rgba(60, 60, 67, 0.36);
+
+    --accent: var(--color-blue);
+    --success: var(--color-green);
+    --warning: var(--color-orange);
+    --danger:  var(--color-red);
+
+    /* Shadows — soft, layered, HIG-style */
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.05);
+    --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.08), 0 1px 2px rgba(0, 0, 0, 0.04);
+    --shadow-lg: 0 10px 30px rgba(0, 0, 0, 0.12), 0 2px 6px rgba(0, 0, 0, 0.06);
+
+    /* Motion — HIG uses 200-400ms for most transitions */
+    --motion-fast:    150ms cubic-bezier(0.4, 0, 0.2, 1);
+    --motion-normal:  250ms cubic-bezier(0.4, 0, 0.2, 1);
+    --motion-slow:    400ms cubic-bezier(0.4, 0, 0.2, 1);
+
+    /* Layout dimensions */
+    --sidebar-width:           240px;
+    --sidebar-width-collapsed:  64px;
+    --header-height:            56px;
+}
+
+/* Dark theme — applied when user explicitly picks dark, or when they
+ * are in auto mode and prefers-color-scheme resolves to dark. */
+[data-theme="dark"] {
+    --bg-primary:    #000000;
+    --bg-secondary:  #1c1c1e;
+    --bg-tertiary:   #2c2c2e;
+    --bg-elevated:   rgba(44, 44, 46, 0.8);
+    --bg-overlay:    rgba(0, 0, 0, 0.6);
+
+    --text-primary:   #f5f5f7;
+    --text-secondary: #ebebf5;
+    --text-tertiary:  rgba(235, 235, 245, 0.6);
+    --text-quaternary: rgba(235, 235, 245, 0.3);
+    --text-on-accent: #ffffff;
+
+    --border-subtle:  rgba(235, 235, 245, 0.1);
+    --border-regular: rgba(235, 235, 245, 0.2);
+    --border-strong:  rgba(235, 235, 245, 0.4);
+
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2);
+    --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.3), 0 1px 2px rgba(0, 0, 0, 0.2);
+    --shadow-lg: 0 10px 30px rgba(0, 0, 0, 0.4), 0 2px 6px rgba(0, 0, 0, 0.25);
+}
+
+/* Auto theme — when data-theme is absent OR set to "auto", fall back to
+ * prefers-color-scheme. The [data-theme="auto"] selector is not strictly
+ * necessary (the :root block already defines light values and the media
+ * query swaps them for dark), but including it explicitly makes the
+ * JavaScript theme toggle's "auto" state self-documenting. */
+@media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+        --bg-primary:    #000000;
+        --bg-secondary:  #1c1c1e;
+        --bg-tertiary:   #2c2c2e;
+        --bg-elevated:   rgba(44, 44, 46, 0.8);
+        --bg-overlay:    rgba(0, 0, 0, 0.6);
+
+        --text-primary:   #f5f5f7;
+        --text-secondary: #ebebf5;
+        --text-tertiary:  rgba(235, 235, 245, 0.6);
+        --text-quaternary: rgba(235, 235, 245, 0.3);
+
+        --border-subtle:  rgba(235, 235, 245, 0.1);
+        --border-regular: rgba(235, 235, 245, 0.2);
+        --border-strong:  rgba(235, 235, 245, 0.4);
+
+        --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.2);
+        --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.3), 0 1px 2px rgba(0, 0, 0, 0.2);
+        --shadow-lg: 0 10px 30px rgba(0, 0, 0, 0.4), 0 2px 6px rgba(0, 0, 0, 0.25);
+    }
+}
+
+/* Reduced motion — honor the OS accessibility preference */
+@media (prefers-reduced-motion: reduce) {
+    :root {
+        --motion-fast:   0ms linear;
+        --motion-normal: 0ms linear;
+        --motion-slow:   0ms linear;
+    }
+}
