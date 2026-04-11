@@ -300,12 +300,17 @@ function discover_gpus() {
     if [ -n "$csv" ]; then
         while IFS=',' read -r idx uuid name mem_total power_limit; do
             # Strip leading/trailing whitespace that nvidia-smi adds after
-            # every comma separator.
-            idx=$(echo "$idx" | xargs)
-            uuid=$(echo "$uuid" | xargs)
-            name=$(echo "$name" | xargs)
-            mem_total=$(echo "$mem_total" | xargs)
-            power_limit=$(echo "$power_limit" | xargs)
+            # every comma separator. Uses the in-process _trim_ws helper
+            # rather than `echo ... | xargs` (which forks two processes
+            # per field = 10 subprocess forks per GPU at startup and
+            # adds a runtime dependency on xargs) for consistency with
+            # the same trim pattern in update_stats() — see the helper
+            # definition near the top of this file for rationale.
+            _trim_ws "$idx";          idx="$REPLY"
+            _trim_ws "$uuid";         uuid="$REPLY"
+            _trim_ws "$name";         name="$REPLY"
+            _trim_ws "$mem_total";    mem_total="$REPLY"
+            _trim_ws "$power_limit";  power_limit="$REPLY"
 
             # Validate idx as a non-negative integer before touching any
             # accumulator state. A non-numeric row (error message leaked
@@ -1051,8 +1056,12 @@ update_stats() {
         [ -z "$idx" ] && continue
 
         # Handle [N/A] power per-row; some laptop/dGPU combos don't report
-        # power telemetry at all.
-        if [[ "$power" == "N/A" || -z "$power" || "$power" == "[N/A]" ]]; then
+        # power telemetry at all. Because the three stripping lines above
+        # have already removed the `[` and `]` characters, only the
+        # post-strip "N/A" (or empty) form is reachable — an earlier
+        # version of this branch also checked `"$power" == "[N/A]"`,
+        # which was unreachable dead code.
+        if [[ "$power" == "N/A" || -z "$power" ]]; then
             power="0"
         fi
 
@@ -1067,12 +1076,22 @@ update_stats() {
     done <<< "$gpu_stats"
 
     # Sanity-check: did nvidia-smi return as many rows as the inventory
-    # discovered at startup? A mismatch suggests a hot-add/remove event
-    # that discover_gpus hasn't seen yet. Log a warning so the condition
-    # is observable; don't fail the tick — partial data is better than
-    # no data for homelab monitoring.
+    # discovered at startup? A mismatch in EITHER direction suggests a
+    # hot-add (row_count > NUM_GPUS — new GPU appeared) or hot-remove
+    # (row_count < NUM_GPUS — a GPU vanished, probably a driver/power
+    # event). Both directions are worth surfacing so the user notices
+    # that the inventory is stale, even though partial data is better
+    # than no data for homelab monitoring so we don't fail the tick.
+    # The direction is encoded in the log message so operators can
+    # distinguish add from remove without re-checking nvidia-smi.
     if [ "$row_count" -ne "${NUM_GPUS:-1}" ]; then
-        log_warning "nvidia-smi returned $row_count rows but discover_gpus found $NUM_GPUS GPUs; hardware may have changed since startup"
+        local direction="unchanged"
+        if [ "$row_count" -lt "${NUM_GPUS:-1}" ]; then
+            direction="hot-remove suspected"
+        elif [ "$row_count" -gt "${NUM_GPUS:-1}" ]; then
+            direction="hot-add suspected"
+        fi
+        log_warning "nvidia-smi returned $row_count rows but discover_gpus found $NUM_GPUS GPUs at startup ($direction); restart the container to refresh the inventory"
     fi
 
     # Detailed error logging for debugging any write failures.
