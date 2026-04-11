@@ -685,18 +685,29 @@ function clean_old_data() {
 
     # Phase 6c: Read housekeeping.retention_days live from
     # settings.json every invocation, falling back to the Phase-1
-    # RETENTION_SECONDS default (3 days) on missing / malformed /
-    # out-of-range. Same jq-with-validation pattern as load_settings
-    # and the new rotate_logs block above. A user who changes
-    # retention in the Settings view sees it take effect on the
-    # next clean_old_data call (fired once per day).
+    # RETENTION_SECONDS default (3 days + 10 minute slack) on
+    # missing / malformed / out-of-range. Same jq-with-validation
+    # pattern as load_settings and the new rotate_logs block above.
+    # A user who changes retention in the Settings view sees it
+    # take effect on the next clean_old_data call (fired once per
+    # day).
+    #
+    # The +600 slack preserves the exact pre-Phase-1 behavior: the
+    # original RETENTION_SECONDS constant was $((3*86400+600)),
+    # ten minutes past the 3-day boundary, so a row sampled at
+    # "now - 3 days - 5 minutes" stayed visible in the last-24h
+    # chart window until the next daily sweep. Dropping the slack
+    # would subtly shrink the effective retention by 10 minutes —
+    # imperceptible in practice but explicitly not what the
+    # Phase-1-compatibility comment promised.
     local retention_days=3
+    local retention_slack=600
     if [ -r "$SETTINGS_FILE" ] && command -v jq >/dev/null 2>&1; then
         local r
         r=$(jq -r '.housekeeping.retention_days // 3' "$SETTINGS_FILE" 2>/dev/null)
         [[ "$r" =~ ^[0-9]+$ ]] && [ "$r" -ge 1 ] && [ "$r" -le 365 ] && retention_days=$r
     fi
-    local retention_seconds=$(( retention_days * 86400 ))
+    local retention_seconds=$(( retention_days * 86400 + retention_slack ))
     local cutoff_time=$(( $(date +%s) - retention_seconds ))
 
     sqlite3 "$DB_FILE" <<EOF

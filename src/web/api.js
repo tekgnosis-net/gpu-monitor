@@ -9,14 +9,32 @@
  * there is exactly one place to update.
  *
  * Design principles:
- *   - Every function returns a Promise that resolves to a sensible default
- *     on failure, NEVER rejects. Views render an empty state rather than
- *     showing an unhandled rejection in the console.
- *   - Defaults for list endpoints are [], for scalar endpoints are {} or
- *     primitive zero values. Never null or undefined.
- *   - No retries, no caching: if the view needs retry-on-failure or
- *     revalidation, that's the view's call. Keeping this layer thin
- *     makes it easy to reason about.
+ *
+ *   Read helpers (built on _fetchJson — getHealth, getVersion, getGpus,
+ *   getCurrentMetrics, getHistory, getStats24h, getPowerStats, getSettings,
+ *   getDbInfo) return a Promise that resolves to a sensible default on
+ *   failure and NEVER reject. Views render an empty state rather than
+ *   showing an unhandled rejection in the console. Defaults for list
+ *   endpoints are [], for scalar endpoints are {} or primitive zero
+ *   values — never null or undefined.
+ *
+ *   Mutating helpers (built on _putJson / _postJson — putSettings,
+ *   testSmtp, runScheduleNow, vacuumDb, purgeOldData) THROW on 4xx/5xx
+ *   with the server's error message carried in Error.message, and
+ *   additional context in Error.status and Error.detail. Views wrap
+ *   these calls in try/catch so they can surface field-level errors
+ *   inline — a failed PUT /api/settings returns Pydantic validation
+ *   details that the Settings form shows next to the Save button.
+ *   Silently swallowing mutation failures would leave the user with
+ *   no signal that their Save click didn't persist.
+ *
+ *   The synchronous helper getReportPreviewUrl is a pure string
+ *   builder with no fetch and no Promise — it constructs the URL
+ *   the iframe src= should point at and returns it directly.
+ *
+ *   No retries, no caching: if the view needs retry-on-failure or
+ *   revalidation, that's the view's call. Keeping this layer thin
+ *   makes it easy to reason about.
  */
 
 const API_BASE = '/api';
@@ -184,12 +202,17 @@ export async function purgeOldData(days) {
     return _postJson('/housekeeping/purge', { days });
 }
 
-export async function getReportPreviewUrl(template = 'daily') {
+export function getReportPreviewUrl(template = 'daily') {
     // Returns the URL of the HTML preview endpoint for use as an
-    // iframe src (not srcdoc — we want a real HTTP fetch so the
-    // iframe can cache and the browser can show a loading state).
-    // This is a synchronous helper, not a fetch, so the view can
-    // set iframe.src directly without an await.
+    // iframe src. This is a PURE SYNCHRONOUS STRING BUILDER, NOT a
+    // fetch — the caller assigns the returned string directly to
+    // iframe.src. An earlier version had `async` on this function,
+    // which made it return a Promise; callers doing
+    // `iframe.src = api.getReportPreviewUrl(...)` then got
+    // "[object Promise]" as the src URL and the iframe silently
+    // refused to load. Keeping this sync is load-bearing — do NOT
+    // add async back even if every other helper in this module
+    // is async.
     const params = new URLSearchParams({ template });
     return `${API_BASE}/reports/preview?${params}`;
 }

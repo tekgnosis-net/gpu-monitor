@@ -173,6 +173,30 @@ function checkboxInput(name, checked) {
     return i;
 }
 
+// Phase 6c round 1: validated numeric read from an <input type="number">.
+// Returns the parsed finite number on success, or null on failure. On
+// failure calls reportValidity() to show the browser's native constraint
+// message inline next to the offending field, so the user gets immediate
+// feedback without a server round-trip.
+//
+// Using valueAsNumber instead of Number(input.value) correctly distinguishes
+// "empty field" (NaN) from "literal zero" — Number("") is 0, which would
+// silently send interval_seconds=0 to the server and trigger a 400 from
+// Pydantic's ge=2 constraint with a generic error. Catching the failure
+// client-side at the button boundary produces a better error UX.
+function numericValue(input) {
+    if (!input.checkValidity()) {
+        input.reportValidity();
+        return null;
+    }
+    const v = input.valueAsNumber;
+    if (!Number.isFinite(v)) {
+        input.reportValidity();
+        return null;
+    }
+    return v;
+}
+
 function checkboxRow(id, labelText, checked, infoText) {
     // Horizontal layout: [checkbox] [label] [info-tip]
     const row = el('div', 'field');
@@ -220,7 +244,17 @@ function saveButton(tabId, onClick) {
         btn.textContent = 'Saving…';
         status.textContent = '';
         try {
-            await onClick();
+            // Phase 6c round 1 fix: capture the server's merged/
+            // validated response and update state.settings with it.
+            // Without this, switching tabs and coming back re-renders
+            // with pre-save cached values — the user sees their
+            // saved change "disappear" until a full page reload.
+            // `putSettings` already returns the validated dict
+            // (with password redaction) so we just plumb it through.
+            const response = await onClick();
+            if (response && typeof response === 'object') {
+                state.settings = response;
+            }
             status.textContent = 'Saved.';
             status.style.color = 'var(--success, #34c759)';
             setTimeout(() => { status.textContent = ''; }, 2500);
@@ -274,10 +308,13 @@ function renderCollectionTab() {
     ));
 
     panel.append(saveButton('collection', async () => {
-        await api.putSettings({
+        const interval = numericValue(intervalInput);
+        const flush = numericValue(flushInput);
+        if (interval === null || flush === null) return null;
+        return api.putSettings({
             collection: {
-                interval_seconds: Number(intervalInput.value),
-                flush_interval_seconds: Number(flushInput.value),
+                interval_seconds: interval,
+                flush_interval_seconds: flush,
             },
         });
     }));
@@ -310,7 +347,57 @@ function renderSmtpTab() {
     const passInput = passwordInput('password',
         s.password_set ? '•••• (currently set — leave empty to preserve)' : 'new password');
     panel.append(field('smtp-password', 'Password', passInput,
-        'Leave empty to preserve the existing password. Enter a value to change it, or a single space then delete to clear.'));
+        'Leave empty to preserve the existing password. Enter a value to change it. Use the "Clear password" button below to fully remove the saved password.'));
+
+    // Phase 6c round 1: the password help text used to tell users
+    // to "enter a single space then delete to clear", but the save
+    // logic maps empty → null (preserve), so that path silently
+    // does nothing. A dedicated Clear button is unambiguous: it
+    // sends smtp.password = "" which the server maps to the
+    // four-way sentinel's "clear" branch and persists
+    // password_enc = "". Only rendered when a password is
+    // currently set — otherwise there's nothing to clear.
+    if (s.password_set) {
+        const clearWrap = document.createElement('div');
+        clearWrap.style.display = 'flex';
+        clearWrap.style.alignItems = 'center';
+        clearWrap.style.gap = 'var(--space-2)';
+        clearWrap.style.marginTop = 'calc(-1 * var(--space-3))';
+        clearWrap.style.marginBottom = 'var(--space-4)';
+
+        const clearBtn = el('button', 'small', 'Clear password');
+        clearBtn.type = 'button';
+        const clearStatus = el('span');
+        clearStatus.style.fontSize = 'var(--font-size-sm)';
+        clearStatus.style.color = 'var(--text-tertiary)';
+
+        clearBtn.addEventListener('click', async () => {
+            if (!confirm('Clear the saved SMTP password? You will need to re-enter it before the next test email or scheduled report can send.')) {
+                return;
+            }
+            clearBtn.disabled = true;
+            clearBtn.textContent = 'Clearing…';
+            try {
+                // Explicit empty string, NOT null — the server
+                // maps "" to the "clear" branch of the password
+                // sentinel. null would preserve the existing
+                // ciphertext and the button would silently no-op.
+                await api.putSettings({ smtp: { password: '' } });
+                clearStatus.textContent = 'Password cleared. Enter a new one to re-enable auth.';
+                clearStatus.style.color = 'var(--success)';
+                passInput.placeholder = 'new password';
+            } catch (err) {
+                clearStatus.textContent = `Clear failed: ${err.message}`;
+                clearStatus.style.color = 'var(--danger)';
+            } finally {
+                clearBtn.disabled = false;
+                clearBtn.textContent = 'Clear password';
+            }
+        });
+
+        clearWrap.append(clearBtn, clearStatus);
+        panel.append(clearWrap);
+    }
 
     const fromInput = emailInput('from', s.from, 'gpu-monitor@example.com');
     panel.append(field('smtp-from', 'From address', fromInput,
@@ -348,6 +435,8 @@ function renderSmtpTab() {
     };
 
     saveBtn.addEventListener('click', async () => {
+        const port = numericValue(portInput);
+        if (port === null) return;
         saveBtn.disabled = true;
         saveBtn.textContent = 'Saving…';
         setStatus('', null);
@@ -356,20 +445,28 @@ function renderSmtpTab() {
             // non-empty = new password. The server does the right thing
             // based on this mapping (null = preserve, "" = clear, value
             // = set). We prefer preserve-on-empty because most edits
-            // won't touch the password.
+            // won't touch the password. A dedicated Clear password
+            // button below the field handles the explicit clear path.
             const passwordValue = passInput.value === ''
                 ? null
                 : passInput.value;
-            await api.putSettings({
+            const response = await api.putSettings({
                 smtp: {
                     host: hostInput.value,
-                    port: Number(portInput.value),
+                    port,
                     user: userInput.value,
                     password: passwordValue,
                     from: fromInput.value,
                     tls: tlsSelect.value,
                 },
             });
+            // Phase 6c round 1: persist the server-validated
+            // response into state.settings so re-rendering this
+            // tab shows the freshly-saved values instead of the
+            // stale snapshot we loaded at mount.
+            if (response && typeof response === 'object') {
+                state.settings = response;
+            }
             // Clear the password field after successful save so the
             // placeholder can switch to "currently set" on re-render
             passInput.value = '';
@@ -435,12 +532,19 @@ function renderAlertsTab() {
         'Use the browser\'s Notification API for system-level alerts. Browser permission is requested the first time you enable this.'));
 
     panel.append(saveButton('alerts', async () => {
-        await api.putSettings({
+        const temp = numericValue(tempInput);
+        const util = numericValue(utilInput);
+        const power = numericValue(powerInput);
+        const cooldown = numericValue(cooldownInput);
+        if (temp === null || util === null || power === null || cooldown === null) {
+            return null;
+        }
+        return api.putSettings({
             alerts: {
-                temperature_c: Number(tempInput.value),
-                utilization_pct: Number(utilInput.value),
-                power_w: Number(powerInput.value),
-                cooldown_seconds: Number(cooldownInput.value),
+                temperature_c: temp,
+                utilization_pct: util,
+                power_w: power,
+                cooldown_seconds: cooldown,
                 sound_enabled: panel.querySelector('#alerts-sound').checked,
                 notifications_enabled: panel.querySelector('#alerts-notifications').checked,
             },
@@ -470,9 +574,11 @@ function renderPowerTab() {
         'Single-character (or short) currency symbol displayed next to cost values. Examples: $ € £ ¥.'));
 
     panel.append(saveButton('power', async () => {
-        await api.putSettings({
+        const rate = numericValue(rateInput);
+        if (rate === null) return null;
+        return api.putSettings({
             power: {
-                rate_per_kwh: Number(rateInput.value),
+                rate_per_kwh: rate,
                 currency: currencyInput.value,
             },
         });
@@ -500,10 +606,13 @@ function renderLoggingTab() {
         'Rotated when the log file is older than this. Default 25 h keeps the last day of logs plus a rollover margin.'));
 
     panel.append(saveButton('logging', async () => {
-        await api.putSettings({
+        const size = numericValue(sizeInput);
+        const age = numericValue(ageInput);
+        if (size === null || age === null) return null;
+        return api.putSettings({
             logging: {
-                max_size_mb: Number(sizeInput.value),
-                max_age_hours: Number(ageInput.value),
+                max_size_mb: size,
+                max_age_hours: age,
             },
         });
     }));
@@ -530,7 +639,7 @@ function renderThemeTab() {
         'The sidebar has a live toggle that overrides this per-session. This setting is the default on a fresh page load.'));
 
     panel.append(saveButton('theme', async () => {
-        await api.putSettings({
+        return api.putSettings({
             theme: { default_mode: modeSelect.value },
         });
     }));
@@ -554,8 +663,10 @@ function renderHousekeepingTab() {
         'The nightly clean_old_data sweep deletes rows older than this. Changes apply at the next midnight sweep.'));
 
     panel.append(saveButton('housekeeping', async () => {
-        await api.putSettings({
-            housekeeping: { retention_days: Number(retentionInput.value) },
+        const retention = numericValue(retentionInput);
+        if (retention === null) return null;
+        return api.putSettings({
+            housekeeping: { retention_days: retention },
         });
     }));
 
@@ -726,15 +837,29 @@ function renderReportsTab() {
             .split(',')
             .map(s => s.trim())
             .filter(Boolean);
-        if (!idInput.value || recipients.length === 0) {
+        const newId = idInput.value.trim();
+        if (!newId || recipients.length === 0) {
             addStatus.textContent = 'ID and at least one recipient are required.';
+            addStatus.style.color = 'var(--danger)';
+            return;
+        }
+        // Phase 6c round 1: reject duplicate schedule IDs at the
+        // client boundary. The scheduler's fire-id dict and the
+        // server's run-now handler both key on schedule.id; adding
+        // two entries with the same id would leave the second one
+        // effectively dead (run-now finds the first via next(),
+        // the scheduler stamps only the first's last_run_epoch on
+        // each tick). Better to refuse at submit time with a clear
+        // message than produce silent unreachable state.
+        if (schedules.some(s => s && s.id === newId)) {
+            addStatus.textContent = `A schedule with id "${newId}" already exists. Remove it first or pick a different id.`;
             addStatus.style.color = 'var(--danger)';
             return;
         }
         const nextSchedules = [
             ...schedules,
             {
-                id: idInput.value,
+                id: newId,
                 template: templateSelect.value,
                 cron: cronInput.value,
                 recipients,
