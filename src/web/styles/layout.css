@@ -37,14 +37,31 @@ html, body {
 
 body {
     display: grid;
-    grid-template-columns: var(--sidebar-width) 1fr;
+    /* minmax(0, 1fr) — not just 1fr — is load-bearing here. A bare
+       `1fr` column has an implicit minimum of auto (i.e. max-content
+       of the column's contents), which means any child with an
+       intrinsic width (Chart.js sets width="1190" on its <canvas>
+       based on the grown-to size) pins the column's floor at that
+       value. When the user collapses the sidebar, the 1fr column
+       grows, Chart.js grows the canvas to fit, and then re-expanding
+       the sidebar can't shrink the column back because the canvas's
+       intrinsic width is now the floor — leading to permanent
+       horizontal overflow until a page refresh resets the canvas.
+
+       minmax(0, 1fr) explicitly declares "this column is allowed to
+       shrink to 0 regardless of content intrinsic size", breaking
+       the feedback loop. Chart.js's ResizeObserver then shrinks the
+       canvas back to the new (smaller) container width on the next
+       frame and the overflow goes away. This is the canonical CSS
+       Grid fix for the "1fr min-content trap". */
+    grid-template-columns: var(--sidebar-width) minmax(0, 1fr);
     grid-template-rows: 1fr;
     min-height: 100vh;
     transition: grid-template-columns var(--motion-normal);
 }
 
 html[data-sidebar-collapsed="true"] body {
-    grid-template-columns: var(--sidebar-width-collapsed) 1fr;
+    grid-template-columns: var(--sidebar-width-collapsed) minmax(0, 1fr);
 }
 
 /* ─── Sidebar ───────────────────────────────────────────────────────────── */
@@ -223,6 +240,18 @@ main.content .subtitle {
 }
 
 main.content section {
+    margin-bottom: var(--space-6);
+}
+
+/* Top-level non-section blocks in the main area (e.g. the dashboard's
+   gauge-card grid, which is a plain <div class="card-grid wide">, not
+   a <section>) need the same breathing room as sections — otherwise
+   the grid's bottom edge butts directly against the next element
+   (e.g. the Historical trend card), breaking the uniform vertical
+   rhythm the rest of the page follows. Scoped to direct children so
+   card-grids nested inside sections (Settings, Housekeeping) don't
+   get double spacing. */
+main.content > .card-grid {
     margin-bottom: var(--space-6);
 }
 
