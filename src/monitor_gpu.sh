@@ -105,15 +105,11 @@ GPU_UUID=$(nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | head 
 export GPU_UUID
 CONFIG_FILE="$BASE_DIR/gpu_config.json"
 
-# Create config JSON with GPU name and application version. Phase 2 will
-# extend this to carry a "gpus" array for multi-GPU inventory; for now the
-# single "gpu_name" key is preserved for the existing frontend.
-cat > "$CONFIG_FILE" << EOF
-{
-    "gpu_name": "${GPU_NAME}",
-    "version": "${GPU_MONITOR_VERSION}"
-}
-EOF
+# NOTE: gpu_config.json is WRITTEN in the startup block near the end of
+# this file, after all helper functions (safe_write_json in particular)
+# have been defined. Top-level script flow in bash runs line-by-line, so
+# calling safe_write_json up here would fail because its definition is
+# further down.
 
 ###############################################################################
 # load_settings: Recomputes the effective collection cadence every tick and
@@ -171,15 +167,17 @@ function load_settings() {
         if [ -f "$BUFFER_FILE" ] && [ -s "$BUFFER_FILE" ]; then
             log_debug "Flushing ${INTERVAL}s-interval buffer before applying new cadence"
             if ! process_buffer; then
-                # The flush failed. Do NOT update $INTERVAL/$FLUSH_INTERVAL
-                # — leaving the old values in place means the next tick's
-                # load_settings will detect the same diff and retry the flush
-                # against whatever is in the buffer by then. Swapping cadence
-                # on a failed flush would attribute future rows to the new
-                # interval even though the user's request was never fully
-                # honoured for the current data.
-                log_warning "Failed to flush ${INTERVAL}s-interval buffer; aborting collection settings reload (will retry next tick)"
-                return 1
+                # Best-effort semantics: log the failure for visibility and
+                # leave $INTERVAL / $FLUSH_INTERVAL / $BUFFER_SIZE untouched.
+                # Swapping cadence on a failed flush would attribute future
+                # rows to the new interval even though the user's request
+                # was never fully honoured for the current data. The diff
+                # check above keeps firing until the values match, so the
+                # NEXT tick automatically retries the flush — no propagation
+                # into update_stats' data-collection retry loop (which is
+                # tuned for nvidia-smi hiccups, not settings-reload issues).
+                log_warning "Failed to flush ${INTERVAL}s-interval buffer; postponing cadence change (will retry next tick)"
+                return 0
             fi
             # Run the post-flush maintenance that update_stats normally does
             # at a buffer-full boundary, so the API consumers see fresh data
@@ -194,6 +192,7 @@ function load_settings() {
         [ "$BUFFER_SIZE" -lt 1 ] && BUFFER_SIZE=1
         log_warning "Collection settings reloaded: interval=${INTERVAL}s flush=${FLUSH_INTERVAL}s buffer_size=${BUFFER_SIZE}"
     fi
+    return 0
 }
 
 ###############################################################################
@@ -891,6 +890,19 @@ EOF
         log_error "Failed to get GPU stats output"
     fi
 }
+
+# Write gpu_config.json using jq for proper JSON escaping (GPU_NAME from
+# nvidia-smi and GPU_MONITOR_VERSION from the VERSION file are both
+# external-ish inputs that could in principle contain JSON-significant
+# characters; jq handles escaping per RFC 8259). safe_write_json gives us
+# atomic temp-file + rename so readers never see a partially-written file.
+# This runs here rather than at the top of the file because both jq and
+# safe_write_json must be available before the call.
+CONFIG_JSON=$(jq -n \
+    --arg gpu_name "$GPU_NAME" \
+    --arg version "$GPU_MONITOR_VERSION" \
+    '{gpu_name: $gpu_name, version: $version}')
+safe_write_json "$CONFIG_FILE" "$CONFIG_JSON"
 
 # Run schema migrations on the existing DB (no-op on fresh installs), then
 # initialize / open the database for writes. Migration must run BEFORE
