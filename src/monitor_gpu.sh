@@ -93,9 +93,13 @@ log_debug() {
 
 # Get GPU name + UUID once at startup. UUID is stable across reboots and is
 # the audit identifier written into every metrics row via the process_buffer
-# heredoc. A missing UUID (e.g. no GPU available in the test harness) falls
-# back to "legacy-unknown" so rows still satisfy the NOT NULL chain.
-GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' || echo "GPU")
+# heredoc. Both values use an explicit empty-check fallback (rather than
+# `|| echo "GPU"` appended to a pipeline) because bash only evaluates the
+# `||` against the final command in the pipeline — `sed` on empty input
+# exits 0, so a failing `nvidia-smi` would otherwise silently leave the
+# variable empty.
+GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+[ -z "$GPU_NAME" ] && GPU_NAME="GPU"
 GPU_UUID=$(nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | head -n1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
 [ -z "$GPU_UUID" ] && GPU_UUID="legacy-unknown"
 export GPU_UUID
@@ -112,15 +116,20 @@ cat > "$CONFIG_FILE" << EOF
 EOF
 
 ###############################################################################
-# load_settings: Re-reads collection-cadence settings from settings.json and
-# applies any changes to INTERVAL / FLUSH_INTERVAL / BUFFER_SIZE. Called once
+# load_settings: Recomputes the effective collection cadence every tick and
+# applies any change to INTERVAL / FLUSH_INTERVAL / BUFFER_SIZE. Called once
 # per collector tick so the user can change cadence live from the Settings UI
 # without restarting the container (propagation delay: at most one tick).
 #
-# Behaviour if settings.json is missing or malformed: silently keep the
-# current in-memory defaults. This keeps first-run containers behaving
-# identically to the pre-overhaul script (INTERVAL=4, FLUSH_INTERVAL=60,
-# BUFFER_SIZE=15).
+# Behaviour matrix:
+#   - settings.json missing / unreadable / jq not available → defaults
+#   - settings.json present but collection.* keys missing   → defaults
+#   - settings.json present but values out of range          → defaults
+#   - settings.json present with valid values                → those values
+#
+# Crucially the defaults case is re-asserted every tick, so deleting
+# settings.json while the container is running reverts the cadence to
+# (4s / 60s / 15), matching the pre-overhaul script behaviour.
 #
 # Validation: interval_seconds must be in [2, 300]; flush_interval_seconds
 # must be in [5, 3600]; anything outside falls back to the default. BUFFER_SIZE
@@ -130,20 +139,25 @@ EOF
 # in the steady state.
 ###############################################################################
 function load_settings() {
-    [ -r "$SETTINGS_FILE" ] || return 0
-    command -v jq >/dev/null 2>&1 || return 0
+    local default_interval=4
+    local default_flush=60
+    local new_interval="$default_interval"
+    local new_flush="$default_flush"
 
-    local new_interval new_flush
-    new_interval=$(jq -r '.collection.interval_seconds // empty' "$SETTINGS_FILE" 2>/dev/null)
-    new_flush=$(jq -r '.collection.flush_interval_seconds // empty' "$SETTINGS_FILE" 2>/dev/null)
+    # Compute the candidate values from settings.json if it's readable AND
+    # jq is installed; otherwise stick with the defaults already assigned.
+    if [ -r "$SETTINGS_FILE" ] && command -v jq >/dev/null 2>&1; then
+        new_interval=$(jq -r '.collection.interval_seconds // empty' "$SETTINGS_FILE" 2>/dev/null)
+        new_flush=$(jq -r '.collection.flush_interval_seconds // empty' "$SETTINGS_FILE" 2>/dev/null)
+    fi
 
     # Validate interval_seconds ∈ [2, 300]; fall back to default otherwise.
     if ! [[ "$new_interval" =~ ^[0-9]+$ ]] || [ "$new_interval" -lt 2 ] || [ "$new_interval" -gt 300 ]; then
-        new_interval=4
+        new_interval="$default_interval"
     fi
     # Validate flush_interval_seconds ∈ [5, 3600]; fall back to default otherwise.
     if ! [[ "$new_flush" =~ ^[0-9]+$ ]] || [ "$new_flush" -lt 5 ] || [ "$new_flush" -gt 3600 ]; then
-        new_flush=60
+        new_flush="$default_flush"
     fi
 
     if [ "$new_interval" != "$INTERVAL" ] || [ "$new_flush" != "$FLUSH_INTERVAL" ]; then
