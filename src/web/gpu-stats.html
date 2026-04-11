@@ -1105,11 +1105,18 @@
         // Phase 3: fetch both endpoints via the new API. Response shapes:
         //   /api/metrics/current → array of GPUs (we want [0] for legacy)
         //   /api/stats/24h       → array of {gpu_index, stats} (we want [0].stats)
-        // Both return a non-error JSON response even on an empty DB, so the
-        // client-side defaultStats fallback only fires on a network error.
+        // Both endpoints normally return a non-error JSON response even on
+        // an empty DB, so the client-side fallback only fires on a true
+        // network error or a 5xx. Check r.ok before .json() so a 500
+        // response body isn't fed to JSON.parse, and add a .catch() so
+        // a hard network failure takes the same fallback path.
         Promise.all([
-            fetch('/api/metrics/current').then(r => r.json()),
-            fetch('/api/stats/24h').then(r => r.json()).catch(() => [])
+            fetch('/api/metrics/current')
+                .then(r => r.ok ? r.json() : [])
+                .catch(() => []),
+            fetch('/api/stats/24h')
+                .then(r => r.ok ? r.json() : [])
+                .catch(() => [])
         ])
         .then(([currentArray, statsArray]) => {
             // Pre-Phase-3 code consumed a single object for both endpoints;

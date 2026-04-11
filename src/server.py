@@ -37,11 +37,8 @@ point; Phase 3 does not.
 
 import json
 import logging
-import os
-import re
 import sqlite3
 from pathlib import Path
-from typing import Any, Callable
 
 from aiohttp import web
 

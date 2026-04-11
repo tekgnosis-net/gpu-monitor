@@ -16,16 +16,13 @@ but pytest-asyncio or pytest-aiohttp is the idiomatic runner).
 from __future__ import annotations
 
 import json
-import os
 import sqlite3
 import sys
-import tempfile
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
 import pytest_asyncio
-from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 
