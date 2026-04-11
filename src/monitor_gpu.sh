@@ -170,7 +170,17 @@ function load_settings() {
         # which is still the OLD $INTERVAL at this point.
         if [ -f "$BUFFER_FILE" ] && [ -s "$BUFFER_FILE" ]; then
             log_debug "Flushing ${INTERVAL}s-interval buffer before applying new cadence"
-            process_buffer
+            if ! process_buffer; then
+                # The flush failed. Do NOT update $INTERVAL/$FLUSH_INTERVAL
+                # — leaving the old values in place means the next tick's
+                # load_settings will detect the same diff and retry the flush
+                # against whatever is in the buffer by then. Swapping cadence
+                # on a failed flush would attribute future rows to the new
+                # interval even though the user's request was never fully
+                # honoured for the current data.
+                log_warning "Failed to flush ${INTERVAL}s-interval buffer; aborting collection settings reload (will retry next tick)"
+                return 1
+            fi
             # Run the post-flush maintenance that update_stats normally does
             # at a buffer-full boundary, so the API consumers see fresh data
             # immediately rather than waiting a full new-flush-interval.
@@ -260,9 +270,29 @@ function migrate_database() {
         }
     fi
 
-    # Add gpu_uuid if missing. Backfill existing rows to the current GPU's
-    # UUID (the fork was single-GPU until now, so this is correct attribution).
+    # Add gpu_uuid column if missing (separate from backfill so a partial
+    # previous failure — ALTER succeeded but UPDATE didn't — can still be
+    # recovered by the idempotent backfill below).
     if ! gpu_metrics_has_column gpu_uuid; then
+        log_warning "Migrating gpu_metrics: adding gpu_uuid column"
+        sqlite3 -init /dev/null "$DB_FILE" \
+            "ALTER TABLE gpu_metrics ADD COLUMN gpu_uuid TEXT;" || {
+            log_error "Failed to add gpu_uuid column"
+            return 1
+        }
+    fi
+
+    # Backfill any NULL gpu_uuid rows with the current GPU's UUID.
+    # This runs on EVERY boot regardless of whether we just added the column,
+    # so:
+    #   (a) a partial previous migration (ALTER ok, UPDATE failed) recovers;
+    #   (b) rows inserted by a bug elsewhere with NULL gpu_uuid get fixed;
+    #   (c) the operation is a cheap COUNT-then-UPDATE on steady-state runs
+    #       where nothing is NULL.
+    local null_count
+    null_count=$(sqlite3 -init /dev/null "$DB_FILE" \
+        "SELECT COUNT(*) FROM gpu_metrics WHERE gpu_uuid IS NULL;" 2>/dev/null)
+    if [ "${null_count:-0}" -gt 0 ]; then
         local current_uuid escaped_uuid
         current_uuid=$(nvidia-smi --query-gpu=uuid --format=csv,noheader 2>/dev/null | head -n1 | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
         [ -z "$current_uuid" ] && current_uuid="legacy-unknown"
@@ -272,15 +302,12 @@ function migrate_database() {
         # and robust to future driver changes).
         escaped_uuid=${current_uuid//\'/\'\'}
 
-        log_warning "Migrating gpu_metrics: adding gpu_uuid column (backfilling to '$current_uuid')"
-        sqlite3 -init /dev/null "$DB_FILE" <<SQL
-ALTER TABLE gpu_metrics ADD COLUMN gpu_uuid TEXT;
-UPDATE gpu_metrics SET gpu_uuid = '$escaped_uuid' WHERE gpu_uuid IS NULL;
-SQL
-        if [ $? -ne 0 ]; then
-            log_error "Failed to add gpu_uuid column"
+        log_warning "Backfilling $null_count gpu_metrics row(s) with NULL gpu_uuid → '$current_uuid'"
+        sqlite3 -init /dev/null "$DB_FILE" \
+            "UPDATE gpu_metrics SET gpu_uuid = '$escaped_uuid' WHERE gpu_uuid IS NULL;" || {
+            log_error "Failed to backfill gpu_uuid"
             return 1
-        fi
+        }
     fi
 
     # Add interval_s if missing. DEFAULT 4 is correct for all existing rows
