@@ -9,14 +9,32 @@
  * there is exactly one place to update.
  *
  * Design principles:
- *   - Every function returns a Promise that resolves to a sensible default
- *     on failure, NEVER rejects. Views render an empty state rather than
- *     showing an unhandled rejection in the console.
- *   - Defaults for list endpoints are [], for scalar endpoints are {} or
- *     primitive zero values. Never null or undefined.
- *   - No retries, no caching: if the view needs retry-on-failure or
- *     revalidation, that's the view's call. Keeping this layer thin
- *     makes it easy to reason about.
+ *
+ *   Read helpers (built on _fetchJson — getHealth, getVersion, getGpus,
+ *   getCurrentMetrics, getHistory, getStats24h, getPowerStats, getSettings,
+ *   getDbInfo) return a Promise that resolves to a sensible default on
+ *   failure and NEVER reject. Views render an empty state rather than
+ *   showing an unhandled rejection in the console. Defaults for list
+ *   endpoints are [], for scalar endpoints are {} or primitive zero
+ *   values — never null or undefined.
+ *
+ *   Mutating helpers (built on _putJson / _postJson — putSettings,
+ *   testSmtp, runScheduleNow, vacuumDb, purgeOldData) THROW on 4xx/5xx
+ *   with the server's error message carried in Error.message, and
+ *   additional context in Error.status and Error.detail. Views wrap
+ *   these calls in try/catch so they can surface field-level errors
+ *   inline — a failed PUT /api/settings returns Pydantic validation
+ *   details that the Settings form shows next to the Save button.
+ *   Silently swallowing mutation failures would leave the user with
+ *   no signal that their Save click didn't persist.
+ *
+ *   The synchronous helper getReportPreviewUrl is a pure string
+ *   builder with no fetch and no Promise — it constructs the URL
+ *   the iframe src= should point at and returns it directly.
+ *
+ *   No retries, no caching: if the view needs retry-on-failure or
+ *   revalidation, that's the view's call. Keeping this layer thin
+ *   makes it easy to reason about.
  */
 
 const API_BASE = '/api';
@@ -76,6 +94,130 @@ export async function getStats24h() {
     const data = await _fetchJson('/stats/24h', []);
     return Array.isArray(data) ? data : [];
 }
+
+/* ─── Phase 6 — Settings, housekeeping, schedules ──────────────────────── */
+
+export async function getSettings() {
+    // Phase 6a: returns the full settings tree with smtp.password_enc
+    // replaced by a boolean smtp.password_set. Never null — the server
+    // falls back to DEFAULT_SETTINGS on missing file.
+    return _fetchJson('/settings', {});
+}
+
+async function _putJson(path, body) {
+    // Mutating helper: PUT a JSON body and return the parsed response.
+    // Unlike _fetchJson which swallows errors into a fallback, mutating
+    // calls re-raise so the Settings view can show a toast on failure.
+    try {
+        const response = await fetch(`${API_BASE}${path}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            const err = new Error(data.error || `HTTP ${response.status}`);
+            err.status = response.status;
+            err.detail = data.detail;
+            throw err;
+        }
+        return data;
+    } catch (error) {
+        if (error.status) throw error;
+        // Network / JSON parse failure — surface as a consistent shape
+        const err = new Error(error.message || 'network error');
+        err.status = 0;
+        throw err;
+    }
+}
+
+async function _postJson(path, body = undefined) {
+    try {
+        const init = {
+            method: 'POST',
+            headers: body ? { 'Content-Type': 'application/json' } : {},
+        };
+        if (body !== undefined) init.body = JSON.stringify(body);
+        const response = await fetch(`${API_BASE}${path}`, init);
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            const err = new Error(data.error || `HTTP ${response.status}`);
+            err.status = response.status;
+            err.detail = data.detail;
+            throw err;
+        }
+        return data;
+    } catch (error) {
+        if (error.status) throw error;
+        const err = new Error(error.message || 'network error');
+        err.status = 0;
+        throw err;
+    }
+}
+
+export async function putSettings(partial) {
+    // Partial-merge update — only send the fields you want to change.
+    // The server deep-merges over the current settings.json and
+    // validates via Pydantic before writing. Throws on 4xx / 5xx so
+    // the view can surface the server's error message inline.
+    return _putJson('/settings', partial);
+}
+
+export async function testSmtp(to = null) {
+    // Trigger a real SMTP test send. `to` optional — defaults to the
+    // configured user address if omitted. Throws on 4xx / 5xx with
+    // the server's error message so the Settings view can show it
+    // without a generic "network error" fallback.
+    return _postJson('/settings/smtp/test', to ? { to } : undefined);
+}
+
+export async function runScheduleNow(scheduleId) {
+    // Synchronously fires one schedule via the server's run-now
+    // endpoint. Blocks until render + send complete — the UI should
+    // show a spinner because this can take 5-15 seconds on a slow
+    // SMTP relay.
+    const encoded = encodeURIComponent(scheduleId);
+    return _postJson(`/schedules/${encoded}/run-now`);
+}
+
+export async function getDbInfo() {
+    // Housekeeping tab: current DB size, row count, oldest/newest,
+    // per-GPU breakdown.
+    return _fetchJson('/housekeeping/db-info', {
+        size_bytes: 0,
+        row_count: 0,
+        oldest_epoch: null,
+        newest_epoch: null,
+        row_count_per_gpu: [],
+    });
+}
+
+export async function vacuumDb() {
+    // Triggers a blocking VACUUM. Can take seconds on a large DB.
+    return _postJson('/housekeeping/vacuum');
+}
+
+export async function purgeOldData(days) {
+    // DELETE rows older than N days. Idempotent.
+    return _postJson('/housekeeping/purge', { days });
+}
+
+export function getReportPreviewUrl(template = 'daily') {
+    // Returns the URL of the HTML preview endpoint for use as an
+    // iframe src. This is a PURE SYNCHRONOUS STRING BUILDER, NOT a
+    // fetch — the caller assigns the returned string directly to
+    // iframe.src. An earlier version had `async` on this function,
+    // which made it return a Promise; callers doing
+    // `iframe.src = api.getReportPreviewUrl(...)` then got
+    // "[object Promise]" as the src URL and the iframe silently
+    // refused to load. Keeping this sync is load-bearing — do NOT
+    // add async back even if every other helper in this module
+    // is async.
+    const params = new URLSearchParams({ template });
+    return `${API_BASE}/reports/preview?${params}`;
+}
+
+/* ─── Phase 5 (existing) ──────────────────────────────────────────────── */
 
 export async function getPowerStats(range = '24h', gpuIndex = 0) {
     // Phase 5: integrated energy + peak / avg / sample counts for one GPU

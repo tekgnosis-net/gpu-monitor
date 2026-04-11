@@ -626,8 +626,27 @@ EOF
 # Handles: error.log, warning.log, gpu_stats.log
 ###############################################################################
 rotate_logs() {
-    local max_size=$((5 * 1024 * 1024))  # 5MB size limit
-    local max_age=$((25 * 3600))      # 25hr retention
+    # Phase 6c: Read size + age thresholds live from settings.json
+    # every invocation. The jq filter falls back to the Phase-1
+    # defaults (5 MB / 25 h) if the file is missing, malformed, or
+    # the keys are absent — matching the pre-Phase-1 hardcoded
+    # behaviour exactly. A user who changes logging.max_size_mb or
+    # logging.max_age_hours in the Settings view sees the new
+    # values take effect on the very next rotate_logs call (which
+    # the main loop fires hourly).
+    local max_size_mb=5
+    local max_age_hours=25
+    if [ -r "$SETTINGS_FILE" ] && command -v jq >/dev/null 2>&1; then
+        local s
+        s=$(jq -r '.logging.max_size_mb // 5' "$SETTINGS_FILE" 2>/dev/null)
+        [[ "$s" =~ ^[0-9]+$ ]] && [ "$s" -ge 1 ] && [ "$s" -le 100 ] && max_size_mb=$s
+        local a
+        a=$(jq -r '.logging.max_age_hours // 25' "$SETTINGS_FILE" 2>/dev/null)
+        [[ "$a" =~ ^[0-9]+$ ]] && [ "$a" -ge 1 ] && [ "$a" -le 720 ] && max_age_hours=$a
+    fi
+
+    local max_size=$(( max_size_mb * 1024 * 1024 ))
+    local max_age=$(( max_age_hours * 3600 ))
     local current_time=$(date +%s)
 
     rotate_log_file() {
@@ -664,10 +683,32 @@ rotate_logs() {
 function clean_old_data() {
     log_debug "Cleaning old data from SQLite database"
 
-    # Retention comes from the single RETENTION_SECONDS constant at the top
-    # of this file. Phase 3 deleted the other historical consumer
-    # (export_history_json heredoc), so this is now the sole caller.
-    local cutoff_time=$(( $(date +%s) - RETENTION_SECONDS ))
+    # Phase 6c: Read housekeeping.retention_days live from
+    # settings.json every invocation, falling back to the Phase-1
+    # RETENTION_SECONDS default (3 days + 10 minute slack) on
+    # missing / malformed / out-of-range. Same jq-with-validation
+    # pattern as load_settings and the new rotate_logs block above.
+    # A user who changes retention in the Settings view sees it
+    # take effect on the next clean_old_data call (fired once per
+    # day).
+    #
+    # The +600 slack preserves the exact pre-Phase-1 behavior: the
+    # original RETENTION_SECONDS constant was $((3*86400+600)),
+    # ten minutes past the 3-day boundary, so a row sampled at
+    # "now - 3 days - 5 minutes" stayed visible in the last-24h
+    # chart window until the next daily sweep. Dropping the slack
+    # would subtly shrink the effective retention by 10 minutes —
+    # imperceptible in practice but explicitly not what the
+    # Phase-1-compatibility comment promised.
+    local retention_days=3
+    local retention_slack=600
+    if [ -r "$SETTINGS_FILE" ] && command -v jq >/dev/null 2>&1; then
+        local r
+        r=$(jq -r '.housekeeping.retention_days // 3' "$SETTINGS_FILE" 2>/dev/null)
+        [[ "$r" =~ ^[0-9]+$ ]] && [ "$r" -ge 1 ] && [ "$r" -le 365 ] && retention_days=$r
+    fi
+    local retention_seconds=$(( retention_days * 86400 + retention_slack ))
+    local cutoff_time=$(( $(date +%s) - retention_seconds ))
 
     sqlite3 "$DB_FILE" <<EOF
     DELETE FROM gpu_metrics WHERE timestamp_epoch < $cutoff_time;
