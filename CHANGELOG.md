@@ -6,6 +6,15 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 ## [Unreleased]
 
 ### Added
+- **Phase 3** — aiohttp-based API routes on `src/server.py`:
+  - `GET /api/health` — liveness + version + schema version
+  - `GET /api/version` — `{version}`
+  - `GET /api/gpus` — `{gpus: [...]}` from `/app/gpu_inventory.json`
+  - `GET /api/metrics/current` — array of latest samples per GPU (correlated subquery on `(gpu_index, timestamp_epoch)` composite index)
+  - `GET /api/metrics/history?range=24h&gpu=0` — per-GPU timeseries; range one of `15m|30m|1h|6h|12h|24h|3d|7d`, defaults to 24h on missing/invalid; shape matches the pre-Phase-3 `history/history.json` contract exactly so the retrofit is minimal
+  - `GET /api/stats/24h` — array of `{gpu_index, stats: {min/max per metric}}`
+- **Phase 3** — read-only SQLite connections per request (`file:...?mode=ro`) so the API boundary physically cannot issue writes. WAL journal mode from Phase 1 lets the collector's writes and API reads concur without locking.
+- **Phase 3** — `tests/test_api.py` pytest integration suite (10 tests) covering every new endpoint, including range-param fallback and path-traversal rejection. `pytest.ini` and `tests/conftest.py` configure `asyncio_mode=auto` and exclude the legacy standalone load-test scripts from collection.
 - **Phase 1** — `VERSION` file as the single source of truth for the application version; exposed to the frontend via `gpu_config.json`.
 - **Phase 1** — `CHANGELOG.md` following Keep-a-Changelog format; will be managed by release-please from v1.0.0 onwards.
 - **Phase 1** — Database migration path with a new `migrate_database()` function in `monitor_gpu.sh`:
@@ -26,7 +35,12 @@ Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [S
 - **Phase 2** — Hot-remove detection: `update_stats()` logs a WARNING if `nvidia-smi` returns fewer rows than `discover_gpus` found at startup, so a silently-removed GPU becomes observable.
 
 ### Changed
+- **Phase 3** — `src/server.py` grew from 30 lines (static-only) to ~300 lines with the aiohttp JSON API. Static file serving still works via a catch-all registered last. Module now exposes `make_app()` so tests can construct fresh app instances per test.
+- **Phase 3** — `src/web/gpu-stats.html` fetch call sites retrofitted to hit `/api/metrics/current`, `/api/metrics/history`, `/api/stats/24h` instead of the deleted flat files. Response shapes are compatible with the existing downstream render code via minimal adapter layers. `gpu_config.json` stays as a static file. This is a transitional retrofit; Phase 4 rewrites the whole frontend.
 - **Phase 2** — Legacy flat files (`gpu_current_stats.json`, `history/history.json`, `gpu_24hr_stats.txt`) now filter on `gpu_index = 0` so the pre-Phase-3 frontend continues to see a single-GPU rendering even when the DB contains multi-GPU rows. Phase 3 will replace these with per-GPU API endpoints and delete the flat files.
+
+### Removed
+- **Phase 3** — `process_historical_data` and `process_24hr_stats` functions (and their embedded Python heredocs `export_json.py` / `process_stats.py`) deleted from `src/monitor_gpu.sh`. The collector no longer writes `history/history.json` or `gpu_24hr_stats.txt` — those files will simply stop appearing in the volume after the upgrade. `STATS_FILE` bash constant removed. Stale references to `export_history_json` in comments updated. `gpu_current_stats.json` is still written as a transitional shim for the pre-Phase-4 frontend and will be removed in Phase 4.
 - **Phase 2** — `process_buffer.py` heredoc looks up `gpu_uuid` per row via `gpu_inventory.json` (with `GPU_MONITOR_GPU_UUID` env var as last-resort fallback) instead of unconditionally using a single env var.
 - **Phase 2** — CSV whitespace trimming in `update_stats()` uses bash parameter expansion instead of `echo | xargs`, removing a subprocess fork per field per GPU per tick.
 

@@ -19,7 +19,11 @@
 
 BASE_DIR="/app"
 LOG_FILE="$BASE_DIR/gpu_stats.log"
-STATS_FILE="$BASE_DIR/gpu_24hr_stats.txt"
+# JSON_FILE is the legacy single-GPU current-stats shim kept alive for the
+# pre-Phase-4 frontend. Phase 3 deleted the history.json and 24h-stats
+# flat files in favour of /api/metrics/history and /api/stats/24h; Phase 4
+# deletes this one too once the UI rewrite reads exclusively from
+# /api/metrics/current.
 JSON_FILE="$BASE_DIR/gpu_current_stats.json"
 HISTORY_DIR="$BASE_DIR/history"
 LOG_DIR="$BASE_DIR/logs"
@@ -42,10 +46,11 @@ FLUSH_INTERVAL=60    # Buffered readings are committed to the DB this often (sec
 BUFFER_SIZE=15       # Derived: ceil(FLUSH_INTERVAL / INTERVAL). Recomputed in load_settings().
 
 # Single source of truth for the history retention window.
-# Used by clean_old_data (DB purge) AND by export_history_json (JSON export
-# cutoff). Keep them in lockstep by deriving both from this one value.
+# Used by clean_old_data (DB purge). Phase 3 deleted the flat-file
+# export_history_json heredoc that also referenced this constant, so
+# clean_old_data is the sole remaining consumer until Phase 6 sources
+# the value from housekeeping.retention_days in settings.json.
 # Default: 3 days + 10 minutes of slack to avoid chart gaps at the edge.
-# Phase 6 will source this from housekeeping.retention_days in settings.json.
 RETENTION_SECONDS=$(( 3 * 86400 + 600 ))
 
 # Debug toggle (comment out to disable debug logging)
@@ -245,11 +250,11 @@ function load_settings() {
                 log_warning "Failed to flush ${INTERVAL}s-interval buffer; postponing cadence change (will retry next tick)"
                 return 0
             fi
-            # Run the post-flush maintenance that update_stats normally does
-            # at a buffer-full boundary, so the API consumers see fresh data
-            # immediately rather than waiting a full new-flush-interval.
-            process_historical_data
-            process_24hr_stats
+            # Phase 3 deletes process_historical_data and process_24hr_stats
+            # (see the removed-functions note block further down). The
+            # collector just writes the DB; Phase 3's /api/metrics/history
+            # and /api/stats/24h routes query SQLite directly, so there is
+            # nothing to export here after the flush succeeds.
         fi
 
         INTERVAL="$new_interval"
@@ -604,193 +609,15 @@ EOF
 }
 
 ###############################################################################
-# process_historical_data: Manages historical GPU metrics
-# Handles data persistence and file permissions across system updates
-# Creates JSON view for backward compatibility
+# NOTE (Phase 3): process_historical_data and process_24hr_stats used to live
+# here. They exported SQLite data to legacy flat files (history.json,
+# gpu_24hr_stats.txt) via embedded-Python heredocs, for the pre-API frontend
+# to consume via static fetch(). Phase 3 deletes them in favour of
+# /api/metrics/history and /api/stats/24h, which query the DB directly via
+# aiohttp + sqlite3 in server.py. The collector still writes
+# gpu_current_stats.json as a transitional shim for the retrofitted
+# legacy frontend until Phase 4's full UI rewrite deletes that too.
 ###############################################################################
-function process_historical_data() {
-    local output_file="$HISTORY_DIR/history.json"
-    
-    # Create Python script for generating the JSON file from SQLite
-    cat > /tmp/export_json.py << 'PYTHONSCRIPT'
-import json
-import sqlite3
-import sys
-import os
-from datetime import datetime, timedelta
-
-def export_history_json(db_path, output_path, retention_seconds):
-    try:
-        # Connect to SQLite database
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-
-        # Cutoff comes from RETENTION_SECONDS passed in by the caller so there
-        # is exactly one retention value in the whole codebase.
-        cutoff_time = int(datetime.now().timestamp()) - retention_seconds
-        
-        # Query the database for everything newer than the computed cutoff.
-        # Phase 2: filter on gpu_index = 0 so the legacy flat file stays a
-        # single-GPU rendering for the pre-Phase-3 frontend, even when the
-        # underlying DB contains rows for multiple GPUs. Phase 3 replaces
-        # this flat file with a per-GPU API endpoint.
-        cur = conn.cursor()
-        cur.execute('''
-            SELECT timestamp, temperature, utilization, memory, power
-            FROM gpu_metrics
-            WHERE gpu_index = 0 AND timestamp_epoch > ?
-            ORDER BY timestamp_epoch ASC
-        ''', (cutoff_time,))
-        
-        # Prepare data structure
-        result = {
-            "timestamps": [],
-            "temperatures": [],
-            "utilizations": [],
-            "memory": [],
-            "power": []
-        }
-        
-        # Process each row
-        for row in cur.fetchall():
-            result["timestamps"].append(row["timestamp"])
-            result["temperatures"].append(row["temperature"])
-            result["utilizations"].append(row["utilization"])
-            result["memory"].append(row["memory"])
-            result["power"].append(row["power"])
-        
-        # Create temp file first
-        temp_path = output_path + ".tmp"
-        with open(temp_path, 'w') as f:
-            json.dump(result, f, indent=4)
-        
-        # Move temp file to final destination
-        os.rename(temp_path, output_path)
-        
-        return True
-    except Exception as e:
-        print(f"Error exporting history to JSON: {e}", file=sys.stderr)
-        return False
-    finally:
-        if 'conn' in locals():
-            conn.close()
-
-if __name__ == "__main__":
-    if len(sys.argv) != 4:
-        print(f"Usage: {sys.argv[0]} <db_path> <output_json_path> <retention_seconds>", file=sys.stderr)
-        sys.exit(1)
-
-    try:
-        retention_seconds = int(sys.argv[3])
-    except ValueError:
-        print(f"Error: retention_seconds must be an integer, got: {sys.argv[3]!r}", file=sys.stderr)
-        sys.exit(2)
-
-    success = export_history_json(sys.argv[1], sys.argv[2], retention_seconds)
-    sys.exit(0 if success else 1)
-PYTHONSCRIPT
-
-    # Run the Python script to export data
-    if ! python3 /tmp/export_json.py "$DB_FILE" "$output_file" "$RETENTION_SECONDS"; then
-        log_error "Failed to export history data to JSON"
-        return 1
-    fi
-    
-    # Ensure proper permissions on the JSON file for web access
-    chmod 666 "$output_file" 2>/dev/null
-    
-    return 0
-}
-
-# Function to process 24-hour stats
-process_24hr_stats() {
-    # Create Python script to generate stats from SQLite
-    cat > /tmp/process_stats.py << 'EOF'
-import sys
-import json
-import sqlite3
-from datetime import datetime, timedelta
-
-def get_24hr_stats(db_path):
-    try:
-        # Connect to SQLite database
-        conn = sqlite3.connect(db_path)
-        conn.row_factory = sqlite3.Row
-        
-        # Calculate cutoff time (24 hours ago)
-        cutoff_time = int((datetime.now() - timedelta(hours=24)).timestamp())
-        
-        # Execute query to get min/max values.
-        # Phase 2: filter on gpu_index = 0 so the legacy 24h stats file
-        # keeps showing single-GPU numbers for the pre-Phase-3 frontend,
-        # even when the DB contains rows for multiple GPUs.
-        cur = conn.cursor()
-        cur.execute('''
-            SELECT
-                MIN(temperature) as temp_min,
-                MAX(temperature) as temp_max,
-                MIN(utilization) as util_min,
-                MAX(utilization) as util_max,
-                MIN(memory) as mem_min,
-                MAX(memory) as mem_max,
-                MIN(CASE WHEN power > 0 THEN power ELSE NULL END) as power_min,
-                MAX(power) as power_max
-            FROM gpu_metrics
-            WHERE gpu_index = 0 AND timestamp_epoch > ?
-        ''', (cutoff_time,))
-        
-        row = cur.fetchone()
-        
-        # Handle case where no data was processed
-        if row['temp_min'] is None:
-            temp_min = temp_max = util_min = util_max = mem_min = mem_max = power_min = power_max = 0
-        else:
-            temp_min = row['temp_min']
-            temp_max = row['temp_max']
-            util_min = row['util_min']
-            util_max = row['util_max']
-            mem_min = row['mem_min']
-            mem_max = row['mem_max']
-            power_min = row['power_min'] if row['power_min'] is not None else 0
-            power_max = row['power_max'] if row['power_max'] is not None else 0
-        
-        # Create stats object
-        stats = {
-            "stats": {
-                "temperature": {"min": temp_min, "max": temp_max},
-                "utilization": {"min": util_min, "max": util_max},
-                "memory": {"min": mem_min, "max": mem_max},
-                "power": {"min": power_min, "max": power_max}
-            }
-        }
-        
-        return json.dumps(stats, indent=4)
-    except Exception as e:
-        print(f"Error processing 24hr stats: {e}", file=sys.stderr)
-        return json.dumps({"stats": {
-            "temperature": {"min": 0, "max": 0},
-            "utilization": {"min": 0, "max": 0},
-            "memory": {"min": 0, "max": 0},
-            "power": {"min": 0, "max": 0}
-        }})
-    finally:
-        if 'conn' in locals():
-            conn.close()
-
-if __name__ == "__main__":
-    if len(sys.argv) != 2:
-        print(f"Usage: {sys.argv[0]} <db_path>", file=sys.stderr)
-        sys.exit(1)
-    
-    print(get_24hr_stats(sys.argv[1]))
-EOF
-
-    # Run the Python script
-    python3 /tmp/process_stats.py "$DB_FILE" > "$STATS_FILE"
-    chmod 666 "$STATS_FILE"
-    rm /tmp/process_stats.py
-}
-
 ###############################################################################
 # rotate_logs: Manages log file sizes and retention
 # Rotates logs based on:
@@ -838,7 +665,8 @@ function clean_old_data() {
     log_debug "Cleaning old data from SQLite database"
 
     # Retention comes from the single RETENTION_SECONDS constant at the top
-    # of this file — keep in sync with export_history_json by design.
+    # of this file. Phase 3 deleted the other historical consumer
+    # (export_history_json heredoc), so this is now the sole caller.
     local cutoff_time=$(( $(date +%s) - RETENTION_SECONDS ))
 
     sqlite3 "$DB_FILE" <<EOF
@@ -1280,11 +1108,12 @@ update_stats() {
 
     # Process buffer when full. BUFFER_SIZE is already scaled by NUM_GPUS
     # in load_settings(), so this threshold means "~flush_interval_seconds
-    # of wall-clock data buffered" regardless of card count.
+    # of wall-clock data buffered" regardless of card count. Phase 3:
+    # the historical/24h flat-file exporters are gone; process_buffer is
+    # now the only thing that runs at a buffer-full boundary. The API
+    # routes in server.py query the DB directly on every request.
     if [[ -f "$BUFFER_FILE" ]] && [[ $(wc -l < "$BUFFER_FILE") -ge $BUFFER_SIZE ]]; then
         process_buffer
-        process_historical_data
-        process_24hr_stats
     fi
 }
 
