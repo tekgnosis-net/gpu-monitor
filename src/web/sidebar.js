@@ -88,6 +88,12 @@ function buildNav() {
     for (const item of NAV_ITEMS) {
         const link = document.createElement('a');
         link.href = `#${item.path}`;
+        // Always set an aria-label so the link has an accessible name
+        // regardless of whether the sidebar is expanded (label span
+        // visible) or collapsed (label span display:none, icon
+        // aria-hidden). Without this, screen readers encounter an
+        // unnamed link in the collapsed state.
+        link.setAttribute('aria-label', item.label);
 
         const icon = document.createElement('span');
         icon.className = 'icon';

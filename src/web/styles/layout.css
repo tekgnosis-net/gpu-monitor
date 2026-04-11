@@ -296,8 +296,15 @@ main.content section h2 {
     box-shadow: var(--shadow-md);
 }
 
-/* Focus rings — HIG uses a 2px inner offset ring on :focus-visible */
-*:focus {
+/* Focus rings — HIG uses a 2px inner offset ring on :focus-visible.
+ *
+ * The `:focus:not(:focus-visible)` selector only strips the outline
+ * when BOTH conditions are true: the element has focus AND the browser
+ * has decided it shouldn't show a visible ring (e.g. mouse click in
+ * a modern browser). In browsers without :focus-visible support the
+ * selector matches nothing, so the default outline stays intact —
+ * keyboard users always get a focus ring regardless of support. */
+*:focus:not(:focus-visible) {
     outline: none;
 }
 

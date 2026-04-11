@@ -69,7 +69,17 @@ function renderMountError(viewName, errMessage) {
 
 async function activate(path) {
     const normalized = normalizeRoute(path);
-    const view = routes.get(normalized) || routes.get('/dashboard');
+    let view = routes.get(normalized);
+    // When the requested route doesn't match any registered view, fall
+    // back to the dashboard. `activatedPath` is what actually ended up
+    // rendered, which may differ from `normalized`. We use it below for
+    // the sidebar nav highlighting so an unknown hash doesn't leave the
+    // navigation with no item marked current.
+    let activatedPath = normalized;
+    if (!view) {
+        view = routes.get('/dashboard');
+        activatedPath = '/dashboard';
+    }
 
     if (!view) {
         console.error(`router: no view registered for ${normalized} and no /dashboard fallback`);
@@ -102,10 +112,14 @@ async function activate(path) {
         }
     }
 
-    // Update sidebar nav highlighting
+    // Update sidebar nav highlighting. Compare against `activatedPath`
+    // (the view we actually mounted) not `normalized` (the raw hash)
+    // so an unknown route falls back to /dashboard AND highlights the
+    // Dashboard nav item, rather than leaving the sidebar with no
+    // current-item indication.
     document.querySelectorAll('aside.sidebar nav a').forEach(link => {
         const linkPath = normalizeRoute((link.getAttribute('href') || '').replace(/^#/, ''));
-        if (linkPath === normalized) {
+        if (linkPath === activatedPath) {
             link.setAttribute('aria-current', 'page');
         } else {
             link.removeAttribute('aria-current');

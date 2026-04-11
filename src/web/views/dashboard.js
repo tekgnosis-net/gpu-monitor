@@ -33,18 +33,13 @@ const TIME_RANGES = [
 
 let pollInterval = null;
 let chartInstance = null;
+let themeChangeHandler = null;
 let state = {
     gpus: [],
     selectedGpuIndex: 0,
     currentMetrics: [],
     timeRange: '1h',
 };
-
-function formatValue(v, decimals = 1) {
-    if (typeof v !== 'number' || !isFinite(v)) return '—';
-    if (Number.isInteger(v)) return String(v);
-    return v.toFixed(decimals);
-}
 
 /* ─── DOM builders ─────────────────────────────────────────────────────── */
 
@@ -297,7 +292,12 @@ export const dashboardView = {
     async mount(container) {
         // Fetch GPU inventory once — the inventory is stable per session
         // (hot-add/remove requires a container restart per Phase 2 scope).
-        state.gpus = await api.getGpus();
+        // Sort by index so "the lowest-index GPU" comment in the default
+        // selection below is structurally guaranteed, not just
+        // accidentally true because nvidia-smi happens to return rows in
+        // index order.
+        const fetched = await api.getGpus();
+        state.gpus = [...fetched].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
         if (state.gpus.length === 0) {
             const empty = document.createElement('div');
             empty.className = 'empty-state';
@@ -338,6 +338,18 @@ export const dashboardView = {
         pollInterval = setInterval(() => {
             refreshCurrent().catch(err => console.warn('dashboard poll failed:', err));
         }, 4000);
+
+        // Re-apply chart options on theme change so the legend /
+        // tooltip / tick colors follow the new palette. Without this,
+        // toggling the sidebar theme button leaves the chart stuck
+        // rendering in the prior theme's colors until the user
+        // happens to change the time range or GPU tab.
+        themeChangeHandler = () => {
+            refreshHistory().catch(err => {
+                console.warn('dashboard: theme-change refresh failed:', err);
+            });
+        };
+        window.addEventListener('themechange', themeChangeHandler);
     },
 
     unmount() {
@@ -348,6 +360,10 @@ export const dashboardView = {
         if (chartInstance) {
             chartInstance.destroy();
             chartInstance = null;
+        }
+        if (themeChangeHandler) {
+            window.removeEventListener('themechange', themeChangeHandler);
+            themeChangeHandler = null;
         }
     },
 };
