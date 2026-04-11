@@ -10,8 +10,12 @@
  *
  * Collapse state persists in localStorage under
  * 'gpu-monitor:sidebar-collapsed'. On mobile (< 768px) the sidebar
- * becomes an overlay drawer and the collapse state is ignored in
- * favour of data-sidebar-open.
+ * becomes an overlay drawer. The data-sidebar-collapsed attribute is
+ * still set from the persisted preference so it re-applies when the
+ * user resizes back to desktop, but its *visual* effect is cancelled
+ * by the mobile @media overrides in layout.css (drawer is always
+ * full width with labels visible). Drawer open/closed state uses
+ * data-sidebar-open instead.
  *
  * Footer renders the version from /api/version and the "Built with
  * love ❤️ by Tekgnosis" byline.
@@ -67,11 +71,15 @@ export function toggleMobileDrawer() {
     const next = !open;
     root.setAttribute('data-sidebar-open', next ? 'true' : 'false');
     // Reflect drawer state on the hamburger so AT users hear the
-    // correct expanded/collapsed announcement. The button lives in
-    // <body>, not inside <aside>, so we can't rely on a sibling
-    // selector — set the attribute directly.
+    // correct expanded/collapsed announcement AND the correct verb in
+    // the accessible name. The button lives in <body>, not inside
+    // <aside>, so we can't rely on a sibling selector — set the
+    // attributes directly.
     const btn = document.querySelector('.mobile-menu-button');
-    if (btn) btn.setAttribute('aria-expanded', next ? 'true' : 'false');
+    if (btn) {
+        btn.setAttribute('aria-expanded', next ? 'true' : 'false');
+        btn.setAttribute('aria-label', next ? 'Close navigation' : 'Open navigation');
+    }
 }
 
 function buildHeader() {
@@ -121,7 +129,10 @@ function buildNav() {
             if (window.matchMedia('(max-width: 768px)').matches) {
                 document.documentElement.setAttribute('data-sidebar-open', 'false');
                 const hamburger = document.querySelector('.mobile-menu-button');
-                if (hamburger) hamburger.setAttribute('aria-expanded', 'false');
+                if (hamburger) {
+                    hamburger.setAttribute('aria-expanded', 'false');
+                    hamburger.setAttribute('aria-label', 'Open navigation');
+                }
             }
         });
 
