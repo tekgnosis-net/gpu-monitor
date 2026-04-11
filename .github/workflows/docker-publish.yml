@@ -95,7 +95,11 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          # amd64-only — same rationale as release.yml. This is a
+          # homelab NVIDIA monitoring tool; arm64 users on Jetson
+          # or Grace Hopper have their own tooling. See the
+          # comment in release.yml for the full story.
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}

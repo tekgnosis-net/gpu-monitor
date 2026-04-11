@@ -141,7 +141,16 @@ jobs:
         with:
           context: .
           file: docker/Dockerfile
-          platforms: linux/amd64,linux/arm64
+          # amd64-only: this is a homelab NVIDIA monitoring tool and
+          # the target audience is x86 desktops with consumer cards.
+          # The edge cases where NVIDIA GPUs appear on arm64 (Jetson
+          # / Grace Hopper) have their own monitoring tooling and are
+          # out of scope for this fork. Dropping arm64 also avoids
+          # the doubled base-image CDN traffic that was hitting
+          # Azure Front Door transient failures during the v1.0.0
+          # ship step. Users who really need an arm64 image can
+          # build from source via `docker build` on an arm64 host.
+          platforms: linux/amd64
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
