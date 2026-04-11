@@ -1030,11 +1030,21 @@ def process_buffer(db_path, buffer_lines):
             timestamp_epoch = int(dt.timestamp())
 
             # Dual-mode fallback per the comment at the top of this
-            # function: env var when the inventory is completely missing,
-            # sentinel when a specific index is absent from a non-empty
-            # inventory.
+            # function. Three distinct cases:
+            #
+            #   (a) inventory present with an entry for this gpu_index
+            #       → use the real UUID from the inventory.
+            #   (b) inventory present but missing this gpu_index → use
+            #       'legacy-unknown' sentinel (partial corruption case).
+            #   (c) inventory empty / unreadable:
+            #       - gpu_index == 0 → env var (single-GPU legacy path)
+            #       - gpu_index != 0 → 'legacy-unknown' sentinel,
+            #         NOT the env var. The env var is specifically GPU 0's
+            #         UUID, so using it for non-zero indexes would silently
+            #         misattribute their rows to GPU 0 — exactly the
+            #         data-integrity issue we fixed in the (b) branch.
             if inventory_empty:
-                gpu_uuid = legacy_env_uuid
+                gpu_uuid = legacy_env_uuid if gpu_index == 0 else 'legacy-unknown'
             else:
                 gpu_uuid = uuid_by_index.get(gpu_index, 'legacy-unknown')
 
