@@ -145,72 +145,80 @@ function buildHeader() {
     h1.textContent = 'Power usage';
     const subtitle = document.createElement('div');
     subtitle.className = 'subtitle';
-    subtitle.textContent = 'Per-GPU power draw, integrated energy, and electricity cost';
+    // Fold the GPU count into the page subtitle, matching the Dashboard
+    // pattern — avoids a standalone "N GPUs attached" banner and the
+    // vertical clutter that came with it.
+    const count = state.gpus.length;
+    const attachedSuffix = count > 1 ? ` · ${count} GPUs attached` : '';
+    subtitle.textContent =
+        'Per-GPU power draw, integrated energy, and electricity cost'
+        + attachedSuffix;
     header.append(h1, subtitle);
     return header;
 }
 
-function buildGpuTabs(onSelect) {
-    if (state.gpus.length <= 1) return null;
-
+// Single consolidated control row: GPU picker on the left (multi-GPU
+// only), window picker on the right. Matches the Dashboard's
+// "subject-left, modifier-right" LTR pattern and collapses two
+// previously-separate labelled sections into one visual cluster,
+// eliminating ~80px of non-uniform vertical spacing that the old
+// two-section layout introduced.
+//
+// Returns the wrapper element (a <section>) so it still participates
+// in the `main.content section { margin-bottom: var(--space-6); }`
+// spacing rule.
+function buildControls(onGpuSelect, onWindowChange) {
     const wrapper = document.createElement('section');
-    const label = document.createElement('div');
-    label.style.marginBottom = '12px';
-    label.style.color = 'var(--text-tertiary)';
-    label.style.fontSize = 'var(--font-size-sm)';
-    label.textContent = `${state.gpus.length} GPUs attached`;
+    wrapper.style.display = 'flex';
+    wrapper.style.flexWrap = 'wrap';
+    wrapper.style.justifyContent = 'space-between';
+    wrapper.style.alignItems = 'center';
+    wrapper.style.gap = 'var(--space-3)';
 
-    const tabs = document.createElement('div');
-    tabs.className = 'tabs';
-    tabs.setAttribute('role', 'tablist');
-    tabs.setAttribute('aria-label', 'Select GPU for power integration');
+    // Left cluster — GPU tabs (or an empty div when single-GPU so the
+    // window picker stays right-aligned even without a GPU selector).
+    const left = document.createElement('div');
+    if (state.gpus.length > 1) {
+        const tabs = document.createElement('div');
+        tabs.className = 'tabs';
+        tabs.setAttribute('role', 'tablist');
+        tabs.setAttribute('aria-label', 'Select GPU for power integration');
 
-    let initialActive = null;
-    state.gpus.forEach((gpu) => {
-        const btn = document.createElement('button');
-        btn.textContent = `GPU ${gpu.index}`;
-        btn.setAttribute('data-gpu-index', String(gpu.index));
-        btn.setAttribute('role', 'tab');
-        btn.addEventListener('click', () => {
-            state.selectedGpuIndex = gpu.index;
-            markTabSelected(tabs, btn);
-            onSelect();
+        let initialActive = null;
+        state.gpus.forEach((gpu) => {
+            const btn = document.createElement('button');
+            btn.textContent = `GPU ${gpu.index}`;
+            btn.setAttribute('data-gpu-index', String(gpu.index));
+            btn.setAttribute('role', 'tab');
+            btn.addEventListener('click', () => {
+                state.selectedGpuIndex = gpu.index;
+                markTabSelected(tabs, btn);
+                onGpuSelect();
+            });
+            tabs.append(btn);
+            if (gpu.index === state.selectedGpuIndex) initialActive = btn;
         });
-        tabs.append(btn);
-        if (gpu.index === state.selectedGpuIndex) initialActive = btn;
-    });
 
-    // Phase 7 / task #28: full WAI-ARIA tab pattern.
-    if (initialActive) markTabSelected(tabs, initialActive);
-    attachTablistKeyboard(tabs, {
-        onSelect: (targetTab) => {
-            const idx = Number(targetTab.getAttribute('data-gpu-index'));
-            if (Number.isFinite(idx)) {
-                state.selectedGpuIndex = idx;
-                onSelect();
-            }
-        },
-    });
+        if (initialActive) markTabSelected(tabs, initialActive);
+        attachTablistKeyboard(tabs, {
+            onSelect: (targetTab) => {
+                const idx = Number(targetTab.getAttribute('data-gpu-index'));
+                if (Number.isFinite(idx)) {
+                    state.selectedGpuIndex = idx;
+                    onGpuSelect();
+                }
+            },
+        });
+        left.append(tabs);
+    }
 
-    wrapper.append(label, tabs);
-    return wrapper;
-}
-
-function buildWindowPicker(onChange) {
-    const wrapper = document.createElement('section');
-
-    const label = document.createElement('div');
-    label.style.marginBottom = '12px';
-    label.style.color = 'var(--text-tertiary)';
-    label.style.fontSize = 'var(--font-size-sm)';
-    label.textContent = 'Integration window';
-
+    // Right cluster — integration window picker.
     const picker = document.createElement('div');
     picker.className = 'time-range';
     picker.setAttribute('role', 'tablist');
     picker.setAttribute('aria-label', 'Integration window');
 
-    let initialActive = null;
+    let initialActiveWin = null;
     WINDOWS.forEach((w) => {
         const btn = document.createElement('button');
         btn.textContent = w.label;
@@ -219,24 +227,24 @@ function buildWindowPicker(onChange) {
         btn.addEventListener('click', () => {
             state.window = w.id;
             markTabSelected(picker, btn);
-            onChange();
+            onWindowChange();
         });
         picker.append(btn);
-        if (w.id === state.window) initialActive = btn;
+        if (w.id === state.window) initialActiveWin = btn;
     });
 
-    if (initialActive) markTabSelected(picker, initialActive);
+    if (initialActiveWin) markTabSelected(picker, initialActiveWin);
     attachTablistKeyboard(picker, {
         onSelect: (targetTab) => {
             const id = targetTab.getAttribute('data-window');
             if (id) {
                 state.window = id;
-                onChange();
+                onWindowChange();
             }
         },
     });
 
-    wrapper.append(label, picker);
+    wrapper.append(left, picker);
     return wrapper;
 }
 
@@ -244,7 +252,9 @@ function buildWindowPicker(onChange) {
 
 function buildKpiCard(id, title, infoText) {
     const card = document.createElement('section');
-    card.className = 'card';
+    // `compact` drops internal padding from 32px → 16px so the tiles
+    // don't feel puffy around their short single-number content.
+    card.className = 'card compact';
     card.id = id;
 
     const header = document.createElement('header');
@@ -307,7 +317,11 @@ function updateKpiCard(cardEl, displayValue, displayUnit, subtitle) {
 
 function buildChartCard() {
     const card = document.createElement('section');
-    card.className = 'card';
+    // `compact` drops the card's internal padding so the chart's
+    // built-in 320px height + the card's previous 64px vertical
+    // padding don't stack into a 400px block that feels oversized
+    // relative to the three short KPI tiles above.
+    card.className = 'card compact';
     card.id = 'power-chart-card';
 
     const header = document.createElement('header');
@@ -325,6 +339,11 @@ function buildChartCard() {
 
     const wrap = document.createElement('div');
     wrap.className = 'chart-container';
+    // Power view uses a shorter chart than the default 320px — the
+    // KPI tiles above are short, so a tall chart feels disconnected.
+    // 240px keeps enough vertical resolution for the power curve
+    // while preserving the "single integrated panel" feel.
+    wrap.style.height = '240px';
     const canvas = document.createElement('canvas');
     canvas.id = 'power-history-chart';
     wrap.append(canvas);
@@ -452,17 +471,30 @@ export const powerView = {
 
         state.selectedGpuIndex = state.gpus[0].index;
 
-        // Build the static structure
+        // Build the static structure. Header folds the GPU count into
+        // the subtitle; controls row merges what used to be two
+        // labelled sections into a single flex row with GPU tabs left
+        // and window picker right.
+        //
+        // Vertical gaps between the controls → KPI row → chart card
+        // are tightened from the global 32px (--space-6) default
+        // down to 16px (--space-4), matching the horizontal gap
+        // between the three KPI tiles. This makes the Power view
+        // feel like a single integrated panel rather than four
+        // loosely-stacked sections — a Power-specific override
+        // because the KPI tiles are shorter than the Dashboard's
+        // gauge cards, so the global gap was disproportionate to
+        // their height.
         container.append(buildHeader());
 
-        const gpuTabs = buildGpuTabs(() => refresh());
-        if (gpuTabs) container.append(gpuTabs);
-
-        container.append(buildWindowPicker(() => refresh()));
+        const controls = buildControls(() => refresh(), () => refresh());
+        controls.style.marginBottom = 'var(--space-4)';
+        container.append(controls);
 
         // KPI row
         const kpiGrid = document.createElement('div');
         kpiGrid.className = 'card-grid';
+        kpiGrid.style.marginBottom = 'var(--space-4)';
         kpiGrid.append(
             buildKpiCard(
                 'kpi-energy',

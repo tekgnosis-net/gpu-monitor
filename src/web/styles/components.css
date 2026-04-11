@@ -22,6 +22,20 @@
     box-shadow: var(--shadow-md);
 }
 
+/* Compact card variant for views where the card's content is short
+   enough that the default 32px all-around padding makes the card
+   feel puffy. Used by the Power view's KPI tiles (three short
+   "Energy 60 Wh"-style tiles) and the Power draw chart card — the
+   chart's 320px canvas is big enough that the default padding
+   becomes disproportionate. Apply via `card.className = 'card compact'`. */
+.card.compact {
+    padding: var(--space-4);
+}
+
+.card.compact > header {
+    margin-bottom: var(--space-3);
+}
+
 .card > header {
     display: flex;
     align-items: center;
