@@ -398,23 +398,49 @@ function renderSmtpTab() {
 
     const s = state.settings.smtp || {};
 
+    // Wrap all the credential fields in a <form> element. Browsers
+    // expect <input type="password"> to live inside a <form> ancestor
+    // for password-manager autofill/save-to-vault integration —
+    // Chrome specifically logs "Password field is not contained in a
+    // form" when the field stands alone in a <div>. The form has no
+    // submit action and its onsubmit preventDefault() swallows any
+    // accidental Enter-key submissions, so the autosave JS handlers
+    // remain the single source of truth for field persistence. This
+    // is a pure wrapper — no CSS or layout impact — so appending
+    // siblings like the Clear password block and the action row
+    // either inside or outside the form works the same visually.
+    const smtpForm = document.createElement('form');
+    smtpForm.setAttribute('autocomplete', 'on');
+    smtpForm.setAttribute('novalidate', '');  // we validate on change, not submit
+    smtpForm.addEventListener('submit', (e) => e.preventDefault());
+    panel.append(smtpForm);
+
     const hostInput = textInput('host', s.host, 'smtp.example.com');
+    hostInput.setAttribute('autocomplete', 'off');  // SMTP host is not a login username
     bindTextBlur(hostInput, v => ({ smtp: { host: v } }));
-    panel.append(field('smtp-host', 'Host', hostInput,
+    smtpForm.append(field('smtp-host', 'Host', hostInput,
         'Hostname or IP of your SMTP relay. Leave empty to disable email entirely.'));
 
     const portInput = numberInput('port', s.port || 587, 1, 65535);
     bindNumberChange(portInput, v => ({ smtp: { port: v } }));
-    panel.append(field('smtp-port', 'Port', portInput,
+    smtpForm.append(field('smtp-port', 'Port', portInput,
         'Standard ports: 587 (STARTTLS), 465 (implicit TLS / SMTPS), 25 (plain).'));
 
     const userInput = textInput('user', s.user, 'user@example.com');
+    userInput.setAttribute('autocomplete', 'username');
     bindTextBlur(userInput, v => ({ smtp: { user: v } }));
-    panel.append(field('smtp-user', 'Username', userInput,
+    smtpForm.append(field('smtp-user', 'Username', userInput,
         'Auth username. Leave empty if your relay accepts anonymous mail (local MTAs, docker-compose Mailpit, etc).'));
 
     const passInput = passwordInput('password',
         s.password_set ? '•••• (currently set — leave empty to preserve)' : 'new password');
+    // Hint browsers that this is a "current-password" field paired
+    // with the username above, so password managers offer to
+    // save/autofill the pair. The passwordInput helper defaults to
+    // autocomplete="new-password" (which suppresses autofill); we
+    // override that here so the Settings screen gets the password-
+    // manager treatment the user expects from a login-ish form.
+    passInput.setAttribute('autocomplete', 'current-password');
     // Password field is the only autosave edge case. It saves on blur,
     // but ONLY when the field is non-empty. An empty blur means "user
     // tabbed past without changing" and we preserve the existing
@@ -435,7 +461,7 @@ function renderSmtpTab() {
             // so the user can re-try or correct.
         }
     });
-    panel.append(field('smtp-password', 'Password', passInput,
+    smtpForm.append(field('smtp-password', 'Password', passInput,
         'Leave empty to preserve the existing password. Enter a value and tab away to change it. Use the "Clear password" button below to fully remove the saved password.'));
 
     // Phase 6c round 1: the password help text used to tell users
@@ -485,12 +511,16 @@ function renderSmtpTab() {
         });
 
         clearWrap.append(clearBtn, clearStatus);
-        panel.append(clearWrap);
+        // Clear button lives inside the form so password managers see
+        // it as part of the "credentials cluster" — harmless but keeps
+        // DOM locality with the password field it acts on.
+        smtpForm.append(clearWrap);
     }
 
     const fromInput = emailInput('from', s.from, 'gpu-monitor@example.com');
+    fromInput.setAttribute('autocomplete', 'off');  // not a login identifier
     bindTextBlur(fromInput, v => ({ smtp: { from: v } }));
-    panel.append(field('smtp-from', 'From address', fromInput,
+    smtpForm.append(field('smtp-from', 'From address', fromInput,
         'The "From:" header on sent messages. Most relays require this to match the authenticated user.'));
 
     const tlsSelect = selectInput('tls', s.tls || 'starttls', [
@@ -499,7 +529,7 @@ function renderSmtpTab() {
         { value: 'none',     label: 'None (local relays only)' },
     ]);
     bindSelectChange(tlsSelect, v => ({ smtp: { tls: v } }));
-    panel.append(field('smtp-tls', 'Encryption', tlsSelect,
+    smtpForm.append(field('smtp-tls', 'Encryption', tlsSelect,
         'TLS mode. Most modern relays want STARTTLS on 587. "None" should only be used for loopback relays — never against a real provider.'));
 
     // Action row: only the Send test email button now. The Save
