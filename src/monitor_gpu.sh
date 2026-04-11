@@ -335,11 +335,19 @@ function discover_gpus() {
     export GPU_UUID
 
     # Wrap the per-GPU entries in a top-level object and write atomically.
+    # If the write fails (disk full, permissions, read-only mount), log
+    # loudly and return non-zero so the startup path can fail fast rather
+    # than running with a stale inventory file and silently falling back
+    # to the single-UUID env var for multi-GPU installs.
     local inventory_json
     inventory_json=$(jq -s '{gpus: .}' <<< "$inventory_entries")
-    safe_write_json "$INVENTORY_FILE" "$inventory_json"
+    if ! safe_write_json "$INVENTORY_FILE" "$inventory_json"; then
+        log_error "discover_gpus: failed to write GPU inventory to $INVENTORY_FILE"
+        return 1
+    fi
 
     log_debug "discover_gpus: detected $NUM_GPUS GPU(s): ${GPU_INDEXES[*]}"
+    return 0
 }
 
 ###############################################################################
@@ -1078,12 +1086,24 @@ update_stats() {
     local gpu0_temp="" gpu0_util="" gpu0_mem="" gpu0_power=""
     local first_temp="" first_util="" first_mem="" first_power=""
     local row_count=0
+    # Whitespace-trim helper using bash parameter expansion only (no
+    # subprocess fork per call). Writes to $REPLY in the caller's scope.
+    # Phase 2's initial version used `echo ... | xargs` per field, which
+    # forked ~16 subprocesses per tick on a 4-GPU system.
+    _trim() {
+        local v="${1#"${1%%[![:space:]]*}"}"
+        REPLY="${v%"${v##*[![:space:]]}"}"
+    }
     while IFS=',' read -r idx temp util mem power; do
-        idx=$(echo "$idx" | xargs)
-        temp=$(echo "$temp" | xargs)
-        util=$(echo "$util" | xargs)
-        mem=$(echo "$mem" | xargs)
-        power=$(echo "$power" | tr -d ' []')
+        _trim "$idx";   idx="$REPLY"
+        _trim "$temp";  temp="$REPLY"
+        _trim "$util";  util="$REPLY"
+        _trim "$mem";   mem="$REPLY"
+        # power has additional [N/A] bracket handling; strip spaces and
+        # brackets using parameter-expansion substitutions.
+        power="${power// /}"
+        power="${power//[/}"
+        power="${power//]/}"
 
         [ -z "$idx" ] && continue
 
@@ -1193,7 +1213,14 @@ fi
 # GPU_UUIDS, and writes $INVENTORY_FILE atomically via safe_write_json.
 # Falls back to a synthetic single-GPU entry if nvidia-smi is unavailable,
 # so the rest of the pipeline stays uniform for test and dev environments.
-discover_gpus
+# Fail-fast on inventory-write failure: running without a valid inventory
+# file would silently degrade multi-GPU lookups to the single-UUID env
+# var fallback, which is much harder to diagnose than a clean startup
+# error.
+if ! discover_gpus; then
+    log_error "Failed to discover GPUs; refusing to start without a valid inventory"
+    exit 1
+fi
 
 # Write gpu_config.json using jq for proper JSON escaping (GPU_NAME from
 # nvidia-smi and GPU_MONITOR_VERSION from the VERSION file are both
