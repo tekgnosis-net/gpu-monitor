@@ -77,6 +77,125 @@ export async function getStats24h() {
     return Array.isArray(data) ? data : [];
 }
 
+/* ─── Phase 6 — Settings, housekeeping, schedules ──────────────────────── */
+
+export async function getSettings() {
+    // Phase 6a: returns the full settings tree with smtp.password_enc
+    // replaced by a boolean smtp.password_set. Never null — the server
+    // falls back to DEFAULT_SETTINGS on missing file.
+    return _fetchJson('/settings', {});
+}
+
+async function _putJson(path, body) {
+    // Mutating helper: PUT a JSON body and return the parsed response.
+    // Unlike _fetchJson which swallows errors into a fallback, mutating
+    // calls re-raise so the Settings view can show a toast on failure.
+    try {
+        const response = await fetch(`${API_BASE}${path}`, {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+        });
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            const err = new Error(data.error || `HTTP ${response.status}`);
+            err.status = response.status;
+            err.detail = data.detail;
+            throw err;
+        }
+        return data;
+    } catch (error) {
+        if (error.status) throw error;
+        // Network / JSON parse failure — surface as a consistent shape
+        const err = new Error(error.message || 'network error');
+        err.status = 0;
+        throw err;
+    }
+}
+
+async function _postJson(path, body = undefined) {
+    try {
+        const init = {
+            method: 'POST',
+            headers: body ? { 'Content-Type': 'application/json' } : {},
+        };
+        if (body !== undefined) init.body = JSON.stringify(body);
+        const response = await fetch(`${API_BASE}${path}`, init);
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+            const err = new Error(data.error || `HTTP ${response.status}`);
+            err.status = response.status;
+            err.detail = data.detail;
+            throw err;
+        }
+        return data;
+    } catch (error) {
+        if (error.status) throw error;
+        const err = new Error(error.message || 'network error');
+        err.status = 0;
+        throw err;
+    }
+}
+
+export async function putSettings(partial) {
+    // Partial-merge update — only send the fields you want to change.
+    // The server deep-merges over the current settings.json and
+    // validates via Pydantic before writing. Throws on 4xx / 5xx so
+    // the view can surface the server's error message inline.
+    return _putJson('/settings', partial);
+}
+
+export async function testSmtp(to = null) {
+    // Trigger a real SMTP test send. `to` optional — defaults to the
+    // configured user address if omitted. Throws on 4xx / 5xx with
+    // the server's error message so the Settings view can show it
+    // without a generic "network error" fallback.
+    return _postJson('/settings/smtp/test', to ? { to } : undefined);
+}
+
+export async function runScheduleNow(scheduleId) {
+    // Synchronously fires one schedule via the server's run-now
+    // endpoint. Blocks until render + send complete — the UI should
+    // show a spinner because this can take 5-15 seconds on a slow
+    // SMTP relay.
+    const encoded = encodeURIComponent(scheduleId);
+    return _postJson(`/schedules/${encoded}/run-now`);
+}
+
+export async function getDbInfo() {
+    // Housekeeping tab: current DB size, row count, oldest/newest,
+    // per-GPU breakdown.
+    return _fetchJson('/housekeeping/db-info', {
+        size_bytes: 0,
+        row_count: 0,
+        oldest_epoch: null,
+        newest_epoch: null,
+        row_count_per_gpu: [],
+    });
+}
+
+export async function vacuumDb() {
+    // Triggers a blocking VACUUM. Can take seconds on a large DB.
+    return _postJson('/housekeeping/vacuum');
+}
+
+export async function purgeOldData(days) {
+    // DELETE rows older than N days. Idempotent.
+    return _postJson('/housekeeping/purge', { days });
+}
+
+export async function getReportPreviewUrl(template = 'daily') {
+    // Returns the URL of the HTML preview endpoint for use as an
+    // iframe src (not srcdoc — we want a real HTTP fetch so the
+    // iframe can cache and the browser can show a loading state).
+    // This is a synchronous helper, not a fetch, so the view can
+    // set iframe.src directly without an await.
+    const params = new URLSearchParams({ template });
+    return `${API_BASE}/reports/preview?${params}`;
+}
+
+/* ─── Phase 5 (existing) ──────────────────────────────────────────────── */
+
 export async function getPowerStats(range = '24h', gpuIndex = 0) {
     // Phase 5: integrated energy + peak / avg / sample counts for one GPU
     // over a selectable window. The fallback shape matches the server
