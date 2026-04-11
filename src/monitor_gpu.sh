@@ -118,14 +118,21 @@ CONFIG_FILE="$BASE_DIR/gpu_config.json"
 # without restarting the container (propagation delay: at most one tick).
 #
 # Behaviour matrix:
-#   - settings.json missing / unreadable / jq not available → defaults
+#   - settings.json missing / unreadable / malformed        → defaults
 #   - settings.json present but collection.* keys missing   → defaults
-#   - settings.json present but values out of range          → defaults
-#   - settings.json present with valid values                → those values
+#   - settings.json present but values out of range         → defaults
+#   - settings.json present with valid values               → those values
 #
 # Crucially the defaults case is re-asserted every tick, so deleting
 # settings.json while the container is running reverts the cadence to
 # (4s / 60s / 15), matching the pre-overhaul script behaviour.
+#
+# Note on jq: at the function level this file appears to tolerate jq
+# being absent (we fall back to defaults), but jq is NOT optional for
+# the collector as a whole. The startup block later runs `jq -n` to
+# generate gpu_config.json and exits 1 if jq is missing. Keeping the
+# local jq-availability check here is belt-and-suspenders for test
+# harnesses that exercise load_settings in isolation.
 #
 # Validation: interval_seconds must be in [2, 300]; flush_interval_seconds
 # must be in [5, 3600]; anything outside falls back to the default. BUFFER_SIZE
@@ -811,11 +818,19 @@ PYTHONSCRIPT
               python3 /tmp/process_buffer.py "$DB_FILE"; then
             log_debug "Successfully processed buffer data into database"
             success=1
-            # Also append to log file for backup
-            cat "$temp_file" >> "$LOG_FILE"
         else
             log_error "Failed to process buffer into database"
         fi
+        # Append buffered samples to the audit log REGARDLESS of DB insert
+        # success. Without this, a transient DB-insert failure meant the
+        # buffer had already been truncated (line 715) and the temp file was
+        # about to be deleted, so there was no record of the failed samples
+        # anywhere. Appending unconditionally means every sample is
+        # recoverable from $LOG_FILE even if the DB write failed. (The
+        # proper retry mechanism — rename temp_file to a pending-retry
+        # artifact and pick it up on the next flush — is still future work
+        # that deserves its own focused PR.)
+        cat "$temp_file" >> "$LOG_FILE"
         
         # Clean up
         rm -f /tmp/process_buffer.py
