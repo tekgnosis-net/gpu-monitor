@@ -3,6 +3,23 @@
 All notable changes to this fork of `bigsk1/gpu-monitor` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0](https://github.com/tekgnosis-net/gpu-monitor/compare/v1.1.0...v1.2.0) (2026-04-12)
+
+
+### Features
+
+* **alerts:** notification channel schema + notifiers module ([3c976df](https://github.com/tekgnosis-net/gpu-monitor/commit/3c976df1b8bdda6a3d1b6013c341521c2d9f8f48))
+* **alerts:** server-side alert checker process + supervisor ([10a3914](https://github.com/tekgnosis-net/gpu-monitor/commit/10a391442af77d8ae48df0e9a23080157bbca4ab))
+* **alerts:** settings UI + test endpoint + secret encryption ([832b995](https://github.com/tekgnosis-net/gpu-monitor/commit/832b9952272d908453c8ccb0160fb8ced8fefe12))
+
+
+### Bug Fixes
+
+* **css:** zero out card margin-bottom inside card-grid containers ([4690089](https://github.com/tekgnosis-net/gpu-monitor/commit/4690089072f389b9412f1a275e78ffe2b35b630d))
+* **power:** fetch electricity rate from settings API on mount ([2dfb8c1](https://github.com/tekgnosis-net/gpu-monitor/commit/2dfb8c1a14fecd397bd309f5d99281d1173b1b51))
+* **ui:** tighten Power KPI tiles — 12px padding, 8px grid gap ([66d82a1](https://github.com/tekgnosis-net/gpu-monitor/commit/66d82a153d7f468f36c88420438a9b31794daaa4))
+* **ui:** uniform 16px gaps across Power view blocks ([ceb1430](https://github.com/tekgnosis-net/gpu-monitor/commit/ceb1430537cc63aab3ec1a306753857211b823dd))
+
 ## [1.1.0](https://github.com/tekgnosis-net/gpu-monitor/compare/v1.0.1...v1.1.0) (2026-04-12)
 
 
