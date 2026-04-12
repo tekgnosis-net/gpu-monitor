@@ -477,6 +477,20 @@ export const powerView = {
 
         state.selectedGpuIndex = state.gpus[0].index;
 
+        // Fetch the electricity rate from /api/settings — this was
+        // stubbed at 0 in Phase 5 with a "Phase 6 reads this" TODO
+        // that was never wired up. Without this fetch, the cost tile
+        // always shows $0.00 regardless of what the user configured
+        // in Settings → Power.
+        try {
+            const settings = await api.getSettings();
+            const power = settings.power || {};
+            state.electricityRate = Number(power.rate_per_kwh) || 0;
+            state.currency = power.currency || '$';
+        } catch {
+            // Fall back to defaults — cost tile shows $0.00
+        }
+
         // Build the static structure. Header folds the GPU count into
         // the subtitle; controls row merges what used to be two
         // labelled sections into a single flex row with GPU tabs left
