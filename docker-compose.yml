@@ -9,7 +9,7 @@ services:
     ports:
       - "8081:8081"
     environment:
-      - TZ=America/Los_Angeles   # update your timezone
+      - TZ=Australia/Sydney   # update your timezone
     volumes:
       - /etc/localtime:/etc/localtime:ro  # Share host timezone
       - ./history:/app/history:rw    # Persist historical data and SQLite database with explicit rw permissions
