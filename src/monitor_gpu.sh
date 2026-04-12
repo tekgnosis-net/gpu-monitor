@@ -136,6 +136,29 @@ CONFIG_FILE="$BASE_DIR/gpu_config.json"
 declare -gA GPU_NAMES
 declare -gA GPU_UUIDS
 declare -ga GPU_INDEXES
+
+# NVIDIA_SMI_AVAILABLE — cached at startup via `command -v nvidia-smi`.
+#
+# Dev/test environments frequently have no nvidia-smi binary at all
+# (CI runners, container unit tests, non-NVIDIA Linux boxes). Without
+# this flag, every tick of update_stats calls nvidia-smi, gets empty
+# output, returns 1, and engages the main loop's 3×1s retry backoff —
+# producing ~4 log lines per tick and ~10 seconds of wall-clock spent
+# retrying a failure that will never recover. The loop never quits
+# either, so dev environments "work" but the log files fill with
+# false-alarm ERRORs.
+#
+# The fix: at startup, run `command -v nvidia-smi` once and cache
+# the result. update_stats consults the cache — if nvidia-smi is
+# permanently unavailable, synthesize zeroed metric rows for every
+# discovered GPU and return 0, bypassing the retry loop entirely.
+# If nvidia-smi IS installed but returns empty (transient failure,
+# driver hiccup, permissions), the old retry path still engages
+# because that's the case the retry was designed for.
+#
+# Set to 0 before the detection runs; the startup block a few
+# hundred lines below flips it to 1 if the binary is found.
+NVIDIA_SMI_AVAILABLE=0
 NUM_GPUS=0
 GPU_NAME="GPU"
 GPU_UUID="legacy-unknown"
@@ -300,12 +323,17 @@ function discover_gpus() {
     if [ -n "$csv" ]; then
         while IFS=',' read -r idx uuid name mem_total power_limit; do
             # Strip leading/trailing whitespace that nvidia-smi adds after
-            # every comma separator.
-            idx=$(echo "$idx" | xargs)
-            uuid=$(echo "$uuid" | xargs)
-            name=$(echo "$name" | xargs)
-            mem_total=$(echo "$mem_total" | xargs)
-            power_limit=$(echo "$power_limit" | xargs)
+            # every comma separator. Uses the in-process _trim_ws helper
+            # rather than `echo ... | xargs` (which forks two processes
+            # per field = 10 subprocess forks per GPU at startup and
+            # adds a runtime dependency on xargs) for consistency with
+            # the same trim pattern in update_stats() — see the helper
+            # definition near the top of this file for rationale.
+            _trim_ws "$idx";          idx="$REPLY"
+            _trim_ws "$uuid";         uuid="$REPLY"
+            _trim_ws "$name";         name="$REPLY"
+            _trim_ws "$mem_total";    mem_total="$REPLY"
+            _trim_ws "$power_limit";  power_limit="$REPLY"
 
             # Validate idx as a non-negative integer before touching any
             # accumulator state. A non-numeric row (error message leaked
@@ -764,16 +792,69 @@ function safe_write_json() {
 ###############################################################################
 # process_buffer: Safely handles buffered GPU metrics data
 # Implements atomic write operations to prevent data loss during system updates
+#
+# Retry semantics (task #23):
+#
+#   On python insert failure, the buffered rows are renamed from
+#   $temp_file → ${BUFFER_FILE}.pending, and a sibling
+#   ${BUFFER_FILE}.pending.retries file records the consecutive
+#   failure count. On the next process_buffer call, any existing
+#   .pending file is CHRONOLOGICALLY PREPENDED to the freshly-copied
+#   buffer before python runs — so the retry and the new rows are
+#   written as a single transaction, preserving sample ordering.
+#
+#   After MAX_PROCESS_BUFFER_RETRIES consecutive failures, the pending
+#   file is renamed to ${BUFFER_FILE}.stuck-YYYYMMDDHHMMSS for manual
+#   operator recovery, and the retry count resets. This prevents a
+#   persistent bug (e.g. schema mismatch, read-only filesystem) from
+#   infinitely accumulating unprocessable rows in .pending.
+#
+#   Regardless of python success/failure, every row is ALSO appended
+#   to $LOG_FILE as an audit trail — that safety net was added in
+#   Phase 1 and is preserved here.
+#
 # Returns: 0 on success, 1 on failure
 ###############################################################################
+MAX_PROCESS_BUFFER_RETRIES=5
+
 function process_buffer() {
     local temp_file="${BUFFER_FILE}.tmp"
+    local pending_file="${BUFFER_FILE}.pending"
+    local retries_file="${pending_file}.retries"
     local success=0
-    
+
     # Create temp file with buffer contents
     if cp "$BUFFER_FILE" "$temp_file"; then
-        # Clear original buffer only after successful copy
+        # Clear original buffer only after successful copy so any
+        # samples written between now and python exit go into a clean
+        # slate rather than being double-processed or lost.
         > "$BUFFER_FILE"
+
+        # If a prior tick left a .pending file behind, prepend its
+        # contents to the freshly-copied buffer so old-then-new
+        # chronological order is preserved in the retry transaction.
+        # Rows in .pending are always older than anything now sitting
+        # in $temp_file because the main loop is serialized — no
+        # concurrent writer could have added to .pending after we
+        # started this function. Use a merge temp file to avoid the
+        # "cat a > a" race that would silently produce an empty file.
+        local current_retries=0
+        if [ -f "$pending_file" ]; then
+            local merge_tmp="${temp_file}.merge"
+            if cat "$pending_file" "$temp_file" > "$merge_tmp" 2>/dev/null; then
+                mv "$merge_tmp" "$temp_file"
+            else
+                log_warning "process_buffer: could not merge .pending (continuing with fresh buffer only)"
+                rm -f "$merge_tmp"
+            fi
+            # Read the retry counter — missing or malformed counter
+            # resets to 0, which is the conservative default (worst
+            # case: one extra retry cycle before escalation to .stuck).
+            if [ -f "$retries_file" ]; then
+                current_retries=$(cat "$retries_file" 2>/dev/null || echo 0)
+                [[ "$current_retries" =~ ^[0-9]+$ ]] || current_retries=0
+            fi
+        fi
         
         # Process buffer with Python and write to database
         cat > /tmp/process_buffer.py << 'PYTHONSCRIPT'
@@ -956,25 +1037,65 @@ PYTHONSCRIPT
             log_error "Failed to process buffer into database"
         fi
         # Append buffered samples to the audit log REGARDLESS of DB insert
-        # success. Without this, a transient DB-insert failure meant the
-        # buffer had already been truncated (line 715) and the temp file was
-        # about to be deleted, so there was no record of the failed samples
-        # anywhere. Appending unconditionally means every sample is
-        # recoverable from $LOG_FILE even if the DB write failed. (The
-        # proper retry mechanism — rename temp_file to a pending-retry
-        # artifact and pick it up on the next flush — is still future work
-        # that deserves its own focused PR.)
+        # success. The audit-log safety net was added in Phase 1 so every
+        # sample is recoverable from $LOG_FILE even if both the DB write
+        # and the retry path fail. The retry path (below) stashes failed
+        # rows to .pending / .stuck-* for programmatic recovery; the audit
+        # log is the belt-and-braces fallback for the case where even the
+        # retry path is broken (read-only filesystem, etc.).
         cat "$temp_file" >> "$LOG_FILE"
-        
-        # Clean up
+
+        # Clean up the Python script (recreated on every call)
         rm -f /tmp/process_buffer.py
     else
         log_error "Failed to create temp buffer file"
     fi
-    
-    # Clean up temp file
-    rm -f "$temp_file"
-    
+
+    # Final disposition of $temp_file depends on whether the Python
+    # insert succeeded and whether we've exhausted the retry budget:
+    if [ "$success" -eq 1 ]; then
+        # Clean slate: delete temp + any lingering .pending retry
+        # artifacts. A successful insert discharges all buffered rows
+        # — the .pending file (which was merged into temp_file at the
+        # top of this function) has already been committed to the DB.
+        rm -f "$temp_file" "$pending_file" "$retries_file"
+    elif [ -f "$temp_file" ]; then
+        # Python failed. Decide between "defer for retry" and
+        # "escalate to .stuck for manual recovery".
+        local next_retries=$((current_retries + 1))
+        if [ "$next_retries" -ge "$MAX_PROCESS_BUFFER_RETRIES" ]; then
+            # Exhausted retry budget — stash to .stuck-* with a
+            # timestamp suffix and reset the retry state. The operator
+            # needs to look at the file manually (fix the underlying
+            # issue, replay via sqlite3 + the process_buffer.py heredoc,
+            # or delete if unrecoverable). Logging an ERROR here flags
+            # it in the main log stream so it surfaces in Settings →
+            # Housekeeping → DB info for observability.
+            local stuck_file
+            stuck_file="${BUFFER_FILE}.stuck-$(date '+%Y%m%d%H%M%S')"
+            if mv "$temp_file" "$stuck_file" 2>/dev/null; then
+                rm -f "$pending_file" "$retries_file"
+                log_error "process_buffer: $next_retries consecutive DB-insert failures; stashed $(wc -l < "$stuck_file" 2>/dev/null || echo '?') rows to $stuck_file for manual recovery"
+            else
+                log_error "process_buffer: cannot escalate to .stuck-* (mv failed); keeping .pending"
+                # Leave .pending/temp_file as-is — next tick will try
+                # again. Better to spin on retries than to silently drop.
+                mv "$temp_file" "$pending_file" 2>/dev/null || true
+            fi
+        else
+            # Still within retry budget — defer to .pending for the
+            # next tick to pick up and prepend.
+            if mv "$temp_file" "$pending_file" 2>/dev/null; then
+                echo "$next_retries" > "$retries_file" 2>/dev/null || \
+                    log_warning "process_buffer: could not write retry counter (next tick may reset)"
+                log_warning "process_buffer: DB insert failed (retry $next_retries/$MAX_PROCESS_BUFFER_RETRIES); deferred to $pending_file"
+            else
+                log_error "process_buffer: cannot rename temp to .pending; rows will be re-fetched on audit-log replay only"
+                rm -f "$temp_file"
+            fi
+        fi
+    fi
+
     # Return result
     return $((1 - success))
 }
@@ -1007,18 +1128,55 @@ update_stats() {
     # Multi-GPU query: one row per attached GPU, prefixed with the GPU index
     # so rows can be disambiguated downstream. The `index` field is always
     # emitted first and the remaining field order matches Phase 1.
+    #
+    # When NVIDIA_SMI_AVAILABLE=0 (set at startup by the cache in the
+    # startup block), skip the nvidia-smi call entirely and synthesize
+    # zeroed rows for every discovered GPU. This keeps dev/CI
+    # environments quiet without false-alarm ERROR lines or 3× retry
+    # delays, while preserving the transient-failure retry path for
+    # real production hardware where nvidia-smi IS installed but
+    # occasionally hiccups.
     local gpu_stats
-    gpu_stats=$(nvidia-smi \
-        --query-gpu=index,temperature.gpu,utilization.gpu,memory.used,power.draw \
-        --format=csv,noheader,nounits 2>/dev/null)
+    if [ "$NVIDIA_SMI_AVAILABLE" -eq 1 ]; then
+        gpu_stats=$(nvidia-smi \
+            --query-gpu=index,temperature.gpu,utilization.gpu,memory.used,power.draw \
+            --format=csv,noheader,nounits 2>/dev/null)
 
-    if [[ -z "$gpu_stats" ]]; then
-        # Return 1 so the main retry loop engages its nvidia-smi-hiccup
-        # backoff (3 × 1s retries). Phase 2 initially returned 0 here
-        # which silently suppressed the retry mechanism and contradicted
-        # the "Returns: 0 on success, 1 on failure" contract.
-        log_error "Failed to get GPU stats output"
-        return 1
+        if [[ -z "$gpu_stats" ]]; then
+            # Return 1 so the main retry loop engages its nvidia-smi-hiccup
+            # backoff (3 × 1s retries). Phase 2 initially returned 0 here
+            # which silently suppressed the retry mechanism and contradicted
+            # the "Returns: 0 on success, 1 on failure" contract.
+            log_error "Failed to get GPU stats output"
+            return 1
+        fi
+    else
+        # Synthetic path: build a multi-line CSV that matches nvidia-smi's
+        # format ("index, temperature, util, mem, power" — one row per
+        # discovered GPU). Values are zero across the board so the buffer
+        # parsing loop below can process them through the exact same code
+        # path as the real-hardware case — no alternate insert path, no
+        # special-case in process_buffer, no divergence in downstream
+        # aggregations. The Phase 5 power integration correctly
+        # contributes 0 Wh per tick from these rows, and /api/stats/power
+        # already surfaces an `insufficient_telemetry: true` flag when
+        # the window has zero power samples, so the UI won't claim
+        # fake readings are real.
+        gpu_stats=""
+        local i
+        for i in "${GPU_INDEXES[@]}"; do
+            if [ -n "$gpu_stats" ]; then
+                gpu_stats+=$'\n'
+            fi
+            gpu_stats+="${i}, 0, 0, 0, 0"
+        done
+        if [ -z "$gpu_stats" ]; then
+            # Extremely defensive: discover_gpus always populates at least
+            # one synthetic entry, so GPU_INDEXES should never be empty
+            # here. If it somehow is, fall through to a single GPU 0 row
+            # rather than silently no-op'ing the tick.
+            gpu_stats="0, 0, 0, 0, 0"
+        fi
     fi
 
     # Verify buffer write access before proceeding
@@ -1051,8 +1209,12 @@ update_stats() {
         [ -z "$idx" ] && continue
 
         # Handle [N/A] power per-row; some laptop/dGPU combos don't report
-        # power telemetry at all.
-        if [[ "$power" == "N/A" || -z "$power" || "$power" == "[N/A]" ]]; then
+        # power telemetry at all. Because the three stripping lines above
+        # have already removed the `[` and `]` characters, only the
+        # post-strip "N/A" (or empty) form is reachable — an earlier
+        # version of this branch also checked `"$power" == "[N/A]"`,
+        # which was unreachable dead code.
+        if [[ "$power" == "N/A" || -z "$power" ]]; then
             power="0"
         fi
 
@@ -1067,12 +1229,22 @@ update_stats() {
     done <<< "$gpu_stats"
 
     # Sanity-check: did nvidia-smi return as many rows as the inventory
-    # discovered at startup? A mismatch suggests a hot-add/remove event
-    # that discover_gpus hasn't seen yet. Log a warning so the condition
-    # is observable; don't fail the tick — partial data is better than
-    # no data for homelab monitoring.
+    # discovered at startup? A mismatch in EITHER direction suggests a
+    # hot-add (row_count > NUM_GPUS — new GPU appeared) or hot-remove
+    # (row_count < NUM_GPUS — a GPU vanished, probably a driver/power
+    # event). Both directions are worth surfacing so the user notices
+    # that the inventory is stale, even though partial data is better
+    # than no data for homelab monitoring so we don't fail the tick.
+    # The direction is encoded in the log message so operators can
+    # distinguish add from remove without re-checking nvidia-smi.
     if [ "$row_count" -ne "${NUM_GPUS:-1}" ]; then
-        log_warning "nvidia-smi returned $row_count rows but discover_gpus found $NUM_GPUS GPUs; hardware may have changed since startup"
+        local direction="unchanged"
+        if [ "$row_count" -lt "${NUM_GPUS:-1}" ]; then
+            direction="hot-remove suspected"
+        elif [ "$row_count" -gt "${NUM_GPUS:-1}" ]; then
+            direction="hot-add suspected"
+        fi
+        log_warning "nvidia-smi returned $row_count rows but discover_gpus found $NUM_GPUS GPUs at startup ($direction); restart the container to refresh the inventory"
     fi
 
     # Detailed error logging for debugging any write failures.
@@ -1100,6 +1272,24 @@ update_stats() {
 if ! command -v jq >/dev/null 2>&1; then
     log_error "jq is required to generate $CONFIG_FILE but was not found in PATH"
     exit 1
+fi
+
+# Cache nvidia-smi availability once at startup. See the comment on the
+# NVIDIA_SMI_AVAILABLE declaration for why this matters — short version:
+# dev environments without nvidia-smi shouldn't flood the logs with
+# per-tick nvidia-smi-hiccup retries for a failure that will never
+# recover. If the binary is missing, log a single synthetic-mode
+# warning at startup and let update_stats generate zeroed rows for
+# every tick. discover_gpus already has its own synthetic fallback
+# for the inventory side; this flag just extends that behavior to the
+# hot-path collector loop.
+if command -v nvidia-smi >/dev/null 2>&1; then
+    NVIDIA_SMI_AVAILABLE=1
+else
+    NVIDIA_SMI_AVAILABLE=0
+    log_warning "nvidia-smi not found in PATH — running in synthetic-metrics mode"
+    log_warning "All telemetry rows will be zeroed; this is fine for test/CI but"
+    log_warning "indicates a missing NVIDIA driver if you're running on real hardware"
 fi
 
 # Discover attached GPUs. Populates NUM_GPUS, GPU_INDEXES, GPU_NAMES,
