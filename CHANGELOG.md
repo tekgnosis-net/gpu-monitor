@@ -3,6 +3,20 @@
 All notable changes to this fork of `bigsk1/gpu-monitor` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0](https://github.com/tekgnosis-net/gpu-monitor/compare/v1.0.1...v1.1.0) (2026-04-12)
+
+
+### Features
+
+* **reports:** inline schedule editing + custom email subject ([31d6180](https://github.com/tekgnosis-net/gpu-monitor/commit/31d6180bf25be49c4f83d660c91a4e528b6c1a9c))
+
+
+### Bug Fixes
+
+* **ci:** correct cache-export ignore-error parameter name ([4918efa](https://github.com/tekgnosis-net/gpu-monitor/commit/4918efaf4c74fbd4562ab9d981f92829e6c07266))
+* **ci:** make cache-export non-fatal in Docker build workflows ([6171e49](https://github.com/tekgnosis-net/gpu-monitor/commit/6171e496f38a0286a3a188b4166d1a6ef3f756e4))
+* **ui:** add test recipient field to SMTP settings ([18fe421](https://github.com/tekgnosis-net/gpu-monitor/commit/18fe421fc06850036e8e40e018ca7c1d71e2a391))
+
 ## [1.0.1](https://github.com/tekgnosis-net/gpu-monitor/compare/v1.0.0...v1.0.1) (2026-04-12)
 
 
