@@ -243,6 +243,20 @@ main.content section {
     margin-bottom: var(--space-6);
 }
 
+/* Cards inside a card-grid must NOT have their own margin-bottom —
+   the grid's `gap` property is the sole authority for inter-item
+   spacing. Without this override, the descendant selector above
+   (`main.content section`) bleeds a 32px margin-bottom into every
+   <section class="card"> nested inside a .card-grid, stacking on
+   top of the grid's own gap and any marginBottom set on the grid
+   container. The result: ~60px of cumulative whitespace below the
+   KPI tiles in the Power view that no amount of grid-margin tuning
+   could eliminate — because the real offender was the per-card
+   section margin, not the grid margin. */
+.card-grid > .card {
+    margin-bottom: 0;
+}
+
 /* Top-level non-section blocks in the main area (e.g. the dashboard's
    gauge-card grid, which is a plain <div class="card-grid wide">, not
    a <section>) need the same breathing room as sections — otherwise
