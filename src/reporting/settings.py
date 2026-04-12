@@ -78,8 +78,15 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "utilization_pct": 100,
         "power_w": 300,
         "cooldown_seconds": 10,
+        "poll_interval_seconds": 30,
         "sound_enabled": True,
         "notifications_enabled": False,
+        "channels": {
+            "ntfy": {"enabled": False, "topic_url": "", "priority": "high"},
+            "pushover": {"enabled": False, "user_key_enc": "", "app_token_enc": "", "priority": 1},
+            "webhook": {"enabled": False, "url": "", "method": "POST", "headers": {}, "body_template": "", "auth_token_enc": ""},
+            "email": {"enabled": False, "recipients": []},
+        },
     },
     "power": {
         "rate_per_kwh": 0.0,
@@ -124,13 +131,88 @@ class LoggingSettings(BaseModel):
     max_age_hours: int = Field(default=25, ge=1, le=720)
 
 
+# ─── Alert notification channel models ─────────────────────────────────────
+#
+# Each channel has an `enabled` bool so channels can be independently
+# toggled without clearing their configuration. Secrets (Pushover keys,
+# webhook auth tokens) are stored Fernet-encrypted using the same
+# pattern as smtp.password_enc — the API GET redacts them to *_set: bool,
+# and the PUT handler encrypts on save.
+
+
+class NtfyChannelSettings(BaseModel):
+    """ntfy.sh push notification channel. Simple HTTP POST to a topic URL."""
+    enabled: bool = False
+    topic_url: str = ""   # e.g. "https://ntfy.sh/my-gpu-alerts"
+    priority: str = Field(default="high")
+
+    @field_validator("priority")
+    @classmethod
+    def _priority_enum(cls, v: str) -> str:
+        allowed = {"min", "low", "default", "high", "urgent"}
+        if v not in allowed:
+            raise ValueError(f"ntfy priority must be one of {sorted(allowed)}")
+        return v
+
+
+class PushoverChannelSettings(BaseModel):
+    """Pushover push notification channel. HTTP POST to api.pushover.net."""
+    enabled: bool = False
+    user_key_enc: str = ""     # Fernet-encrypted user key
+    app_token_enc: str = ""    # Fernet-encrypted application token
+    priority: int = Field(default=1, ge=-2, le=2)
+
+
+class WebhookChannelSettings(BaseModel):
+    """Generic webhook channel. Configurable URL, method, headers, and
+    body template. Default body is JSON with alert data fields; if
+    body_template is set, {{key}} placeholders are substituted."""
+    enabled: bool = False
+    url: str = ""
+    method: str = Field(default="POST")
+    headers: dict[str, str] = Field(default_factory=dict)
+    body_template: str = ""      # empty = default JSON payload
+    auth_token_enc: str = ""     # Fernet-encrypted, added as Authorization: Bearer
+
+    @field_validator("method")
+    @classmethod
+    def _method_enum(cls, v: str) -> str:
+        allowed = {"POST", "PUT"}
+        if v.upper() not in allowed:
+            raise ValueError(f"webhook method must be one of {sorted(allowed)}")
+        return v.upper()
+
+
+class EmailAlertChannelSettings(BaseModel):
+    """Email alert channel. Sends short plain-text alerts via the
+    existing SMTP config from settings.smtp — no separate SMTP setup."""
+    enabled: bool = False
+    recipients: list[str] = Field(default_factory=list)
+
+
+class AlertChannelsSettings(BaseModel):
+    """Container for all notification channels. Each is independently
+    enable/disable-able and configured."""
+    ntfy: NtfyChannelSettings = Field(default_factory=NtfyChannelSettings)
+    pushover: PushoverChannelSettings = Field(default_factory=PushoverChannelSettings)
+    webhook: WebhookChannelSettings = Field(default_factory=WebhookChannelSettings)
+    email: EmailAlertChannelSettings = Field(default_factory=EmailAlertChannelSettings)
+
+
 class AlertSettings(BaseModel):
     temperature_c: float = Field(default=80, ge=0, le=150)
     utilization_pct: float = Field(default=100, ge=0, le=100)
     power_w: float = Field(default=300, ge=0, le=2000)
     cooldown_seconds: int = Field(default=10, ge=2, le=600)
+    # How often the server-side alert checker evaluates thresholds.
+    # 30s is coarse enough to avoid hammering SQLite but fine enough
+    # to catch a thermal runaway before it becomes dangerous.
+    poll_interval_seconds: int = Field(default=30, ge=5, le=300)
+    # Browser-side controls (toast + sound + Notification API):
     sound_enabled: bool = True
     notifications_enabled: bool = False
+    # Server-side push notification channels:
+    channels: AlertChannelsSettings = Field(default_factory=AlertChannelsSettings)
 
 
 class PowerSettings(BaseModel):
