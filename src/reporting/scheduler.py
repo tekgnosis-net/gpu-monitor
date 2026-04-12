@@ -144,7 +144,7 @@ class _SchedulerState:
 
     def __init__(self, base_dir: Path = DEFAULT_BASE_DIR) -> None:
         self.base_dir = base_dir
-        self.settings_file = base_dir / "settings.json"
+        self.settings_file = base_dir / "history" / "settings.json"
         self.db_file = base_dir / "history" / "gpu_metrics.db"
         self.inventory_file = base_dir / "gpu_inventory.json"
         self.version_file = base_dir / "VERSION"

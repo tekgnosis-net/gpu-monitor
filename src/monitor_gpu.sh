@@ -34,7 +34,27 @@ BUFFER_FILE="/tmp/stats_buffer"
 # SQLite database location
 DB_FILE="$HISTORY_DIR/gpu_metrics.db"
 # Settings file (read each tick for live reload, see load_settings())
-SETTINGS_FILE="$BASE_DIR/settings.json"
+# Settings file lives inside the history volume (/app/history/) so it
+# persists across container recreations. The DB and .secret key already
+# live here; settings.json joins them so a `docker compose up` with a
+# new image doesn't wipe the user's SMTP config, alert thresholds, etc.
+SETTINGS_FILE="$BASE_DIR/history/settings.json"
+
+# One-time migration: if settings.json exists at the old location
+# (/app/settings.json, inside the ephemeral container filesystem)
+# but NOT at the new location (/app/history/settings.json, inside
+# the persisted volume), move it so the user's config survives.
+# This handles the upgrade path from pre-v1.2.1 images where
+# settings.json was at the wrong path and got wiped on every
+# container recreation.
+OLD_SETTINGS_FILE="$BASE_DIR/settings.json"
+if [ -f "$OLD_SETTINGS_FILE" ] && [ ! -f "$SETTINGS_FILE" ]; then
+    cp "$OLD_SETTINGS_FILE" "$SETTINGS_FILE" 2>/dev/null && \
+        rm -f "$OLD_SETTINGS_FILE" 2>/dev/null && \
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [INFO] Migrated settings.json from $OLD_SETTINGS_FILE to $SETTINGS_FILE" || \
+        echo "$(date '+%Y-%m-%d %H:%M:%S') [WARN] Could not migrate settings.json; starting with defaults"
+fi
+
 # Version file (written into gpu_config.json at startup for the frontend)
 VERSION_FILE="$BASE_DIR/VERSION"
 

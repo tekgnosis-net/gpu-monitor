@@ -77,7 +77,11 @@ BASE_DIR = Path("/app")
 VERSION_FILE = BASE_DIR / "VERSION"
 INVENTORY_FILE = BASE_DIR / "gpu_inventory.json"
 DB_FILE = BASE_DIR / "history" / "gpu_metrics.db"
-SETTINGS_FILE = BASE_DIR / "settings.json"
+# Settings file lives inside the history volume so it persists across
+# container recreations (docker compose up with a new image). An earlier
+# design placed it at /app/settings.json, which was inside the ephemeral
+# container filesystem — every image upgrade wiped the user's config.
+SETTINGS_FILE = BASE_DIR / "history" / "settings.json"
 SECRET_KEY_FILE = BASE_DIR / "history" / ".secret"
 SCHEMA_VERSION = 2  # Matches Phase 1 migration (gpu_index, gpu_uuid, interval_s)
 
