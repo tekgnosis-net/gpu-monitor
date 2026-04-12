@@ -108,4 +108,13 @@ jobs:
           sbom: true
           provenance: mode=max
           cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # ignore-errors prevents the cache-export step from
+          # failing the entire build when Azure/GHCR's CDN
+          # intermittently returns HTML 400 errors. The actual
+          # image push (step #35) completes successfully — it's
+          # only the cache-layer export (step #37) that fails,
+          # but buildx treats any step failure as a job failure.
+          # With ignore-errors, a cache miss on the next build
+          # is the worst case (slower by ~2 min), but the CI
+          # status stays green.
+          cache-to: type=gha,mode=max,ignore-errors=true
