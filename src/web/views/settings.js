@@ -711,6 +711,235 @@ function renderAlertsTab() {
         });
     }
 
+    // ─── Push notification channels (server-side 24/7) ──────────────
+
+    const channelsDivider = el('div');
+    channelsDivider.style.borderTop = '1px solid var(--border-subtle)';
+    channelsDivider.style.marginTop = 'var(--space-5)';
+    channelsDivider.style.paddingTop = 'var(--space-4)';
+
+    const channelsTitle = el('h3', null, 'Push notification channels');
+    channelsTitle.style.margin = '0 0 var(--space-1) 0';
+    const channelsSubtitle = el('div', 'subtitle',
+        'Server-side notifications fire 24/7 even when the browser is closed. Changes save automatically.');
+    channelsSubtitle.style.marginBottom = 'var(--space-4)';
+    channelsDivider.append(channelsTitle, channelsSubtitle);
+    panel.append(channelsDivider);
+
+    const ch = (a.channels || {});
+
+    // Poll interval
+    const pollInput = numberInput('poll_interval_seconds',
+        a.poll_interval_seconds || 30, 5, 300);
+    bindNumberChange(pollInput, v => ({ alerts: { poll_interval_seconds: v } }));
+    panel.append(field('alerts-poll-interval', 'Poll interval (seconds)', pollInput,
+        'How often the server checks GPU metrics against thresholds. Lower values mean faster detection but more DB reads. Default 30s is a good balance.'));
+
+    // Helper: build a test button for a channel
+    function channelTestButton(channelName) {
+        const wrap = el('div');
+        wrap.style.display = 'flex';
+        wrap.style.alignItems = 'center';
+        wrap.style.gap = 'var(--space-2)';
+        wrap.style.marginBottom = 'var(--space-3)';
+
+        const btn = el('button', 'small', 'Test');
+        btn.type = 'button';
+        const status = el('span');
+        status.style.fontSize = 'var(--font-size-sm)';
+
+        btn.addEventListener('click', async () => {
+            btn.disabled = true;
+            btn.textContent = 'Testing…';
+            status.textContent = '';
+            try {
+                const resp = await fetch(`/api/alerts/test/${channelName}`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                });
+                const data = await resp.json();
+                if (data.ok) {
+                    status.textContent = 'Test sent!';
+                    status.style.color = 'var(--success)';
+                } else {
+                    status.textContent = data.error || 'Test failed';
+                    status.style.color = 'var(--danger)';
+                }
+            } catch (err) {
+                status.textContent = `Error: ${err.message}`;
+                status.style.color = 'var(--danger)';
+            } finally {
+                btn.disabled = false;
+                btn.textContent = 'Test';
+            }
+        });
+
+        wrap.append(btn, status);
+        return wrap;
+    }
+
+    // ── ntfy.sh ──
+    const ntfySectionTitle = el('div', null, 'ntfy.sh');
+    ntfySectionTitle.style.fontWeight = 'var(--font-weight-semibold)';
+    ntfySectionTitle.style.marginTop = 'var(--space-4)';
+    ntfySectionTitle.style.marginBottom = 'var(--space-2)';
+    panel.append(ntfySectionTitle);
+
+    const ntfy = ch.ntfy || {};
+    panel.append(checkboxRow('alerts-ntfy-enabled', 'Enabled', ntfy.enabled,
+        'Send push notifications via ntfy.sh when alert thresholds are breached.'));
+    bindCheckboxChange(panel.querySelector('#alerts-ntfy-enabled'),
+        v => ({ alerts: { channels: { ntfy: { enabled: v } } } }));
+
+    const ntfyUrl = textInput('ntfy_topic_url', ntfy.topic_url || '', 'https://ntfy.sh/my-gpu-alerts');
+    bindTextBlur(ntfyUrl, v => ({ alerts: { channels: { ntfy: { topic_url: v } } } }));
+    panel.append(field('alerts-ntfy-url', 'Topic URL', ntfyUrl,
+        'Full ntfy topic URL. Create a topic at ntfy.sh and paste the URL here.'));
+
+    const ntfyPriority = selectInput('ntfy_priority', ntfy.priority || 'high', [
+        { value: 'min',     label: 'Min' },
+        { value: 'low',     label: 'Low' },
+        { value: 'default', label: 'Default' },
+        { value: 'high',    label: 'High' },
+        { value: 'urgent',  label: 'Urgent' },
+    ]);
+    bindSelectChange(ntfyPriority, v => ({ alerts: { channels: { ntfy: { priority: v } } } }));
+    panel.append(field('alerts-ntfy-priority', 'Priority', ntfyPriority));
+    panel.append(channelTestButton('ntfy'));
+
+    // ── Pushover ──
+    const pushoverTitle = el('div', null, 'Pushover');
+    pushoverTitle.style.fontWeight = 'var(--font-weight-semibold)';
+    pushoverTitle.style.marginTop = 'var(--space-4)';
+    pushoverTitle.style.marginBottom = 'var(--space-2)';
+    panel.append(pushoverTitle);
+
+    const pushover = ch.pushover || {};
+    panel.append(checkboxRow('alerts-pushover-enabled', 'Enabled', pushover.enabled,
+        'Send push notifications via Pushover when alert thresholds are breached.'));
+    bindCheckboxChange(panel.querySelector('#alerts-pushover-enabled'),
+        v => ({ alerts: { channels: { pushover: { enabled: v } } } }));
+
+    const poUserKey = passwordInput('pushover_user_key',
+        pushover.user_key_set ? '•••• (set)' : 'User Key');
+    poUserKey.addEventListener('blur', async () => {
+        if (!poUserKey.value) return;
+        try {
+            await autosave({ alerts: { channels: { pushover: { user_key: poUserKey.value } } } });
+            poUserKey.value = '';
+            poUserKey.placeholder = '•••• (set)';
+        } catch { /* toast handles error */ }
+    });
+    panel.append(field('alerts-pushover-userkey', 'User Key', poUserKey,
+        'Your Pushover user key. Find it at pushover.net/dashboard.'));
+
+    const poAppToken = passwordInput('pushover_app_token',
+        pushover.app_token_set ? '•••• (set)' : 'App Token');
+    poAppToken.addEventListener('blur', async () => {
+        if (!poAppToken.value) return;
+        try {
+            await autosave({ alerts: { channels: { pushover: { app_token: poAppToken.value } } } });
+            poAppToken.value = '';
+            poAppToken.placeholder = '•••• (set)';
+        } catch { /* toast handles error */ }
+    });
+    panel.append(field('alerts-pushover-apptoken', 'App Token', poAppToken,
+        'Your Pushover application token. Create an app at pushover.net/apps.'));
+    panel.append(channelTestButton('pushover'));
+
+    // ── Generic webhook ──
+    const webhookTitle = el('div', null, 'Webhook');
+    webhookTitle.style.fontWeight = 'var(--font-weight-semibold)';
+    webhookTitle.style.marginTop = 'var(--space-4)';
+    webhookTitle.style.marginBottom = 'var(--space-2)';
+    panel.append(webhookTitle);
+
+    const webhook = ch.webhook || {};
+    panel.append(checkboxRow('alerts-webhook-enabled', 'Enabled', webhook.enabled,
+        'Send alerts to a custom HTTP endpoint.'));
+    bindCheckboxChange(panel.querySelector('#alerts-webhook-enabled'),
+        v => ({ alerts: { channels: { webhook: { enabled: v } } } }));
+
+    const webhookUrl = textInput('webhook_url', webhook.url || '', 'https://example.com/webhook');
+    bindTextBlur(webhookUrl, v => ({ alerts: { channels: { webhook: { url: v } } } }));
+    panel.append(field('alerts-webhook-url', 'URL', webhookUrl));
+
+    const webhookMethod = selectInput('webhook_method', webhook.method || 'POST', [
+        { value: 'POST', label: 'POST' },
+        { value: 'PUT',  label: 'PUT' },
+    ]);
+    bindSelectChange(webhookMethod, v => ({ alerts: { channels: { webhook: { method: v } } } }));
+    panel.append(field('alerts-webhook-method', 'Method', webhookMethod));
+
+    const webhookHeaders = document.createElement('textarea');
+    webhookHeaders.name = 'webhook_headers';
+    webhookHeaders.rows = 3;
+    webhookHeaders.placeholder = '{"Authorization": "Bearer ..."}';
+    webhookHeaders.value = Object.keys(webhook.headers || {}).length
+        ? JSON.stringify(webhook.headers, null, 2) : '';
+    webhookHeaders.addEventListener('blur', () => {
+        try {
+            const parsed = webhookHeaders.value.trim()
+                ? JSON.parse(webhookHeaders.value) : {};
+            autosave({ alerts: { channels: { webhook: { headers: parsed } } } })
+                .catch(() => {});
+        } catch {
+            showToast('Invalid JSON in headers', 'error');
+        }
+    });
+    panel.append(field('alerts-webhook-headers', 'Custom headers (JSON)', webhookHeaders,
+        'Optional JSON object of HTTP headers. Use for authentication, content-type overrides, etc.'));
+
+    const webhookTemplate = document.createElement('textarea');
+    webhookTemplate.name = 'webhook_body_template';
+    webhookTemplate.rows = 3;
+    webhookTemplate.placeholder = 'Leave empty for default JSON. Use {{gpu_name}}, {{metric}}, {{value}}, {{threshold}}, {{message}}, {{timestamp}}';
+    webhookTemplate.value = webhook.body_template || '';
+    webhookTemplate.addEventListener('blur', () => {
+        autosave({ alerts: { channels: { webhook: { body_template: webhookTemplate.value } } } })
+            .catch(() => {});
+    });
+    panel.append(field('alerts-webhook-template', 'Body template', webhookTemplate,
+        'Custom body template with {{key}} placeholders. Leave empty to send default JSON payload with all alert fields.'));
+
+    const webhookAuth = passwordInput('webhook_auth_token',
+        webhook.auth_token_set ? '•••• (set)' : 'Bearer token');
+    webhookAuth.addEventListener('blur', async () => {
+        if (!webhookAuth.value) return;
+        try {
+            await autosave({ alerts: { channels: { webhook: { auth_token: webhookAuth.value } } } });
+            webhookAuth.value = '';
+            webhookAuth.placeholder = '•••• (set)';
+        } catch { /* toast */ }
+    });
+    panel.append(field('alerts-webhook-auth', 'Auth token (optional)', webhookAuth,
+        'If set, added as Authorization: Bearer header. Encrypted at rest.'));
+    panel.append(channelTestButton('webhook'));
+
+    // ── Email alerts ──
+    const emailTitle = el('div', null, 'Email alerts');
+    emailTitle.style.fontWeight = 'var(--font-weight-semibold)';
+    emailTitle.style.marginTop = 'var(--space-4)';
+    emailTitle.style.marginBottom = 'var(--space-2)';
+    panel.append(emailTitle);
+
+    const emailCh = ch.email || {};
+    panel.append(checkboxRow('alerts-email-enabled', 'Enabled', emailCh.enabled,
+        'Send short alert emails when thresholds are breached. Uses SMTP config from the SMTP tab.'));
+    bindCheckboxChange(panel.querySelector('#alerts-email-enabled'),
+        v => ({ alerts: { channels: { email: { enabled: v } } } }));
+
+    const emailRecipients = textInput('email_alert_recipients',
+        (emailCh.recipients || []).join(', '), 'admin@example.com, ops@example.com');
+    emailRecipients.addEventListener('blur', () => {
+        const list = emailRecipients.value.split(',').map(s => s.trim()).filter(Boolean);
+        autosave({ alerts: { channels: { email: { recipients: list } } } })
+            .catch(() => {});
+    });
+    panel.append(field('alerts-email-recipients', 'Recipients (comma-separated)', emailRecipients,
+        'Alert emails are sent to these addresses. Uses your SMTP configuration from the SMTP tab — no separate mail server setup needed.'));
+    panel.append(channelTestButton('email'));
+
     return panel;
 }
 
