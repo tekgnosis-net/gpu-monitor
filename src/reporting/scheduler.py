@@ -220,6 +220,7 @@ async def _fire_schedule(
     """
     schedule_id = schedule.get("id", "?")
     template = schedule.get("template", "daily")
+    custom_subject = schedule.get("subject") or None
     recipients = schedule.get("recipients") or []
     if not recipients:
         log.warning("scheduler: schedule %s has no recipients, skipping",
@@ -249,6 +250,7 @@ async def _fire_schedule(
             inventory_file=state.inventory_file,
             settings_file=state.settings_file,
             version=version,
+            subject_override=custom_subject,
         )
     except render.RenderError as exc:
         log.error("scheduler: render failed for schedule %s: %s",

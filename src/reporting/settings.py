@@ -182,6 +182,11 @@ class ScheduleEntry(BaseModel):
     cron: str = Field(min_length=1)
     recipients: list[str] = Field(default_factory=list)
     enabled: bool = True
+    # Optional custom subject line for the email. When null/empty,
+    # render.py auto-derives it from the template name
+    # ("GPU Monitor daily report" / "... weekly ..." / "... monthly ...").
+    # When set, the custom value is used verbatim as the Subject header.
+    subject: str | None = None
     # Unix epoch seconds of the last successful fire, or None if never
     # run. The scheduler updates this in-place after each successful
     # send.

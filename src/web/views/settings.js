@@ -975,14 +975,15 @@ function renderReportsTab() {
 
     const idInput = textInput('new_id', '', 'daily-0800');
     addWrap.append(field('report-new-id', 'ID', idInput,
-        'Unique identifier used by run-now and the scheduler. Cannot be changed later without removing and re-adding.'));
+        'Unique identifier used by run-now and the scheduler. Cannot be changed after creation.'));
 
     const templateSelect = selectInput('new_template', 'daily', [
         { value: 'daily',   label: 'Daily (last 24 hours)' },
         { value: 'weekly',  label: 'Weekly (last 7 days)' },
         { value: 'monthly', label: 'Monthly (last 30 days)' },
     ]);
-    addWrap.append(field('report-new-template', 'Template', templateSelect));
+    addWrap.append(field('report-new-template', 'Template', templateSelect,
+        'Determines the data window (24h / 7d / 30d) and the default email subject line.'));
 
     const cronInput = textInput('new_cron', '0 8 * * *', '0 8 * * *');
     addWrap.append(field('report-new-cron', 'Cron expression', cronInput,
@@ -990,6 +991,24 @@ function renderReportsTab() {
 
     const recipientsInput = textInput('new_recipients', '', 'a@example.com, b@example.com');
     addWrap.append(field('report-new-recipients', 'Recipients (comma-separated)', recipientsInput));
+
+    // Subject field: auto-derived from the template selection as a
+    // default, but editable. If the user clears it, the server falls
+    // back to "GPU Monitor {template} report". The auto-population
+    // fires on template change so switching from "daily" to "weekly"
+    // updates the subject placeholder accordingly — but only if the
+    // user hasn't typed a custom value.
+    const subjectInput = textInput('new_subject', '', 'GPU Monitor daily report');
+    let subjectManuallyEdited = false;
+    subjectInput.addEventListener('input', () => { subjectManuallyEdited = true; });
+    templateSelect.addEventListener('change', () => {
+        if (!subjectManuallyEdited) {
+            subjectInput.value = '';
+            subjectInput.placeholder = `GPU Monitor ${templateSelect.value} report`;
+        }
+    });
+    addWrap.append(field('report-new-subject', 'Email subject', subjectInput,
+        'Custom email subject line. Leave empty to use the default "GPU Monitor {template} report". Changing the template auto-updates this unless you\'ve typed a custom value.'));
 
     const addBtn = el('button', 'primary', 'Add schedule');
     addBtn.type = 'button';
@@ -1008,14 +1027,6 @@ function renderReportsTab() {
             addStatus.style.color = 'var(--danger)';
             return;
         }
-        // Phase 6c round 1: reject duplicate schedule IDs at the
-        // client boundary. The scheduler's fire-id dict and the
-        // server's run-now handler both key on schedule.id; adding
-        // two entries with the same id would leave the second one
-        // effectively dead (run-now finds the first via next(),
-        // the scheduler stamps only the first's last_run_epoch on
-        // each tick). Better to refuse at submit time with a clear
-        // message than produce silent unreachable state.
         if (schedules.some(s => s && s.id === newId)) {
             addStatus.textContent = `A schedule with id "${newId}" already exists. Remove it first or pick a different id.`;
             addStatus.style.color = 'var(--danger)';
@@ -1028,6 +1039,7 @@ function renderReportsTab() {
                 template: templateSelect.value,
                 cron: cronInput.value,
                 recipients,
+                subject: subjectInput.value.trim() || null,
                 enabled: true,
                 last_run_epoch: null,
             },
@@ -1037,7 +1049,6 @@ function renderReportsTab() {
         addStatus.textContent = '';
         try {
             await api.putSettings({ schedules: nextSchedules });
-            // Re-fetch and re-render this tab
             await reloadAndReRender();
             addStatus.textContent = '';
         } catch (err) {
@@ -1064,6 +1075,12 @@ function renderScheduleCard(schedule) {
     card.style.flexDirection = 'column';
     card.style.gap = 'var(--space-2)';
 
+    // ─── Read-only view (default) ──────────────────────────────────
+    const readView = el('div');
+    readView.style.display = 'flex';
+    readView.style.flexDirection = 'column';
+    readView.style.gap = 'var(--space-2)';
+
     const topRow = el('div');
     topRow.style.display = 'flex';
     topRow.style.justifyContent = 'space-between';
@@ -1078,13 +1095,28 @@ function renderScheduleCard(schedule) {
     meta.style.fontFamily = 'var(--font-mono)';
     meta.textContent = `${schedule.template} · ${schedule.cron}`;
     topRow.append(name, meta);
-    card.append(topRow);
+    readView.append(topRow);
 
-    const recipients = el('div');
-    recipients.style.fontSize = 'var(--font-size-sm)';
-    recipients.style.color = 'var(--text-secondary)';
-    recipients.textContent = 'To: ' + (schedule.recipients || []).join(', ');
-    card.append(recipients);
+    // Show the subject if it's custom; if null/empty, show the
+    // auto-derived default in a muted style so the user can see
+    // what the email will say.
+    const subjectLine = el('div');
+    subjectLine.style.fontSize = 'var(--font-size-sm)';
+    subjectLine.style.color = schedule.subject
+        ? 'var(--text-secondary)'
+        : 'var(--text-tertiary)';
+    subjectLine.textContent = 'Subject: ' +
+        (schedule.subject || `GPU Monitor ${schedule.template} report`);
+    if (!schedule.subject) {
+        subjectLine.textContent += ' (default)';
+    }
+    readView.append(subjectLine);
+
+    const recipientsLine = el('div');
+    recipientsLine.style.fontSize = 'var(--font-size-sm)';
+    recipientsLine.style.color = 'var(--text-secondary)';
+    recipientsLine.textContent = 'To: ' + (schedule.recipients || []).join(', ');
+    readView.append(recipientsLine);
 
     if (schedule.last_run_epoch) {
         const lastRun = el('div');
@@ -1092,10 +1124,10 @@ function renderScheduleCard(schedule) {
         lastRun.style.color = 'var(--text-tertiary)';
         const d = new Date(schedule.last_run_epoch * 1000);
         lastRun.textContent = 'Last run: ' + d.toLocaleString();
-        card.append(lastRun);
+        readView.append(lastRun);
     }
 
-    // Action buttons
+    // Action buttons (read mode)
     const actionRow = el('div');
     actionRow.style.display = 'flex';
     actionRow.style.gap = 'var(--space-2)';
@@ -1103,6 +1135,8 @@ function renderScheduleCard(schedule) {
 
     const runBtn = el('button', 'small', 'Run now');
     runBtn.type = 'button';
+    const editBtn = el('button', 'small', 'Edit');
+    editBtn.type = 'button';
     const removeBtn = el('button', 'small', 'Remove');
     removeBtn.type = 'button';
 
@@ -1142,8 +1176,117 @@ function renderScheduleCard(schedule) {
         }
     });
 
-    actionRow.append(runBtn, removeBtn, runStatus);
-    card.append(actionRow);
+    actionRow.append(runBtn, editBtn, removeBtn, runStatus);
+    readView.append(actionRow);
+    card.append(readView);
+
+    // ─── Inline edit view (hidden by default) ──────────────────────
+    const editView = el('div');
+    editView.style.display = 'none';
+    editView.style.flexDirection = 'column';
+    editView.style.gap = 'var(--space-2)';
+
+    const editTitle = el('div');
+    editTitle.style.fontWeight = 'var(--font-weight-semibold)';
+    editTitle.style.marginBottom = 'var(--space-2)';
+    editTitle.textContent = `Edit: ${schedule.id}`;
+    editView.append(editTitle);
+
+    const editTemplateSelect = selectInput(`edit_template_${schedule.id}`, schedule.template, [
+        { value: 'daily',   label: 'Daily (last 24 hours)' },
+        { value: 'weekly',  label: 'Weekly (last 7 days)' },
+        { value: 'monthly', label: 'Monthly (last 30 days)' },
+    ]);
+    editView.append(field(`edit-template-${schedule.id}`, 'Template', editTemplateSelect));
+
+    const editCronInput = textInput(`edit_cron_${schedule.id}`, schedule.cron, '0 8 * * *');
+    editView.append(field(`edit-cron-${schedule.id}`, 'Cron expression', editCronInput));
+
+    const editRecipientsInput = textInput(
+        `edit_recipients_${schedule.id}`,
+        (schedule.recipients || []).join(', '),
+        'a@example.com, b@example.com',
+    );
+    editView.append(field(`edit-recipients-${schedule.id}`, 'Recipients (comma-separated)', editRecipientsInput));
+
+    const editSubjectInput = textInput(
+        `edit_subject_${schedule.id}`,
+        schedule.subject || '',
+        `GPU Monitor ${schedule.template} report`,
+    );
+    // Update placeholder when template changes (mirrors the add-form
+    // behavior) so the user sees what the default subject will be.
+    editTemplateSelect.addEventListener('change', () => {
+        editSubjectInput.placeholder = `GPU Monitor ${editTemplateSelect.value} report`;
+    });
+    editView.append(field(`edit-subject-${schedule.id}`, 'Email subject', editSubjectInput,
+        'Leave empty to use the default "GPU Monitor {template} report".'));
+
+    const editBtnRow = el('div');
+    editBtnRow.style.display = 'flex';
+    editBtnRow.style.gap = 'var(--space-2)';
+    editBtnRow.style.marginTop = 'var(--space-2)';
+
+    const saveEditBtn = el('button', 'primary small', 'Save');
+    saveEditBtn.type = 'button';
+    const cancelEditBtn = el('button', 'small', 'Cancel');
+    cancelEditBtn.type = 'button';
+    const editStatus = el('span');
+    editStatus.style.fontSize = 'var(--font-size-sm)';
+    editStatus.style.marginLeft = 'var(--space-2)';
+
+    saveEditBtn.addEventListener('click', async () => {
+        const newRecipients = editRecipientsInput.value
+            .split(',')
+            .map(s => s.trim())
+            .filter(Boolean);
+        if (newRecipients.length === 0) {
+            editStatus.textContent = 'At least one recipient is required.';
+            editStatus.style.color = 'var(--danger)';
+            return;
+        }
+        const current = Array.isArray(state.settings.schedules)
+            ? state.settings.schedules
+            : [];
+        const updated = current.map(s => {
+            if (s.id !== schedule.id) return s;
+            return {
+                ...s,
+                template: editTemplateSelect.value,
+                cron: editCronInput.value,
+                recipients: newRecipients,
+                subject: editSubjectInput.value.trim() || null,
+            };
+        });
+        saveEditBtn.disabled = true;
+        saveEditBtn.textContent = 'Saving…';
+        editStatus.textContent = '';
+        try {
+            await api.putSettings({ schedules: updated });
+            await reloadAndReRender();
+        } catch (err) {
+            editStatus.textContent = `Save failed: ${err.message}`;
+            editStatus.style.color = 'var(--danger)';
+        } finally {
+            saveEditBtn.disabled = false;
+            saveEditBtn.textContent = 'Save';
+        }
+    });
+
+    cancelEditBtn.addEventListener('click', () => {
+        editView.style.display = 'none';
+        readView.style.display = 'flex';
+    });
+
+    editBtnRow.append(saveEditBtn, cancelEditBtn, editStatus);
+    editView.append(editBtnRow);
+    card.append(editView);
+
+    // ─── Toggle between read and edit views ────────────────────────
+    editBtn.addEventListener('click', () => {
+        readView.style.display = 'none';
+        editView.style.display = 'flex';
+    });
 
     return card;
 }

@@ -483,6 +483,7 @@ def generate_report(
     version: str,
     include_charts: bool = True,
     preview_theme: str = "none",
+    subject_override: str | None = None,
 ) -> EmailMessage:
     """Build a full multipart/alternative EmailMessage for the given
     template ("daily"/"weekly"/"monthly"). Caller sets the Subject/
@@ -730,7 +731,12 @@ def generate_report(
     # html alternative that itself carries the inline images as
     # multipart/related content.
     msg = EmailMessage()
-    msg["Subject"] = f"GPU Monitor {template} report"
+    # Use the caller's custom subject if provided; otherwise auto-derive
+    # from the template name. The custom subject comes from the schedule's
+    # optional `subject` field — the user sets it in Settings → Reports
+    # when they want something more descriptive than the generic
+    # "GPU Monitor daily report" default.
+    msg["Subject"] = subject_override or f"GPU Monitor {template} report"
     msg.set_content(plain_text)
     msg.add_alternative(html_inlined, subtype="html")
 

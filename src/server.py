@@ -876,6 +876,7 @@ async def handle_schedule_run_now(request: web.Request) -> web.Response:
             inventory_file=INVENTORY_FILE,
             settings_file=SETTINGS_FILE,
             version=version,
+            subject_override=schedule.get("subject") or None,
         )
     except render.RenderError as exc:
         return web.json_response(
