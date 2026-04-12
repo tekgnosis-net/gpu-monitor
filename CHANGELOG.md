@@ -3,6 +3,23 @@
 All notable changes to this fork of `bigsk1/gpu-monitor` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1](https://github.com/tekgnosis-net/gpu-monitor/compare/v1.0.0...v1.0.1) (2026-04-12)
+
+
+### Features
+
+* **collector:** synthetic-metrics fallback when nvidia-smi unavailable ([24fad5a](https://github.com/tekgnosis-net/gpu-monitor/commit/24fad5a45490e1c666bfa5d4e09fdce43f9c7066))
+* **ui:** autosave settings on change with floating toast ([1b234f2](https://github.com/tekgnosis-net/gpu-monitor/commit/1b234f25fce534ebbdd40336aa1b71af27e4ddb3))
+
+
+### Bug Fixes
+
+* **collector:** transactional retry for process_buffer failed DB inserts (task [#23](https://github.com/tekgnosis-net/gpu-monitor/issues/23)) ([f32424b](https://github.com/tekgnosis-net/gpu-monitor/commit/f32424b9bae2dce3b25104f227d5532e5762acb6))
+* **ui:** dashboard polish — GPU picker relocation, spacing, sidebar overflow ([ebdc4e3](https://github.com/tekgnosis-net/gpu-monitor/commit/ebdc4e3a8a96316ac86d5e9a1a02a31a6c40a830))
+* **ui:** report preview dark/light mode overrides ([728e2f3](https://github.com/tekgnosis-net/gpu-monitor/commit/728e2f374765b1c67ae3bd85930dc657702bb75a))
+* **ui:** theme-adaptive filter on report preview iframe ([c2ec172](https://github.com/tekgnosis-net/gpu-monitor/commit/c2ec172dc602b92942bfeffbeb97e465d8024a40))
+* **ui:** wrap SMTP credentials in a form for password-manager autofill ([16bcb84](https://github.com/tekgnosis-net/gpu-monitor/commit/16bcb8440b799bdd7039c30e7eaa16f99f546991))
+
 ## [Unreleased]
 
 _Nothing yet — this section accumulates changes that land on main
