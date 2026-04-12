@@ -7,6 +7,14 @@ Real-time NVIDIA GPU telemetry dashboard with multi-GPU support,
 scheduled HTML email reports, electricity-cost tracking, and a
 live Apple-HIG-themed web UI. Ships as a single Docker container.
 
+<p align="center">
+  <img src="docs/screenshots/dashboard-dark.png" alt="GPU Monitor Dashboard — 2× RTX 3090 in dark mode" width="800">
+</p>
+
+<p align="center">
+  <em>Dashboard with 2× NVIDIA RTX 3090 — real-time gauges, historical trend chart, Apple HIG dark theme</em>
+</p>
+
 > **This is a fork of [`bigsk1/gpu-monitor`](https://github.com/bigsk1/gpu-monitor)**
 > with enormous thanks to the original author. The upstream project
 > provided the core bash + SQLite collector, the nvidia-smi polling
@@ -109,6 +117,38 @@ GET  /api/housekeeping/db-info         size + row count + per-GPU
 POST /api/housekeeping/vacuum          run SQLite VACUUM
 POST /api/housekeeping/purge           delete rows older than N days
 ```
+
+---
+
+## Screenshots
+
+<details>
+<summary><strong>Dashboard — light mode</strong></summary>
+<p align="center">
+  <img src="docs/screenshots/dashboard-light.png" alt="Dashboard in light mode" width="800">
+</p>
+</details>
+
+<details>
+<summary><strong>Power usage</strong></summary>
+<p align="center">
+  <img src="docs/screenshots/power-dark.png" alt="Power usage view — energy, peak power, cost" width="800">
+</p>
+</details>
+
+<details>
+<summary><strong>Report preview</strong></summary>
+<p align="center">
+  <img src="docs/screenshots/report-dark.png" alt="Report preview with dark-mode email rendering" width="800">
+</p>
+</details>
+
+<details>
+<summary><strong>Settings</strong></summary>
+<p align="center">
+  <img src="docs/screenshots/settings-dark.png" alt="Settings — Collection tab with autosave" width="800">
+</p>
+</details>
 
 ---
 
