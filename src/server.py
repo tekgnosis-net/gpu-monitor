@@ -62,7 +62,7 @@ _SERVER_DIR = Path(__file__).resolve().parent
 if str(_SERVER_DIR) not in sys.path:
     sys.path.insert(0, str(_SERVER_DIR))
 
-from reporting import crypto, mailer, render  # noqa: E402
+from reporting import crypto, mailer, notifiers, render  # noqa: E402
 from reporting.settings import (  # noqa: E402
     DEFAULT_SETTINGS,
     Settings,
@@ -499,18 +499,34 @@ async def handle_stats_power(request: web.Request) -> web.Response:
 # follows the rule table above.
 
 
-def _redact_smtp_password(settings_dict: dict) -> dict:
-    """Replace `smtp.password_enc` (ciphertext) with `smtp.password_set`
-    (boolean) before sending settings to the client. The client should
-    never see the ciphertext — even though it's encrypted, leaking it
-    into browser DevTools / network logs would be an unnecessary
-    attack surface. Display the boolean "is a password configured"
-    instead, and let the user re-enter the plaintext in Settings if
-    they want to change it."""
+def _redact_secrets(settings_dict: dict) -> dict:
+    """Replace all `*_enc` ciphertext fields with `*_set` booleans
+    before sending settings to the client. The client should never
+    see ciphertext in DevTools / network logs.
+
+    Redacted fields:
+      smtp.password_enc     → smtp.password_set
+      alerts.channels.pushover.user_key_enc   → pushover.user_key_set
+      alerts.channels.pushover.app_token_enc  → pushover.app_token_set
+      alerts.channels.webhook.auth_token_enc  → webhook.auth_token_set
+    """
     redacted = json.loads(json.dumps(settings_dict))  # cheap deep copy
+
+    # SMTP password
     smtp = redacted.get("smtp", {})
     password_enc = smtp.pop("password_enc", "")
     smtp["password_set"] = bool(password_enc)
+
+    # Alert channel secrets
+    channels = redacted.get("alerts", {}).get("channels", {})
+
+    pushover = channels.get("pushover", {})
+    pushover["user_key_set"] = bool(pushover.pop("user_key_enc", ""))
+    pushover["app_token_set"] = bool(pushover.pop("app_token_enc", ""))
+
+    webhook = channels.get("webhook", {})
+    webhook["auth_token_set"] = bool(webhook.pop("auth_token_enc", ""))
+
     return redacted
 
 
@@ -616,7 +632,7 @@ async def handle_get_settings(request: web.Request) -> web.Response:
         log.warning("get_settings: load failed: %s", exc)
         data = json.loads(json.dumps(DEFAULT_SETTINGS))
 
-    return web.json_response(_redact_smtp_password(data))
+    return web.json_response(_redact_secrets(data))
 
 
 async def handle_put_settings(request: web.Request) -> web.Response:
@@ -686,6 +702,29 @@ async def handle_put_settings(request: web.Request) -> web.Response:
     else:
         plaintext_password = None
 
+    # Extract alert channel secrets BEFORE the merge — same pattern
+    # as SMTP password. The _enc fields are server-computed; the
+    # client sends plaintext via non-_enc field names (user_key,
+    # app_token, auth_token) which we pop here, encrypt after
+    # validation, and inject into the validated dict.
+    alert_channel_secrets: dict[str, dict[str, str | None]] = {}
+    alerts_body = body.get("alerts", {})
+    channels_body = alerts_body.get("channels", {}) if isinstance(alerts_body, dict) else {}
+
+    for ch_name, field_pairs in [
+        ("pushover", [("user_key", "user_key_enc"), ("app_token", "app_token_enc")]),
+        ("webhook", [("auth_token", "auth_token_enc")]),
+    ]:
+        ch_body = channels_body.get(ch_name, {})
+        if not isinstance(ch_body, dict):
+            continue
+        for plain_field, enc_field in field_pairs:
+            if plain_field in ch_body:
+                raw = ch_body.pop(plain_field)
+                if isinstance(raw, str) and raw:
+                    alert_channel_secrets.setdefault(ch_name, {})[enc_field] = raw
+                # None or "" → preserve existing (don't touch enc field)
+
     # Deep-merge over the existing file, then validate the result.
     # deep_merge is the public helper from reporting.settings (the
     # underscore-prefixed `_deep_merge` is a back-compat alias and
@@ -721,6 +760,23 @@ async def handle_put_settings(request: web.Request) -> web.Response:
                 status=500,
             )
 
+    # Encrypt alert channel secrets and inject into validated_dict.
+    # Same encrypt-after-validate pattern as SMTP password above.
+    if alert_channel_secrets:
+        try:
+            key = crypto.load_or_create_key(SECRET_KEY_FILE)
+            channels_dict = validated_dict.setdefault("alerts", {}).setdefault("channels", {})
+            for ch_name, fields in alert_channel_secrets.items():
+                ch_dict = channels_dict.setdefault(ch_name, {})
+                for enc_field, plaintext in fields.items():
+                    ch_dict[enc_field] = crypto.encrypt(plaintext, key)
+        except crypto.CryptoError as exc:
+            log.error("put_settings: channel secret encryption failed: %s", exc)
+            return web.json_response(
+                {"error": "encryption failed", "detail": str(exc)},
+                status=500,
+            )
+
     try:
         save_settings(SETTINGS_FILE, validated_dict)
     except OSError as exc:
@@ -730,7 +786,7 @@ async def handle_put_settings(request: web.Request) -> web.Response:
             status=500,
         )
 
-    return web.json_response(_redact_smtp_password(validated_dict))
+    return web.json_response(_redact_secrets(validated_dict))
 
 
 async def handle_smtp_test(request: web.Request) -> web.Response:
@@ -1255,6 +1311,80 @@ async def handle_static(request: web.Request) -> web.Response:
     return web.Response(status=404)
 
 
+# ─── Alert test endpoint ───────────────────────────────────────────────────
+
+
+async def handle_alert_test(request: web.Request) -> web.Response:
+    """POST /api/alerts/test/{channel} — fire a test notification to one
+    channel using the currently saved config. Used by the Settings UI's
+    per-channel Test buttons."""
+    if not _origin_is_same(request):
+        return web.json_response({"error": "cross-origin rejected"}, status=403)
+
+    channel = request.match_info.get("channel", "")
+    valid_channels = {"ntfy", "pushover", "webhook", "email"}
+    if channel not in valid_channels:
+        return web.json_response(
+            {"error": f"unknown channel {channel!r}, valid: {sorted(valid_channels)}"},
+            status=400,
+        )
+
+    data = load_settings(SETTINGS_FILE)
+    alerts_cfg = data.get("alerts", {})
+    channels_cfg = alerts_cfg.get("channels", {})
+    ch_cfg = channels_cfg.get(channel, {})
+
+    if not ch_cfg.get("enabled"):
+        return web.json_response(
+            {"ok": False, "error": f"{channel} is not enabled — enable it first"},
+            status=400,
+        )
+
+    try:
+        key = crypto.load_or_create_key(SECRET_KEY_FILE)
+    except crypto.CryptoError as exc:
+        return web.json_response(
+            {"ok": False, "error": f"cannot load encryption key: {exc}"},
+            status=500,
+        )
+
+    # Build a test alert payload
+    alert_data = notifiers.build_alert_data(
+        gpu_index=0,
+        gpu_name="Test GPU",
+        metric="Temperature",
+        value=85.0,
+        threshold=80.0,
+        unit="°C",
+    )
+    alert_data["message"] = f"Test notification from GPU Monitor ({channel} channel)"
+
+    smtp_config = data.get("smtp", {})
+
+    # Fire only the requested channel by building a single-channel config
+    test_channels = {channel: ch_cfg}
+    try:
+        succeeded = await notifiers.dispatch_alert(
+            channels_config=test_channels,
+            alert_data=alert_data,
+            smtp_config=smtp_config,
+            secret_key=key,
+        )
+    except Exception as exc:
+        return web.json_response(
+            {"ok": False, "error": str(exc)},
+            status=502,
+        )
+
+    if channel in succeeded:
+        return web.json_response({"ok": True, "channel": channel})
+    else:
+        return web.json_response(
+            {"ok": False, "error": f"{channel} test failed — check server logs"},
+            status=502,
+        )
+
+
 # ─── App construction ──────────────────────────────────────────────────────
 
 def make_app() -> web.Application:
@@ -1279,6 +1409,9 @@ def make_app() -> web.Application:
     app.router.add_get ("/api/settings",           handle_get_settings)
     app.router.add_put ("/api/settings",           handle_put_settings)
     app.router.add_post("/api/settings/smtp/test", handle_smtp_test)
+
+    # Alert notification test endpoint
+    app.router.add_post("/api/alerts/test/{channel}", handle_alert_test)
 
     # Phase 6b — scheduled reports
     app.router.add_post("/api/schedules/{id}/run-now", handle_schedule_run_now)

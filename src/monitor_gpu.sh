@@ -1394,6 +1394,34 @@ else
 fi
 
 ###############################################################################
+# run_alert_checker: Runs reporting/alert_checker.py in a supervised respawn
+# loop. The alert checker wakes every poll_interval_seconds (default 30s),
+# reads latest GPU metrics from SQLite, evaluates thresholds, and dispatches
+# push notifications (ntfy, Pushover, webhook, email) on breach. Shares the
+# same crash-resilience pattern as run_report_scheduler and run_web_server.
+#
+# Skipped if reporting/alert_checker.py is missing — same pared-down-image
+# escape hatch as the scheduler.
+###############################################################################
+run_alert_checker() {
+    cd /app
+    while true; do
+        python3 reporting/alert_checker.py
+        local rc=$?
+        log_warning "reporting/alert_checker.py exited with code $rc; respawning in 2s"
+        sleep 2
+    done
+}
+
+if [ -f /app/reporting/alert_checker.py ]; then
+    run_alert_checker &
+    ALERT_CHECKER_PID=$!
+    log_debug "Alert checker supervisor started (pid=$ALERT_CHECKER_PID)"
+else
+    log_debug "reporting/alert_checker.py not present; skipping alert checker launch"
+fi
+
+###############################################################################
 # Main Process Loop
 # Manages the continuous monitoring process with:
 # - Retry mechanism for failed updates
