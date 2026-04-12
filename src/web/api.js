@@ -202,7 +202,7 @@ export async function purgeOldData(days) {
     return _postJson('/housekeeping/purge', { days });
 }
 
-export function getReportPreviewUrl(template = 'daily') {
+export function getReportPreviewUrl(template = 'daily', theme = null) {
     // Returns the URL of the HTML preview endpoint for use as an
     // iframe src. This is a PURE SYNCHRONOUS STRING BUILDER, NOT a
     // fetch — the caller assigns the returned string directly to
@@ -213,7 +213,15 @@ export function getReportPreviewUrl(template = 'daily') {
     // refused to load. Keeping this sync is load-bearing — do NOT
     // add async back even if every other helper in this module
     // is async.
+    //
+    // The optional `theme` argument passes `?theme=dark` to the
+    // server so the preview HTML gets a dark-mode override <style>
+    // block injected. Only the literal "dark" is meaningful; any
+    // other value (null, undefined, "light", "auto", typos) omits
+    // the query param and the server renders the default light
+    // preview — which is what real email recipients see.
     const params = new URLSearchParams({ template });
+    if (theme === 'dark') params.set('theme', 'dark');
     return `${API_BASE}/reports/preview?${params}`;
 }
 

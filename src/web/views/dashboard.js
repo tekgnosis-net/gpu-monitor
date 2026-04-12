@@ -53,26 +53,33 @@ function buildHeader() {
 
     const subtitle = document.createElement('div');
     subtitle.className = 'subtitle';
-    subtitle.textContent = 'Real-time GPU telemetry';
+    // Fold the per-GPU count into the page subtitle so there's no
+    // standalone "N GPUs attached" banner floating above the cards.
+    // The cards themselves are already labelled "GPU 0 / GPU 1 /…"
+    // in their own headers (via gpu-card.js), which is the canonical
+    // "which card is which" anchor.
+    const count = state.gpus.length;
+    subtitle.textContent = count > 1
+        ? `Real-time GPU telemetry · ${count} GPUs attached`
+        : 'Real-time GPU telemetry';
 
     header.append(title, subtitle);
     return header;
 }
 
-function buildGpuTabs() {
+// Build a GPU-selection tablist for the chart card header. Returns null
+// in single-GPU mode — the single-card case has nothing to select
+// between, so the chart unambiguously tracks GPU 0 and the tablist is
+// hidden entirely. In multi-GPU mode this lives INSIDE the chart
+// card header next to the time-range picker, so the spatial relationship
+// "these controls govern this chart" is obvious without a text label.
+function buildChartGpuTabs() {
     if (state.gpus.length <= 1) return null;
-
-    const wrapper = document.createElement('section');
-    const label = document.createElement('div');
-    label.style.marginBottom = '12px';
-    label.style.color = 'var(--text-tertiary)';
-    label.style.fontSize = 'var(--font-size-sm)';
-    label.textContent = `${state.gpus.length} GPUs attached`;
 
     const tabs = document.createElement('div');
     tabs.className = 'tabs';
     tabs.setAttribute('role', 'tablist');
-    tabs.setAttribute('aria-label', 'Select GPU');
+    tabs.setAttribute('aria-label', 'Select GPU for chart');
 
     let initialActive = null;
     state.gpus.forEach((gpu) => {
@@ -83,7 +90,6 @@ function buildGpuTabs() {
         btn.addEventListener('click', () => {
             state.selectedGpuIndex = gpu.index;
             markTabSelected(tabs, btn);
-            // Reload the history chart for the newly-selected GPU
             refreshHistory();
         });
         tabs.append(btn);
@@ -94,9 +100,7 @@ function buildGpuTabs() {
 
     // Phase 7 / task #28: full WAI-ARIA tab pattern via
     // widgets/tablist.js — aria-selected, roving tabindex,
-    // arrow-key navigation. markTabSelected does the initial
-    // highlight + tabindex stamp; attachTablistKeyboard wires
-    // up the arrow/Home/End handling.
+    // arrow-key navigation.
     if (initialActive) markTabSelected(tabs, initialActive);
     attachTablistKeyboard(tabs, {
         onSelect: (targetTab) => {
@@ -108,8 +112,7 @@ function buildGpuTabs() {
         },
     });
 
-    wrapper.append(label, tabs);
-    return wrapper;
+    return tabs;
 }
 
 function buildGpuCards(container) {
@@ -181,11 +184,37 @@ function buildChartCard() {
     h3.textContent = 'Historical trend';
     const subtitle = document.createElement('div');
     subtitle.className = 'subtitle';
-    subtitle.textContent = 'Selected GPU over the chosen time range';
+    subtitle.textContent = state.gpus.length > 1
+        ? 'Selected GPU over the chosen time range'
+        : 'Over the chosen time range';
 
+    // Left side of the header holds the heading + subtitle and, in
+    // multi-GPU mode, the GPU selector directly below — creating a
+    // vertical "what am I looking at" reading order:
+    //    Historical trend   (heading: what is this card)
+    //    Selected GPU ...   (subtitle: how to interpret)
+    //    [GPU 0] [GPU 1]    (subject: which one is currently shown)
+    // This matches LTR reading conventions where the subject of a
+    // control group lives on the left and the modifier (time range)
+    // lives on the right, like a music player's track label vs
+    // transport controls.
     const headerLeft = document.createElement('div');
+    headerLeft.style.display = 'flex';
+    headerLeft.style.flexDirection = 'column';
+    headerLeft.style.gap = 'var(--space-2)';
     headerLeft.append(h3, subtitle);
 
+    const gpuTabs = buildChartGpuTabs();
+    if (gpuTabs) {
+        // Align the tab strip flush with the heading's left edge so
+        // it reads as "owned by" the heading above it rather than as
+        // a floating control.
+        gpuTabs.style.alignSelf = 'flex-start';
+        headerLeft.append(gpuTabs);
+    }
+
+    // Right side keeps only the time-range picker — the consistent
+    // "operation" slot that Power, Settings, etc. also right-align.
     header.append(headerLeft, buildTimeRangePicker());
     card.append(header);
 
@@ -387,12 +416,10 @@ export const dashboardView = {
         // Default-select the first (lowest-index) GPU
         state.selectedGpuIndex = state.gpus[0].index;
 
-        // Build the static structure
+        // Build the static structure. Note the GPU selector no longer
+        // lives at the top of the page — it's collocated with the chart
+        // it actually controls, inside buildChartCard()'s header.
         container.append(buildHeader());
-
-        const tabs = buildGpuTabs();
-        if (tabs) container.append(tabs);
-
         buildGpuCards(container);
         container.append(buildChartCard());
 

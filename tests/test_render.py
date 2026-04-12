@@ -236,6 +236,98 @@ def test_include_charts_false_skips_images(render_env):
     assert "multipart/related" not in types
 
 
+def _extract_html(msg):
+    """Pull the text/html part out of an EmailMessage. Helper for the
+    preview-theme tests which all need to poke at the HTML body."""
+    for part in msg.walk():
+        if part.get_content_type() == "text/html":
+            return part.get_payload(decode=True).decode("utf-8")
+    return None
+
+
+def test_preview_theme_dark_injects_override_style(render_env):
+    """preview_theme='dark' appends a post-premailer <style> block
+    that overrides the light-mode inlined styles with Apple HIG dark
+    palette colors. This is required for the dashboard's dark-mode
+    iframe preview; real email sends use preview_theme='none' so
+    recipients see the designed palette.
+
+    The crucial invariant is that cards (#2c2c2e) are LIGHTER than
+    body (#1c1c1e) — CSS filter inversion reversed this hierarchy
+    because it preserves relative brightness ordering. Server-side
+    injection is the only way to restore the visual-depth convention
+    dark-mode UX relies on."""
+    msg = render.generate_report(
+        template="daily",
+        include_charts=False,
+        preview_theme="dark",
+        **render_env,
+    )
+    html = _extract_html(msg)
+    assert html is not None
+    assert "preview-dark-override" in html
+    # The light-mode preview override must NOT leak in.
+    assert "preview-light-override" not in html
+    # Body is dark, cards are lighter than body, tiles are lighter
+    # than cards — the three-level depth hierarchy.
+    assert "#1c1c1e" in html  # body
+    assert "#2c2c2e" in html  # elevated surface (cards)
+    assert "#3a3a3c" in html  # deepest tile
+
+
+def test_preview_theme_light_injects_override_style(render_env):
+    """preview_theme='light' strengthens the authored template's
+    body/card contrast so card boundaries remain visible in the
+    preview iframe. The authored template uses #f5f5f7 body / #ffffff
+    cards — ~3% brightness delta — which works in email clients
+    (they render against their own white body so the #f5f5f7
+    disappears) but washes out in the always-visible iframe preview.
+
+    The override darkens body to #ebebf0 (~5% delta vs #ffffff cards),
+    re-skins tiles to #f5f5f7 for visible separation from cards, and
+    adds a soft shadow + stronger border for a crisper elevation cue.
+    This is a preview-only approximation — real email sends use
+    preview_theme='none' and receive the authored palette."""
+    msg = render.generate_report(
+        template="daily",
+        include_charts=False,
+        preview_theme="light",
+        **render_env,
+    )
+    html = _extract_html(msg)
+    assert html is not None
+    assert "preview-light-override" in html
+    # The dark-mode preview override must NOT leak in.
+    assert "preview-dark-override" not in html
+    # The preview-only light palette values.
+    assert "#ebebf0" in html  # darkened body
+    assert "#ffffff" in html  # cards unchanged
+    assert "box-shadow" in html  # soft elevation shadow
+
+
+def test_preview_theme_none_is_authored_template(render_env):
+    """preview_theme='none' (the default for real email sends called
+    from scheduler.py and the run-now endpoint) does NOT inject
+    either override block. Recipients must see the authored template
+    exactly — no preview approximations, no dashboard-themed tweaks,
+    no shadow-on-cards hack. This test is a guardrail against any
+    future refactor that accidentally flips the default."""
+    msg = render.generate_report(
+        template="daily",
+        include_charts=False,
+        # preview_theme omitted — uses the "none" default
+        **render_env,
+    )
+    html = _extract_html(msg)
+    assert html is not None
+    assert "preview-dark-override" not in html
+    assert "preview-light-override" not in html
+    # The preview-only color values must NOT appear anywhere.
+    assert "#1c1c1e" not in html  # dark-mode body
+    assert "#2c2c2e" not in html  # dark-mode card
+    assert "#ebebf0" not in html  # light-preview darkened body
+
+
 def test_unknown_template_raises_render_error(render_env):
     """Template strings outside the allowed set raise RenderError."""
     with pytest.raises(render.RenderError, match="unknown template"):
