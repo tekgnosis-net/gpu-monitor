@@ -132,9 +132,10 @@ def scheduler_env(tmp_path, smtp_server):
     }))
 
     # settings.json with SMTP pointed at the test listener and
-    # one disabled + one enabled daily schedule
+    # one disabled + one enabled daily schedule.
+    # Settings file lives inside history/ (persisted volume path).
     host, port, _catcher = smtp_server
-    settings_path = base / "settings.json"
+    settings_path = base / "history" / "settings.json"
     settings_data = {
         "collection": {"interval_seconds": 4, "flush_interval_seconds": 60},
         "housekeeping": {"retention_days": 3},
