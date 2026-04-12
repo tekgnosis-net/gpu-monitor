@@ -117,4 +117,4 @@ jobs:
           # With ignore-errors, a cache miss on the next build
           # is the worst case (slower by ~2 min), but the CI
           # status stays green.
-          cache-to: type=gha,mode=max,ignore-errors=true
+          cache-to: type=gha,mode=max,ignore-error=true

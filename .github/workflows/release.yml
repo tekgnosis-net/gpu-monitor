@@ -159,4 +159,4 @@ jobs:
           sbom: true
           provenance: mode=max
           cache-from: type=gha
-          cache-to: type=gha,mode=max,ignore-errors=true
+          cache-to: type=gha,mode=max,ignore-error=true
