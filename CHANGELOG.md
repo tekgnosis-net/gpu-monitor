@@ -3,6 +3,13 @@
 All notable changes to this fork of `bigsk1/gpu-monitor` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1](https://github.com/tekgnosis-net/gpu-monitor/compare/v1.2.0...v1.2.1) (2026-04-12)
+
+
+### Bug Fixes
+
+* move settings.json to history volume for persistence across upgrades ([e100434](https://github.com/tekgnosis-net/gpu-monitor/commit/e100434541fb364b96dac229d3bfe1300d8e7bc4))
+
 ## [1.2.0](https://github.com/tekgnosis-net/gpu-monitor/compare/v1.1.0...v1.2.0) (2026-04-12)
 
 
