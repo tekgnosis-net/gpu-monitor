@@ -532,11 +532,36 @@ function renderSmtpTab() {
     smtpForm.append(field('smtp-tls', 'Encryption', tlsSelect,
         'TLS mode. Most modern relays want STARTTLS on 587. "None" should only be used for loopback relays — never against a real provider.'));
 
-    // Action row: only the Send test email button now. The Save
-    // button is gone — all field edits above autosave on change/blur.
-    // Clearing the password still needs a dedicated button (rendered
-    // above this row inside the password-clear block) because it's
-    // a destructive action that deserves explicit user intent.
+    // Test email section: a dedicated "Test recipient" input so the
+    // user can send a test email to a specific address without having
+    // to configure a full schedule in the Reports tab first. The
+    // server already supports a {"to": "..."} override in the POST
+    // body (Phase 6b design) — the UI just never exposed it.
+    //
+    // The recipient value is persisted to localStorage (like the
+    // purge-days pattern) so it survives page reloads without
+    // needing a settings.json key. If left empty, the server falls
+    // back to smtp.user → smtp.from ("email yourself"), which is
+    // shown in the success message so the user knows where it went.
+    const TEST_RECIPIENT_KEY = 'gpu-monitor:smtp-test-recipient';
+    let savedTestRecipient = '';
+    try {
+        savedTestRecipient = localStorage.getItem(TEST_RECIPIENT_KEY) || '';
+    } catch { /* localStorage unavailable */ }
+
+    const testRecipientInput = emailInput('test_recipient', savedTestRecipient, 'test@example.com');
+    testRecipientInput.setAttribute('autocomplete', 'off');
+    // Persist on blur so the value is remembered across sessions.
+    testRecipientInput.addEventListener('blur', () => {
+        try {
+            localStorage.setItem(TEST_RECIPIENT_KEY, testRecipientInput.value);
+        } catch { /* silently drop */ }
+    });
+    smtpForm.append(field('smtp-test-recipient', 'Test recipient', testRecipientInput,
+        'Email address for the "Send test email" button below. Leave empty to send to the configured username/from address (i.e. email yourself). This value is remembered locally and is independent of report schedule recipients.'));
+
+    // Action row: test email button + inline status. No Save button
+    // — all SMTP fields above autosave on change/blur.
     const actionRow = el('div');
     actionRow.style.display = 'flex';
     actionRow.style.alignItems = 'center';
@@ -554,7 +579,10 @@ function renderSmtpTab() {
         testBtn.textContent = 'Sending…';
         status.textContent = '';
         try {
-            const result = await api.testSmtp();
+            // Pass the test recipient if the user entered one;
+            // null/empty lets the server fall back to smtp.user/from.
+            const to = testRecipientInput.value.trim() || null;
+            const result = await api.testSmtp(to);
             status.textContent = `Test email sent to ${result.to}`;
             status.style.color = 'var(--success, #34c759)';
         } catch (err) {
