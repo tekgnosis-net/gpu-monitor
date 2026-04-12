@@ -500,7 +500,12 @@ export const powerView = {
         // KPI row
         const kpiGrid = document.createElement('div');
         kpiGrid.className = 'card-grid';
-        kpiGrid.style.marginBottom = 'var(--space-2)';
+        // Uniform 16px gap — matches controls→KPI gap above AND the
+        // horizontal gap between the three KPI tiles (both --space-4).
+        // Earlier iterations used 32px (too airy), then 8px (tighter
+        // than the controls gap, breaking uniformity). 16px = the
+        // common value across all three inter-block gaps on this view.
+        kpiGrid.style.marginBottom = 'var(--space-4)';
         kpiGrid.append(
             buildKpiCard(
                 'kpi-energy',
