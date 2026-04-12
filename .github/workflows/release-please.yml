@@ -38,6 +38,15 @@ jobs:
       - name: Run release-please
         uses: googleapis/release-please-action@v4
         with:
+          # Use a PAT instead of the default GITHUB_TOKEN so that
+          # release-please can push commits (VERSION bump, CHANGELOG
+          # update) and create tags on the protected main branch.
+          # The default GITHUB_TOKEN cannot bypass branch protection
+          # rules even with `enforce_admins: false` because it is
+          # not an admin-scoped token. The PAT is stored as a
+          # repository secret with Contents (RW) + Pull requests
+          # (RW) permissions scoped to this repository only.
+          token: ${{ secrets.RELEASE_PAT }}
           config-file: .github/release-please-config.json
           manifest-file: .github/release-please-manifest.json
           target-branch: main

@@ -13,7 +13,8 @@
       "version-file": "VERSION",
       "changelog-path": "CHANGELOG.md",
       "include-component-in-tag": false,
-      "include-v-in-tag": true
+      "include-v-in-tag": true,
+      "release-as": "1.0.1"
     }
   }
 }
