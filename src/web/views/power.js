@@ -252,12 +252,22 @@ function buildControls(onGpuSelect, onWindowChange) {
 
 function buildKpiCard(id, title, infoText) {
     const card = document.createElement('section');
-    // `compact` drops internal padding from 32px → 16px so the tiles
-    // don't feel puffy around their short single-number content.
     card.className = 'card compact';
     card.id = id;
+    // KPI tiles are the shortest cards in the app — just a title,
+    // one big number, and a one-line subtitle. Even the `.compact`
+    // padding (16px) produces a ~120px card for ~60px of actual
+    // content. Override to 12px padding + 4px header gap so the
+    // tiles sit flush against the chart card below them without
+    // the "floating in air" feeling the user reported across
+    // three rounds of feedback. These overrides are inline rather
+    // than a new CSS class because they apply exclusively to the
+    // Power view's three KPI tiles — no other view uses this
+    // exact pattern.
+    card.style.padding = 'var(--space-3)';
 
     const header = document.createElement('header');
+    header.style.marginBottom = 'var(--space-1)';
     const h3 = document.createElement('h3');
     h3.textContent = title;
     header.append(h3);
@@ -269,13 +279,9 @@ function buildKpiCard(id, title, infoText) {
     }
     card.append(header);
 
-    // Big value + small unit. Inline styles keep the tile self-contained
-    // — no new CSS class needed in components.css for three tiles used
-    // in exactly one view. Phase 7 can promote this to a shared .kpi
-    // class if more views start using it.
     const value = document.createElement('div');
     value.className = 'value';
-    value.style.fontSize = 'var(--font-size-3xl)';
+    value.style.fontSize = 'var(--font-size-2xl)';
     value.style.fontWeight = 'var(--font-weight-bold)';
     value.style.fontVariantNumeric = 'tabular-nums';
     value.style.color = 'var(--text-primary)';
@@ -284,15 +290,15 @@ function buildKpiCard(id, title, infoText) {
 
     const unit = document.createElement('span');
     unit.className = 'unit';
-    unit.style.fontSize = 'var(--font-size-md)';
+    unit.style.fontSize = 'var(--font-size-sm)';
     unit.style.fontWeight = 'var(--font-weight-normal)';
     unit.style.color = 'var(--text-tertiary)';
-    unit.style.marginLeft = 'var(--space-2)';
+    unit.style.marginLeft = 'var(--space-1)';
     value.append(unit);
 
     const sub = document.createElement('div');
     sub.className = 'subtitle';
-    sub.style.marginTop = 'var(--space-2)';
+    sub.style.marginTop = 'var(--space-1)';
     sub.style.color = 'var(--text-tertiary)';
     sub.style.fontSize = 'var(--font-size-sm)';
     sub.textContent = '';
@@ -494,7 +500,7 @@ export const powerView = {
         // KPI row
         const kpiGrid = document.createElement('div');
         kpiGrid.className = 'card-grid';
-        kpiGrid.style.marginBottom = 'var(--space-4)';
+        kpiGrid.style.marginBottom = 'var(--space-2)';
         kpiGrid.append(
             buildKpiCard(
                 'kpi-energy',
