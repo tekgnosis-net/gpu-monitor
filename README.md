@@ -36,6 +36,7 @@ live Apple-HIG-themed web UI. Ships as a single Docker container.
 | API | Flat-file JSON served from disk | REST endpoints backed by read-only SQLite (WAL) |
 | Settings | Browser localStorage only | `/app/settings.json` with Pydantic validation + live-reload |
 | Reports | None | Scheduled HTML email with matplotlib PNG charts via SMTP |
+| Push notifications | None | **ntfy.sh, Pushover, webhook, email alerts** — server-side 24/7 |
 | Electricity cost | None | `kWh × rate` on the Power view + in emailed reports |
 | Housekeeping | Nightly collector sweep only | + UI-triggered VACUUM and manual purge endpoints |
 | Docker registry | Docker Hub | **GHCR only** (`ghcr.io/tekgnosis-net/gpu-monitor`) |
@@ -86,18 +87,42 @@ deliveries. Pick the version that matches your use case.
   auto-generated in `/app/history/.secret` mode 0600)
 - **Test email** button in Settings for immediate validation
 
+### Push notifications (server-side 24/7)
+- **Fires even when nobody has the browser open** — a dedicated
+  alert checker process evaluates thresholds every 30 s
+  (configurable 5–300 s) against the latest DB metrics
+- **Four channels**, independently enable/disable-able:
+  - **ntfy.sh** — open-source push notifications (cloud + self-hosted
+    with token auth)
+  - **Pushover** — popular mobile push service with iOS/Android apps
+  - **Generic webhook** — configurable HTTP POST/PUT with custom
+    headers and `{{key}}` body template substitution
+  - **Email alerts** — short plain-text emails reusing existing SMTP
+- **Parallel dispatch** — all enabled channels fire concurrently;
+  one dead channel doesn't block others
+- **Per-channel Test buttons** in Settings for instant validation
+- **Secrets encrypted at rest** (Fernet) — ntfy tokens, Pushover
+  keys, webhook auth tokens never exposed via the API
+
 ### Settings
 - 8-tab form: **Collection / SMTP / Alerts / Power / Housekeeping
   / Logging / Reports / Theme**
+- **macOS-style autosave** — every field saves on change/blur with
+  a floating toast for feedback; no Save buttons
 - **Live-reload** for collection cadence, log rotation, and data
   retention — changes apply on the next tick/hour/day without a
   container restart
 - **Info-tips** on every non-obvious field with `<info-tip>` Lit
   component
 - **Alert thresholds**: temperature / utilization / power with
-  configurable cooldown, sound, and browser Notification opt-in
+  configurable cooldown, sound, browser Notification opt-in, and
+  server-side push notification channels
+- **Inline schedule editing** — edit template, cron, recipients,
+  and custom email subject without deleting and recreating
 - **Database housekeeping**: live size + row count display,
   manual VACUUM button, purge-older-than-N-days with confirmation
+- **Settings persist across upgrades** — stored in the Docker
+  volume alongside the database, not inside the ephemeral container
 
 ### API (`/api/*`)
 ```
@@ -111,6 +136,7 @@ GET  /api/stats/power?range=24h&gpu=0  energy + peak + avg
 GET  /api/settings                     current settings (password redacted)
 PUT  /api/settings                     partial-merge update
 POST /api/settings/smtp/test           send test email
+POST /api/alerts/test/{channel}        test one notification channel
 POST /api/schedules/{id}/run-now       fire one schedule synchronously
 GET  /api/reports/preview              rendered HTML for iframe preview
 GET  /api/housekeeping/db-info         size + row count + per-GPU
