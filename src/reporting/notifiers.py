@@ -48,6 +48,7 @@ async def send_ntfy(
     title: str,
     message: str,
     priority: str = "high",
+    token: str | None = None,
     session: aiohttp.ClientSession,
 ) -> None:
     """POST a plain-text notification to an ntfy topic.
@@ -55,6 +56,11 @@ async def send_ntfy(
     ntfy accepts the message as the raw body with metadata in headers:
       X-Title:    notification title
       X-Priority: min/low/default/high/urgent
+
+    Token-based auth (for ntfy.sh cloud with private topics or
+    self-hosted instances with ACLs) is supported via the standard
+    Authorization: Bearer header. Pass the decrypted access token
+    as `token`; omit or pass None/empty for public topics.
     """
     if not topic_url:
         raise NotifierError("ntfy: topic_url is empty")
@@ -63,6 +69,8 @@ async def send_ntfy(
         "X-Title": title,
         "X-Priority": priority,
     }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
     try:
         async with session.post(
             topic_url,
@@ -293,11 +301,21 @@ async def dispatch_alert(
         # ntfy
         ntfy = channels_config.get("ntfy", {})
         if ntfy.get("enabled") and ntfy.get("topic_url"):
+            # Decrypt the ntfy access token if configured (for
+            # self-hosted instances with ACLs or private cloud topics).
+            ntfy_token = None
+            if ntfy.get("token_enc"):
+                try:
+                    ntfy_token = crypto.decrypt(ntfy["token_enc"], secret_key)
+                except crypto.CryptoError as exc:
+                    log.warning("dispatch: cannot decrypt ntfy token: %s", exc)
+
             tasks.append(("ntfy", send_ntfy(
                 topic_url=ntfy["topic_url"],
                 title=title,
                 message=message,
                 priority=ntfy.get("priority", "high"),
+                token=ntfy_token or None,
                 session=session,
             )))
 
