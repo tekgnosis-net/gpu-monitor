@@ -3,6 +3,13 @@
 All notable changes to this fork of `bigsk1/gpu-monitor` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0](https://github.com/tekgnosis-net/gpu-monitor/compare/v1.2.1...v1.3.0) (2026-04-14)
+
+
+### Features
+
+* **alerts:** add token-based auth to ntfy.sh channel ([0ea3062](https://github.com/tekgnosis-net/gpu-monitor/commit/0ea306266e6fe3602518cfe03a4fb7a098c96c0e))
+
 ## [1.2.1](https://github.com/tekgnosis-net/gpu-monitor/compare/v1.2.0...v1.2.1) (2026-04-12)
 
 
