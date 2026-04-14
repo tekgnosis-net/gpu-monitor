@@ -524,6 +524,9 @@ def _redact_secrets(settings_dict: dict) -> dict:
     # Alert channel secrets
     channels = redacted.get("alerts", {}).get("channels", {})
 
+    ntfy = channels.get("ntfy", {})
+    ntfy["token_set"] = bool(ntfy.pop("token_enc", ""))
+
     pushover = channels.get("pushover", {})
     pushover["user_key_set"] = bool(pushover.pop("user_key_enc", ""))
     pushover["app_token_set"] = bool(pushover.pop("app_token_enc", ""))
@@ -716,6 +719,7 @@ async def handle_put_settings(request: web.Request) -> web.Response:
     channels_body = alerts_body.get("channels", {}) if isinstance(alerts_body, dict) else {}
 
     for ch_name, field_pairs in [
+        ("ntfy", [("token", "token_enc")]),
         ("pushover", [("user_key", "user_key_enc"), ("app_token", "app_token_enc")]),
         ("webhook", [("auth_token", "auth_token_enc")]),
     ]:

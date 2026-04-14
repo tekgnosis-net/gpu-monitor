@@ -805,6 +805,19 @@ function renderAlertsTab() {
     ]);
     bindSelectChange(ntfyPriority, v => ({ alerts: { channels: { ntfy: { priority: v } } } }));
     panel.append(field('alerts-ntfy-priority', 'Priority', ntfyPriority));
+
+    const ntfyToken = passwordInput('ntfy_token',
+        ntfy.token_set ? '•••• (set)' : 'Access token (optional)');
+    ntfyToken.addEventListener('blur', async () => {
+        if (!ntfyToken.value) return;
+        try {
+            await autosave({ alerts: { channels: { ntfy: { token: ntfyToken.value } } } });
+            ntfyToken.value = '';
+            ntfyToken.placeholder = '•••• (set)';
+        } catch { /* toast handles error */ }
+    });
+    panel.append(field('alerts-ntfy-token', 'Access token', ntfyToken,
+        'Token for ntfy authentication (Bearer auth). Required for self-hosted instances with ACLs or private ntfy.sh cloud topics. Leave empty for public topics. Encrypted at rest.'));
     panel.append(channelTestButton('ntfy'));
 
     // ── Pushover ──

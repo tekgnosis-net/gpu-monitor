@@ -104,6 +104,52 @@ async def test_send_ntfy_posts_correct_shape():
 
 
 @pytest.mark.asyncio
+async def test_send_ntfy_injects_auth_token():
+    """When a token is provided, send_ntfy adds an Authorization: Bearer header."""
+    mock_resp = AsyncMock()
+    mock_resp.status = 200
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+    session = MagicMock()
+    session.post = MagicMock(return_value=mock_resp)
+
+    await notifiers.send_ntfy(
+        topic_url="https://ntfy.example.com/private-topic",
+        title="Alert",
+        message="test",
+        token="tk_mytoken123",
+        session=session,
+    )
+
+    headers = session.post.call_args[1]["headers"]
+    assert headers["Authorization"] == "Bearer tk_mytoken123"
+    assert headers["X-Title"] == "Alert"
+
+
+@pytest.mark.asyncio
+async def test_send_ntfy_no_auth_header_without_token():
+    """When token is None/empty, no Authorization header is sent."""
+    mock_resp = AsyncMock()
+    mock_resp.status = 200
+    mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+    mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+    session = MagicMock()
+    session.post = MagicMock(return_value=mock_resp)
+
+    await notifiers.send_ntfy(
+        topic_url="https://ntfy.sh/public-topic",
+        title="Alert",
+        message="test",
+        session=session,
+    )
+
+    headers = session.post.call_args[1]["headers"]
+    assert "Authorization" not in headers
+
+
+@pytest.mark.asyncio
 async def test_send_ntfy_raises_on_empty_url():
     session = MagicMock()
     with pytest.raises(notifiers.NotifierError, match="topic_url is empty"):

@@ -82,7 +82,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "sound_enabled": True,
         "notifications_enabled": False,
         "channels": {
-            "ntfy": {"enabled": False, "topic_url": "", "priority": "high"},
+            "ntfy": {"enabled": False, "topic_url": "", "token_enc": "", "priority": "high"},
             "pushover": {"enabled": False, "user_key_enc": "", "app_token_enc": "", "priority": 1},
             "webhook": {"enabled": False, "url": "", "method": "POST", "headers": {}, "body_template": "", "auth_token_enc": ""},
             "email": {"enabled": False, "recipients": []},
@@ -141,9 +141,12 @@ class LoggingSettings(BaseModel):
 
 
 class NtfyChannelSettings(BaseModel):
-    """ntfy.sh push notification channel. Simple HTTP POST to a topic URL."""
+    """ntfy.sh push notification channel. HTTP POST to a topic URL.
+    Supports both ntfy.sh cloud and self-hosted instances. Self-hosted
+    instances commonly require token-based auth for publishing."""
     enabled: bool = False
-    topic_url: str = ""   # e.g. "https://ntfy.sh/my-gpu-alerts"
+    topic_url: str = ""        # e.g. "https://ntfy.sh/my-gpu-alerts"
+    token_enc: str = ""        # Fernet-encrypted access token (Bearer auth)
     priority: str = Field(default="high")
 
     @field_validator("priority")
