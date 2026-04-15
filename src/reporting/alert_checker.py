@@ -174,6 +174,7 @@ async def run_once(
     alerts_cfg = settings_data.get("alerts", {})
     channels_cfg = alerts_cfg.get("channels", {})
     cooldown_seconds = alerts_cfg.get("cooldown_seconds", 10)
+    instance_name = alerts_cfg.get("instance_name", "")
 
     # Early exit: no channels enabled → nothing to do
     any_enabled = any(
@@ -239,6 +240,7 @@ async def run_once(
                         alert_data=alert_data,
                         smtp_config=smtp_config,
                         secret_key=secret_key,
+                        instance_name=instance_name,
                     )
                     if succeeded:
                         log.info(

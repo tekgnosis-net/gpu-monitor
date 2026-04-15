@@ -1365,7 +1365,9 @@ async def handle_alert_test(request: web.Request) -> web.Response:
         threshold=80.0,
         unit="°C",
     )
-    alert_data["message"] = f"Test notification from GPU Monitor ({channel} channel)"
+    instance_name = alerts_cfg.get("instance_name", "")
+    prefix = instance_name.strip() if instance_name else "GPU Monitor"
+    alert_data["message"] = f"Test notification from {prefix} ({channel} channel)"
 
     smtp_config = data.get("smtp", {})
 
@@ -1377,6 +1379,7 @@ async def handle_alert_test(request: web.Request) -> web.Response:
             alert_data=alert_data,
             smtp_config=smtp_config,
             secret_key=key,
+            instance_name=instance_name,
         )
     except Exception as exc:
         return web.json_response(
