@@ -214,7 +214,7 @@ function buildFooter(version) {
     ghLink.rel = 'noopener noreferrer';
     ghLink.title = 'Star gpu-monitor on GitHub';
     ghLink.append(_createGitHubIcon());
-    ghLink.append(document.createTextNode('Star us on GitHub'));
+    ghLink.append(document.createTextNode(' 🌟 Star us on GitHub'));
 
     const byline = document.createElement('span');
     byline.className = 'byline';
