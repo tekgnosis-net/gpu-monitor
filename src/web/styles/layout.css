@@ -176,11 +176,24 @@ aside.sidebar .sidebar-footer {
     font-size: var(--font-size-xs);
     color: var(--text-tertiary);
     line-height: var(--line-height-loose);
+    text-align: center;
 }
 
 aside.sidebar .sidebar-footer .version {
     font-family: var(--font-mono);
     color: var(--text-secondary);
+}
+
+aside.sidebar .sidebar-footer .github-link {
+    display: block;
+    margin-top: var(--space-1);
+    color: var(--text-tertiary);
+    text-decoration: none;
+    transition: color var(--motion-fast);
+}
+
+aside.sidebar .sidebar-footer .github-link:hover {
+    color: var(--text-primary);
 }
 
 aside.sidebar .sidebar-footer .byline {
@@ -193,7 +206,8 @@ html[data-sidebar-collapsed="true"] aside.sidebar .sidebar-footer {
     text-align: center;
 }
 
-html[data-sidebar-collapsed="true"] aside.sidebar .sidebar-footer .byline {
+html[data-sidebar-collapsed="true"] aside.sidebar .sidebar-footer .byline,
+html[data-sidebar-collapsed="true"] aside.sidebar .sidebar-footer .github-link {
     display: none;
 }
 
