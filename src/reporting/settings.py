@@ -79,6 +79,7 @@ DEFAULT_SETTINGS: dict[str, Any] = {
         "power_w": 300,
         "cooldown_seconds": 10,
         "poll_interval_seconds": 30,
+        "instance_name": "",
         "sound_enabled": True,
         "notifications_enabled": False,
         "channels": {
@@ -211,6 +212,12 @@ class AlertSettings(BaseModel):
     # 30s is coarse enough to avoid hammering SQLite but fine enough
     # to catch a thermal runaway before it becomes dangerous.
     poll_interval_seconds: int = Field(default=30, ge=5, le=300)
+    # Optional instance name for multi-instance setups. When set,
+    # replaces "GPU Monitor" in notification titles so users can
+    # distinguish which machine triggered the alert. Example:
+    # "ML-Rig-01" → title becomes "ML-Rig-01 Alert" instead of
+    # "GPU Monitor Alert".
+    instance_name: str = Field(default="", max_length=64)
     # Browser-side controls (toast + sound + Notification API):
     sound_enabled: bool = True
     notifications_enabled: bool = False

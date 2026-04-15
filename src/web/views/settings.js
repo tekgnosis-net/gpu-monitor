@@ -735,6 +735,11 @@ function renderAlertsTab() {
     panel.append(field('alerts-poll-interval', 'Poll interval (seconds)', pollInput,
         'How often the server checks GPU metrics against thresholds. Lower values mean faster detection but more DB reads. Default 30s is a good balance.'));
 
+    const instanceInput = textInput('instance_name', a.instance_name || '', 'e.g. ML-Rig-01');
+    bindTextBlur(instanceInput, v => ({ alerts: { instance_name: v } }));
+    panel.append(field('alerts-instance-name', 'Instance name', instanceInput,
+        'Optional identifier for this GPU Monitor instance. Replaces "GPU Monitor" in notification titles so you can distinguish alerts from multiple machines reporting to the same channel. Leave empty for the default "GPU Monitor Alert" title.'));
+
     // Helper: build a test button for a channel
     function channelTestButton(channelName) {
         const wrap = el('div');

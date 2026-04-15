@@ -285,6 +285,7 @@ async def dispatch_alert(
     alert_data: dict[str, Any],
     smtp_config: dict[str, Any],
     secret_key: bytes,
+    instance_name: str = "",
 ) -> list[str]:
     """Fire all enabled notification channels for one alert.
 
@@ -292,8 +293,13 @@ async def dispatch_alert(
     logged as warnings but do NOT raise — one dead channel must not
     block others from firing. Uses asyncio.gather with
     return_exceptions=True for parallel dispatch.
+
+    instance_name: when set, replaces "GPU Monitor" in notification
+    titles so multiple instances reporting to the same channel are
+    distinguishable (e.g. "ML-Rig-01 Alert" vs "GPU Monitor Alert").
     """
-    title = "GPU Monitor Alert"
+    prefix = instance_name.strip() if instance_name else "GPU Monitor"
+    title = f"{prefix} Alert"
     message = alert_data["message"]
     tasks: list[tuple[str, Any]] = []
 
@@ -366,7 +372,7 @@ async def dispatch_alert(
         email_cfg = channels_config.get("email", {})
         if email_cfg.get("enabled") and email_cfg.get("recipients"):
             tasks.append(("email", send_alert_email(
-                subject=f"GPU Monitor Alert: {alert_data.get('gpu_name', 'GPU')} {alert_data.get('metric', 'alert')}",
+                subject=f"{prefix} Alert: {alert_data.get('gpu_name', 'GPU')} {alert_data.get('metric', 'alert')}",
                 body_text=message,
                 smtp_config=smtp_config,
                 recipients=email_cfg["recipients"],
