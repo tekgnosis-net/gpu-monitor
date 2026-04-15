@@ -3,6 +3,22 @@
 All notable changes to this fork of `bigsk1/gpu-monitor` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0](https://github.com/tekgnosis-net/gpu-monitor/compare/v1.3.0...v1.4.0) (2026-04-15)
+
+
+### Features
+
+* **alerts:** configurable instance name for multi-instance setups ([1b55452](https://github.com/tekgnosis-net/gpu-monitor/commit/1b55452aee8430958b4d22b05d1b87b9f42ff054))
+* **alerts:** configurable instance name for multi-instance setups ([860c8ec](https://github.com/tekgnosis-net/gpu-monitor/commit/860c8ec0b01911194a11e9464f7dd257f3b4b560))
+
+
+### Bug Fixes
+
+* **dashboard:** visibility-aware polling + connection health indicator ([b895d17](https://github.com/tekgnosis-net/gpu-monitor/commit/b895d17b27f6547aece361fd2fe8e09a6f276b7c))
+* **ui:** add star emoji to GitHub link in sidebar footer ([38302d4](https://github.com/tekgnosis-net/gpu-monitor/commit/38302d4c538bfbc5a63e7a884c64031cb4a78a46))
+* **ui:** center footer version + add GitHub star link with icon ([dd8bb25](https://github.com/tekgnosis-net/gpu-monitor/commit/dd8bb25a9b2b05b086d26fac60c693f05416b336))
+* **ui:** center footer version + GitHub star link ([b886f4e](https://github.com/tekgnosis-net/gpu-monitor/commit/b886f4e87f59fc01ff92bde9226e7c734bfbc154))
+
 ## [1.3.0](https://github.com/tekgnosis-net/gpu-monitor/compare/v1.2.1...v1.3.0) (2026-04-14)
 
 
