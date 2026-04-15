@@ -36,11 +36,13 @@ const TIME_RANGES = [
 let pollInterval = null;
 let chartInstance = null;
 let themeChangeHandler = null;
+let visibilityHandler = null;
 let state = {
     gpus: [],
     selectedGpuIndex: 0,
     currentMetrics: [],
     timeRange: '1h',
+    consecutiveFailures: 0,
 };
 
 /* ─── DOM builders ─────────────────────────────────────────────────────── */
@@ -231,7 +233,21 @@ function buildChartCard() {
 /* ─── Data refresh ─────────────────────────────────────────────────────── */
 
 async function refreshCurrent() {
-    state.currentMetrics = await api.getCurrentMetrics();
+    const fetched = await api.getCurrentMetrics();
+
+    // Track connection health: an empty array from getCurrentMetrics
+    // means the fetch failed or the DB returned no rows. After 3
+    // consecutive empty responses, show a staleness indicator in the
+    // header subtitle so the user knows the data may be stale. A
+    // single successful response resets the counter immediately.
+    if (!fetched || fetched.length === 0) {
+        state.consecutiveFailures++;
+        updateConnectionStatus();
+        return;  // keep the last-known metrics on screen
+    }
+    state.consecutiveFailures = 0;
+    state.currentMetrics = fetched;
+    updateConnectionStatus();
 
     // Update each <gpu-card> in place — Lit re-renders on property change.
     const grid = document.getElementById('gpu-cards-grid');
@@ -375,6 +391,62 @@ async function refreshHistory() {
     }
 }
 
+/* ─── Connection health ────────────────────────────────────────────────── */
+
+// Show/hide a staleness warning in the Dashboard subtitle when
+// multiple consecutive poll failures occur. This tells the user
+// "the data you see may be stale" rather than silently displaying
+// old numbers. The warning clears immediately on the first
+// successful response.
+function updateConnectionStatus() {
+    const subtitle = document.querySelector('main.content header .subtitle');
+    if (!subtitle) return;
+
+    const count = state.gpus.length;
+    const base = count > 1
+        ? `Real-time GPU telemetry · ${count} GPUs attached`
+        : 'Real-time GPU telemetry';
+
+    if (state.consecutiveFailures >= 3) {
+        subtitle.textContent = base + ' · ⚠ Connection lost — retrying…';
+        subtitle.style.color = 'var(--danger, #ff3b30)';
+    } else {
+        subtitle.textContent = base;
+        subtitle.style.color = '';  // reset to default CSS
+    }
+}
+
+// Pause/resume polling based on tab visibility. When the tab is
+// hidden (user switched to another tab or minimized), stop polling
+// to save bandwidth and server load. When the tab becomes visible
+// again, fire an immediate refresh to recover from any staleness,
+// then restart the interval.
+function startPolling() {
+    if (pollInterval) return;  // already running
+    pollInterval = setInterval(() => {
+        refreshCurrent().catch(err => console.warn('dashboard poll failed:', err));
+    }, 4000);
+}
+
+function stopPolling() {
+    if (pollInterval) {
+        clearInterval(pollInterval);
+        pollInterval = null;
+    }
+}
+
+function handleVisibilityChange() {
+    if (document.hidden) {
+        stopPolling();
+    } else {
+        // Tab became visible — immediate refresh to recover from
+        // any staleness accumulated while hidden, then restart the
+        // regular 4s cadence.
+        refreshCurrent().catch(err => console.warn('dashboard: visibility refresh failed:', err));
+        startPolling();
+    }
+}
+
 /* ─── View lifecycle ───────────────────────────────────────────────────── */
 
 export const dashboardView = {
@@ -428,12 +500,15 @@ export const dashboardView = {
         await refreshHistory();
 
         // Poll current metrics every 4 seconds — matches the default
-        // collector interval. A more ambitious Phase 5+ implementation
-        // could switch this to SSE for push updates; 4s polling is
-        // perfectly fine for a homelab dashboard.
-        pollInterval = setInterval(() => {
-            refreshCurrent().catch(err => console.warn('dashboard poll failed:', err));
-        }, 4000);
+        // collector interval. Visibility-aware: pauses when the tab is
+        // hidden (saves bandwidth), resumes with an immediate refresh
+        // when the tab becomes visible so stale data recovers instantly.
+        startPolling();
+
+        // Subscribe to visibility changes for pause/resume. The handler
+        // is stored so unmount can remove it cleanly.
+        visibilityHandler = handleVisibilityChange;
+        document.addEventListener('visibilitychange', visibilityHandler);
 
         // Re-skin the chart when the theme flips so the legend / tooltip /
         // tick colors follow the new palette. Calls applyChartThemeOptions()
@@ -453,10 +528,7 @@ export const dashboardView = {
     },
 
     unmount() {
-        if (pollInterval) {
-            clearInterval(pollInterval);
-            pollInterval = null;
-        }
+        stopPolling();
         if (chartInstance) {
             chartInstance.destroy();
             chartInstance = null;
@@ -465,5 +537,10 @@ export const dashboardView = {
             window.removeEventListener('themechange', themeChangeHandler);
             themeChangeHandler = null;
         }
+        if (visibilityHandler) {
+            document.removeEventListener('visibilitychange', visibilityHandler);
+            visibilityHandler = null;
+        }
+        state.consecutiveFailures = 0;
     },
 };
