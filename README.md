@@ -17,7 +17,7 @@ live Apple-HIG-themed web UI. Ships as a single Docker container.
 
 > **This is a fork of [`bigsk1/gpu-monitor`](https://github.com/bigsk1/gpu-monitor)**
 > with enormous thanks to the original author. The upstream project
-> provided the core bash + SQLite collector, the nvidia-smi polling
+> provided the original bash + SQLite collector, the nvidia-smi polling
 > loop, and the original HTML dashboard. This fork takes that
 > foundation and rebuilds it into a multi-GPU, multi-theme, API-first
 > tool with emailed reporting and settings persistence. See
@@ -75,8 +75,8 @@ deliveries. Pick the version that matches your use case.
   a lower bound
 
 ### Scheduled email reports
-- **Cron-driven scheduler** subprocess supervised by the bash
-  collector. Uses `croniter.get_prev()` so a container offline
+- **Cron-driven scheduler** task running as part of the unified
+  asyncio entrypoint. Uses `croniter.get_prev()` so a container offline
   during a scheduled slot fires once on startup (not N times for
   N missed days)
 - **Multipart/alternative messages** with plain-text fallback and
@@ -392,8 +392,9 @@ same LAN.
    with `gpu_uuid = 'legacy-unknown'` after the migration.
 
 4. **First launch runs the migration automatically** — no manual
-   step required. The bash collector's `migrate_database()`
-   function is idempotent and runs at startup.
+   step required. The Python collector's `gpu_monitor.db.migrate()`
+   function is idempotent and runs at startup. (Pre-v2.0.0 images
+   used a bash equivalent; the migration logic is identical.)
 
 5. **Check the sidebar footer** — it should show `v1.0.0`. If
    you see `v1.0.0-dev` or an older version, check that the
@@ -406,31 +407,36 @@ same LAN.
 ### Architecture at a glance
 
 ```
-┌────────────────────────┐    ┌────────────────────────┐
-│ bash collector         │    │ aiohttp API server     │
-│ (monitor_gpu.sh)       │    │ (src/server.py)        │
-│                        │    │                        │
-│ nvidia-smi every 4s    │    │ read-only queries      │
-│ buffered writes to     │    │ static file serving    │
-│ /app/history/          │    │ + settings CRUD        │
-│   gpu_metrics.db (WAL) │◄──►│ + housekeeping         │
-└────────────────────────┘    └────────────────────────┘
-            │                             │
-            │                             │
-            ▼                             ▼
-┌────────────────────────┐    ┌────────────────────────┐
-│ scheduler subprocess   │    │ frontend               │
-│ (reporting/scheduler)  │    │ (src/web/)             │
-│                        │    │                        │
-│ cron evaluation        │    │ ES modules + Lit       │
-│ → render → mailer      │    │ + design tokens        │
-│ every 60s              │    │ + Chart.js CDN         │
-└────────────────────────┘    └────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│  python3 -m gpu_monitor    (single PID, asyncio event loop)     │
+│                                                                 │
+│  ┌─ collector ───┐  ┌─ aiohttp ─────┐  ┌─ scheduler ─────────┐  │
+│  │ NVML sample   │  │ /api/* +      │  │ cron eval → render  │  │
+│  │ → SQLite WAL  │  │ static files  │  │ → mailer (60s tick) │  │
+│  │ (per-tick)    │  │ + settings    │  └─────────────────────┘  │
+│  └───────────────┘  │ CRUD          │                           │
+│  ┌─ alert-checker ┐  │ + housekeeping│  ┌─ housekeeping ──────┐ │
+│  │ threshold      │  └───────────────┘  │ log rotation hourly │ │
+│  │ state machine  │                     │ DB purge daily 00:00│ │
+│  └────────────────┘                     └─────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+                  ┌─────────────────────────┐
+                  │ /app/history/           │
+                  │   gpu_metrics.db (WAL)  │
+                  │   settings.json         │
+                  └─────────────────────────┘
 ```
 
-All four processes run inside the same container and coordinate
-through the `/app` volume. The bash supervisor re-spawns any that
-crash.
+v2.0.0 unified the four-process tree into a single asyncio process.
+NVML telemetry is sampled directly via `nvidia-ml-py` (no
+`nvidia-smi` subprocess fork per tick), and all five tasks run under
+one event loop. Each task opens its own SQLite connection per
+operation (no shared pool — connection setup is sub-ms and SQLite
+WAL keeps readers contention-free with the collector writer);
+settings hot-reload is per-task with mtime caching so a settings.json
+edit propagates within a tick without coordination.
 
 ### Running the test suite
 
@@ -461,11 +467,13 @@ docker build \
 
 ## License
 
-MIT. See [LICENSE](LICENSE). The bash collector and nvidia-smi
-polling logic is derived from the upstream
+MIT. See [LICENSE](LICENSE). The original GPU-polling architecture
+is derived from the upstream
 [`bigsk1/gpu-monitor`](https://github.com/bigsk1/gpu-monitor)
 project by [@bigsk1](https://github.com/bigsk1) and retains its
-original MIT license. All additions in this fork (the REST API,
+original MIT license — though as of v2.0.0 the bash collector has
+been replaced wholesale with an async Python implementation using
+`nvidia-ml-py`. All additions in this fork (the REST API,
 the frontend rewrite, the reporting subpackage, the settings
 system) are original work under the same license.
 

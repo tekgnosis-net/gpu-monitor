@@ -2,14 +2,15 @@ FROM python:3.13.3-slim-bookworm
 
 # Install required packages.
 #
-# fonts-dejavu-core gives matplotlib a predictable font stack for the
-# email report charts (Phase 6). Without it matplotlib falls back to a
-# bitmap font and logs warnings on every chart render, which both
-# looks cheap in the email and clutters the collector log.
+# v2.0.0 dropped:
+#   * jq        — settings/inventory JSON now built by Python's json module
+#   * sqlite3   — schema migrations now run via Python's sqlite3 module
+#   * curl      — was a Phase-1 remnant, no consumer in the codebase
+#   * monitor_gpu.sh / bash collector — replaced by `python3 -m gpu_monitor`
+#
+# fonts-dejavu-core stays — matplotlib's email report charts need a
+# predictable font stack to avoid bitmap-font fallback warnings.
 RUN apt-get update && apt-get install -y \
-    curl \
-    jq \
-    sqlite3 \
     fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 
@@ -22,20 +23,12 @@ RUN apt-get update && apt-get install -y \
 #                    jinja2 + premailer (HTML email templating),
 #                    matplotlib (PNG chart rendering for email),
 #                    croniter (cron schedule evaluation)
+# v2.0.0   added:    nvidia-ml-py (NVML bindings; replaces the
+#                    `nvidia-smi` subprocess fork in the bash collector
+#                    with direct calls into libnvidia-ml.so)
 #
 # --no-cache-dir keeps pip's download cache out of the final image
-# layer. On the Phase 6 dep set that's ~50 MB of wheels + build
-# intermediates we'd otherwise bake into the runtime image. With
-# matplotlib + numpy + lxml being the heavy hitters, the savings
-# are substantial and the trade-off (slower rebuild from scratch)
-# is invisible in practice because the layer caches across builds
-# anyway.
-#
-# Image-size cost: ~80 MB on top of the Phase 3 baseline, dominated
-# by matplotlib's numpy runtime. The alternative (SVG inline or
-# external chart rendering) was considered and rejected — matplotlib's
-# PNG + MIME multipart/related gives the best compatibility across
-# Gmail, Outlook, and Apple Mail without per-client tuning.
+# layer.
 RUN pip install --no-cache-dir \
     aiohttp \
     pydantic \
@@ -44,7 +37,8 @@ RUN pip install --no-cache-dir \
     jinja2 \
     premailer \
     matplotlib \
-    croniter
+    croniter \
+    nvidia-ml-py
 
 # Create app directory
 WORKDIR /app
@@ -78,16 +72,19 @@ COPY src/web/views/        /app/views/
 COPY src/web/widgets/      /app/widgets/
 COPY src/web/images/       /app/images/
 COPY src/web/sounds/       /app/sounds/
-COPY src/monitor_gpu.sh    /app/
 COPY src/server.py         /app/
 # Phase 6 — reporting subpackage (settings, crypto, mailer, render,
 # scheduler + Jinja template). Copied as a directory tree so
-# `from reporting import ...` resolves correctly when server.py and
-# the scheduler subprocess run at /app/ root.
+# `from reporting import ...` resolves correctly when imported by the
+# unified entrypoint at /app/.
 COPY src/reporting/        /app/reporting/
+# v2.0.0 — gpu_monitor package (collector, NVML source, db, inventory,
+# housekeeping, lifecycle, __main__). Replaces the bash collector.
+COPY src/gpu_monitor/      /app/gpu_monitor/
 
-# Make scripts executable
-RUN chmod +x /app/monitor_gpu.sh
+# PYTHONPATH=/app makes `import server`, `from reporting import …`, and
+# `from gpu_monitor import …` all resolve from the unified entrypoint.
+ENV PYTHONPATH=/app
 
 # Application version: APP_VERSION is the SINGLE source of truth at build
 # time. CI (see .github/workflows/docker-publish.yml) reads the tracked
@@ -106,4 +103,4 @@ RUN printf '%s\n' "${APP_VERSION}" > /app/VERSION
 EXPOSE 8081
 
 # Start the application
-CMD ["./monitor_gpu.sh"]
+CMD ["python3", "-m", "gpu_monitor"]
