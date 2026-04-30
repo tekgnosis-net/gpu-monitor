@@ -164,9 +164,36 @@ class GpuGauge extends LitElement {
         return v.toFixed(1);
     }
 
+    // Hover tooltip: shows the absolute value and the percentage-of-max
+    // in brackets. Anchors the bracket to the visible max so hovering
+    // a Memory bar at 50% on a 24 GiB card produces "12288 MiB
+    // (50.0% of 24576 MiB)" — meaningful — rather than just "50%"
+    // which is what aria-valuenow already announces.
+    //
+    // Skip the bracket entirely when unit === '%' (utilization) because
+    // the value IS already a percentage and "73 % (73.0%)" would be
+    // redundant. Skip the entire tooltip when value is non-finite so
+    // hovering an unavailable metric shows "unavailable" instead of
+    // "—  (NaN%)".
+    _tooltip() {
+        const v = Number(this.value);
+        if (!isFinite(v)) {
+            return `${this.label}: unavailable`;
+        }
+        const unitSuffix = this.unit ? ` ${this.unit}` : '';
+        const valueText = `${this._displayValue()}${unitSuffix}`;
+        if (this.unit === '%') {
+            return `${this.label}: ${valueText}`;
+        }
+        const max = this._sanitizedMax();
+        const pct = this._pct().toFixed(1);
+        return `${this.label}: ${valueText} (${pct}% of ${max}${unitSuffix})`;
+    }
+
     render() {
         const pct = this._pct();
         const colorClass = this._colorClass(pct);
+        const tooltip = this._tooltip();
         return html`
             <div class="header">
                 <span class="label">${this.label}</span>
@@ -175,6 +202,7 @@ class GpuGauge extends LitElement {
                 </span>
             </div>
             <div class="track" role="progressbar"
+                 title=${tooltip}
                  aria-label=${this.label}
                  aria-valuenow=${this._sanitizedValue()}
                  aria-valuemin="0"

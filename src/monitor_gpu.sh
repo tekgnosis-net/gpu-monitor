@@ -331,10 +331,16 @@ function discover_gpus() {
     NUM_GPUS=0
 
     # Structured query: one row per GPU, comma-separated, no header.
-    # Fields: index, uuid, name, memory.total (MiB), power.max_limit (W).
+    # Fields: index, uuid, name, memory.total (MiB), power.limit (W).
+    #
+    # NOTE: we query power.limit (the *currently enforced* cap) rather
+    # than power.max_limit or power.default_limit. Operators commonly
+    # apply a custom cap via `nvidia-smi -pl <watts>` to constrain heat
+    # or noise; reporting the hardware ceiling instead would make the
+    # Power view's "% of cap" math meaningless on those installs.
     local csv
     csv=$(nvidia-smi \
-        --query-gpu=index,uuid,name,memory.total,power.max_limit \
+        --query-gpu=index,uuid,name,memory.total,power.limit \
         --format=csv,noheader,nounits 2>/dev/null)
 
     # Collect per-GPU entries for the inventory JSON.
@@ -588,6 +594,87 @@ function migrate_database() {
         return 1
     }
 
+    # Drop NOT NULL on `power` for existing DBs that were created under the
+    # original schema. nvidia-smi can return [N/A] for power.draw during
+    # transient driver/CUDA states (e.g. workload spin-up under vLLM,
+    # persistence-mode toggles). The original collector collapsed those
+    # to 0, which polluted 24h averages for many hours after a single
+    # bad window. The new collector writes SQL NULL instead — but the
+    # NOT NULL constraint would reject those inserts and lose the row's
+    # other (still-valid) temperature/util/memory readings.
+    #
+    # SQLite has no `ALTER TABLE ... DROP NOT NULL`, so we use the
+    # canonical 12-step table-rebuild pattern (https://sqlite.org/lang_altertable.html
+    # section "Making Other Kinds Of Table Schema Changes"). Wrapped
+    # in a single transaction so a crash mid-migration leaves the
+    # original table intact.
+    local power_notnull
+    power_notnull=$(sqlite3 -init /dev/null "$DB_FILE" \
+        "SELECT \"notnull\" FROM pragma_table_info('gpu_metrics') WHERE name='power';" 2>/dev/null)
+    if [ "${power_notnull:-0}" = "1" ]; then
+        log_warning "Migrating gpu_metrics: dropping NOT NULL on power column to allow N/A telemetry as SQL NULL"
+        # Heredoc-feed the migration SQL into sqlite3. Notes:
+        #
+        #   * `.bail on` forces sqlite3 CLI to abort on the first error
+        #     so a partial failure doesn't sneak through to COMMIT.
+        #   * `history_json_view` references gpu_metrics; we DROP it before
+        #     the table rebuild and recreate it after RENAME. Without this,
+        #     `DROP TABLE gpu_metrics` raises "error in view
+        #     history_json_view: no such table" and aborts the transaction,
+        #     leaving the DB in a half-migrated state.
+        #   * `|| { ... }` with a brace-block does not compose cleanly
+        #     with heredocs (bash parses the brace-block's `}` before the
+        #     heredoc terminator) — so we check the exit code on the
+        #     next line instead.
+        sqlite3 -init /dev/null "$DB_FILE" <<'SQL_MIGRATION'
+.bail on
+BEGIN TRANSACTION;
+DROP VIEW IF EXISTS history_json_view;
+CREATE TABLE gpu_metrics_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TEXT NOT NULL,
+    timestamp_epoch INTEGER NOT NULL,
+    temperature REAL NOT NULL,
+    utilization REAL NOT NULL,
+    memory REAL NOT NULL,
+    power REAL,
+    gpu_index INTEGER NOT NULL DEFAULT 0,
+    gpu_uuid TEXT,
+    interval_s INTEGER NOT NULL DEFAULT 4
+);
+INSERT INTO gpu_metrics_new
+    (id, timestamp, timestamp_epoch, temperature, utilization, memory,
+     power, gpu_index, gpu_uuid, interval_s)
+    SELECT id, timestamp, timestamp_epoch, temperature, utilization, memory,
+           power, gpu_index, gpu_uuid, interval_s
+    FROM gpu_metrics;
+DROP TABLE gpu_metrics;
+ALTER TABLE gpu_metrics_new RENAME TO gpu_metrics;
+CREATE INDEX IF NOT EXISTS idx_gpu_metrics_timestamp_epoch ON gpu_metrics(timestamp_epoch);
+CREATE INDEX IF NOT EXISTS idx_gpu_metrics_gpu_epoch ON gpu_metrics(gpu_index, timestamp_epoch);
+CREATE VIEW IF NOT EXISTS history_json_view AS
+SELECT
+    json_object(
+        'timestamps', json_group_array(timestamp),
+        'temperatures', json_group_array(temperature),
+        'utilizations', json_group_array(utilization),
+        'memory', json_group_array(memory),
+        'power', json_group_array(power)
+    ) AS json_data
+FROM (
+    SELECT timestamp, temperature, utilization, memory, power
+    FROM gpu_metrics
+    WHERE timestamp_epoch > (strftime('%s', 'now') - 86400)
+    ORDER BY timestamp_epoch ASC
+);
+COMMIT;
+SQL_MIGRATION
+        if [ $? -ne 0 ]; then
+            log_error "Failed to migrate power column to nullable"
+            return 1
+        fi
+    fi
+
     log_debug "Schema migration complete"
     return 0
 }
@@ -620,7 +707,7 @@ function initialize_database() {
         temperature REAL NOT NULL,
         utilization REAL NOT NULL,
         memory REAL NOT NULL,
-        power REAL NOT NULL,
+        power REAL,
         gpu_index INTEGER NOT NULL DEFAULT 0,
         gpu_uuid TEXT,
         interval_s INTEGER NOT NULL DEFAULT 4
@@ -915,6 +1002,26 @@ def _safe_float(s, default=0.0):
         return default
 
 
+def _safe_float_or_none(s):
+    """Like _safe_float but returns None (→ SQL NULL) for missing values.
+    Used for the power column specifically: nvidia-smi power.draw can
+    return [N/A] during transient driver/CUDA state changes, and we
+    want those rows preserved (so temperature/util/memory aren't lost)
+    but with power=NULL so the 24h aggregation queries can correctly
+    exclude them. Returning 0 here would conflate a 7-hour driver
+    hiccup with 7 hours of legitimate idle readings and silently drag
+    the average down for the entire window."""
+    try:
+        if s is None:
+            return None
+        cleaned = s.strip()
+        if cleaned in ('N/A', '[N/A]', '[Not Supported]', ''):
+            return None
+        return float(cleaned)
+    except (ValueError, AttributeError):
+        return None
+
+
 def process_buffer(db_path, buffer_lines):
     # interval_s (the cadence the collector is currently running at) comes
     # from the GPU_MONITOR_INTERVAL_S env var set by the bash caller.
@@ -987,7 +1094,9 @@ def process_buffer(db_path, buffer_lines):
             temperature = _safe_float(metric_parts[0])
             utilization = _safe_float(metric_parts[1])
             memory = _safe_float(metric_parts[2])
-            power = _safe_float(metric_parts[3])
+            # Power gets the None-on-N/A treatment so SQL NULL is stored
+            # for telemetry gaps (see _safe_float_or_none docstring).
+            power = _safe_float_or_none(metric_parts[3])
 
             # Parse timestamp to epoch. New format is "%Y-%m-%d %H:%M:%S";
             # fall back to the legacy yearless format for any stragglers in an
@@ -1229,13 +1338,21 @@ update_stats() {
         [ -z "$idx" ] && continue
 
         # Handle [N/A] power per-row; some laptop/dGPU combos don't report
-        # power telemetry at all. Because the three stripping lines above
+        # power telemetry at all, and discrete cards can return [N/A]
+        # transiently during driver/CUDA state changes (e.g. workload
+        # spin-up under vLLM). Because the three stripping lines above
         # have already removed the `[` and `]` characters, only the
-        # post-strip "N/A" (or empty) form is reachable — an earlier
-        # version of this branch also checked `"$power" == "[N/A]"`,
-        # which was unreachable dead code.
-        if [[ "$power" == "N/A" || -z "$power" ]]; then
-            power="0"
+        # post-strip "N/A" (or empty) form is reachable.
+        #
+        # We pass the literal "N/A" through to the buffer (not "0") so
+        # process_buffer.py can insert SQL NULL — the aggregation queries
+        # in /api/stats/power filter `power > 0`, which excludes both 0
+        # and NULL, but storing NULL is the semantically honest "this
+        # reading was unavailable" signal and prevents legitimate-zero
+        # readings (which never happen on real hardware but keep the
+        # contract clear) from being conflated with telemetry gaps.
+        if [[ -z "$power" ]]; then
+            power="N/A"
         fi
 
         # Append 6-field buffer line (atomic single-line append is
