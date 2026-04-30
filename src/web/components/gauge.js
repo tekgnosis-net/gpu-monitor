@@ -71,6 +71,17 @@ class GpuGauge extends LitElement {
             font-weight: 500;
         }
 
+        /* In-line "(96.4%)" suffix on memory/power labels. Tabular
+         * numerals stop the digits from jiggling horizontally as
+         * the value updates every poll cycle. The lighter weight
+         * keeps the percentage visually subordinate to the metric
+         * name itself, even though both share the tertiary color. */
+        .label-pct {
+            font-weight: 400;
+            margin-left: 4px;
+            font-variant-numeric: tabular-nums;
+        }
+
         .value {
             font-size: var(--font-size-lg, 17px);
             font-weight: 600;
@@ -164,17 +175,67 @@ class GpuGauge extends LitElement {
         return v.toFixed(1);
     }
 
+    // Hover tooltip: shows the absolute value and the percentage-of-max
+    // in brackets. Anchors the bracket to the visible max so hovering
+    // a Memory bar at 50% on a 24 GiB card produces "12288 MiB
+    // (50.0% of 24576 MiB)" — meaningful — rather than just "50%"
+    // which is what aria-valuenow already announces.
+    //
+    // Skip the bracket entirely when unit === '%' (utilization) because
+    // the value IS already a percentage and "73 % (73.0%)" would be
+    // redundant. Skip the entire tooltip when value is non-finite so
+    // hovering an unavailable metric shows "unavailable" instead of
+    // "—  (NaN%)".
+    _tooltip() {
+        const v = Number(this.value);
+        if (!isFinite(v)) {
+            return `${this.label}: unavailable`;
+        }
+        const unitSuffix = this.unit ? ` ${this.unit}` : '';
+        const valueText = `${this._displayValue()}${unitSuffix}`;
+        if (this.unit === '%') {
+            return `${this.label}: ${valueText}`;
+        }
+        const max = this._sanitizedMax();
+        const pct = this._pct().toFixed(1);
+        return `${this.label}: ${valueText} (${pct}% of ${max}${unitSuffix})`;
+    }
+
+    // Memory and Power gauges show the percentage-of-cap inline with
+    // the label — "Memory (96.4%) ... 23700 MiB" — so users can read
+    // utilization at a glance without having to hover for the tooltip.
+    //
+    // Skip for:
+    //   * temperature (the "100 °C" max is an arbitrary display
+    //     ceiling, not a meaningful denominator like memory_total
+    //     or power_limit_w),
+    //   * utilization (value is already a percentage; "Utilization
+    //     (73%) ... 73 %" would be redundant noise),
+    //   * non-finite values (would render as "(NaN%)").
+    _shouldShowLabelPct() {
+        if (this.metric !== 'memory' && this.metric !== 'power') return false;
+        if (this.unit === '%') return false;
+        return isFinite(Number(this.value));
+    }
+
     render() {
         const pct = this._pct();
         const colorClass = this._colorClass(pct);
+        const tooltip = this._tooltip();
+        const showLabelPct = this._shouldShowLabelPct();
         return html`
             <div class="header">
-                <span class="label">${this.label}</span>
+                <span class="label">
+                    ${this.label}${showLabelPct
+                        ? html`<span class="label-pct">(${pct.toFixed(1)}%)</span>`
+                        : ''}
+                </span>
                 <span class="value">
                     ${this._displayValue()}<span class="unit">${this.unit}</span>
                 </span>
             </div>
             <div class="track" role="progressbar"
+                 title=${tooltip}
                  aria-label=${this.label}
                  aria-valuenow=${this._sanitizedValue()}
                  aria-valuemin="0"
