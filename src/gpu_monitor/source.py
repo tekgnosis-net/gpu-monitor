@@ -8,13 +8,32 @@ structured `GPUMetric` instances; missing power telemetry surfaces as
 The collector calls `NVMLSource.sample()` once per tick. Each
 NVML query is fast (microseconds — no subprocess fork) so a
 multi-GPU sample completes in well under a millisecond, even on the
-slowest paths. NVML errors are categorized:
+slowest paths.
 
-  * NVML_ERROR_NOT_SUPPORTED on power → power_w=None for that GPU
-    (laptop/integrated GPUs without telemetry)
-  * NVML_ERROR_GPU_IS_LOST → log warning, skip that GPU; the
-    inventory will be re-discovered on next container restart
-  * Anything else → propagate; collector.run() catches and continues
+Per-GPU error isolation
+-----------------------
+
+We deliberately catch every `pynvml.NVMLError` per-metric and either
+return None (omitting that GPU's reading entirely) or substitute
+`None` for the affected field. The contract for callers:
+
+  * Power: NVML_ERROR_NOT_SUPPORTED → `power_w=None` (→ SQL NULL),
+    matching the v1.5.0 telemetry-gap contract. Any other NVMLError
+    on power also surfaces as `power_w=None` with a WARNING log,
+    rather than dropping the whole GPU's sample — a transient
+    driver hiccup shouldn't lose temperature/util/memory readings
+    we already collected.
+
+  * Temperature / utilization / memory: any NVMLError on these
+    metrics drops the GPU from the current tick (returns None from
+    `_sample_one`) and logs a WARNING. The next tick retries with
+    a fresh NVML call. NVML_ERROR_GPU_IS_LOST is the most common
+    cause; the inventory will be re-discovered on next container
+    restart.
+
+`sample()` itself never raises. The collector loop relies on this
+to avoid losing sibling-GPU readings when one GPU is in a degraded
+state.
 """
 
 from __future__ import annotations

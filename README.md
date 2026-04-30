@@ -431,10 +431,12 @@ same LAN.
 
 v2.0.0 unified the four-process tree into a single asyncio process.
 NVML telemetry is sampled directly via `nvidia-ml-py` (no
-`nvidia-smi` subprocess fork per tick), and all five tasks share one
-event loop, settings cache, and DB connection pool. SQLite WAL mode
-keeps the aiohttp readers free of contention with the collector
-writer.
+`nvidia-smi` subprocess fork per tick), and all five tasks run under
+one event loop. Each task opens its own SQLite connection per
+operation (no shared pool — connection setup is sub-ms and SQLite
+WAL keeps readers contention-free with the collector writer);
+settings hot-reload is per-task with mtime caching so a settings.json
+edit propagates within a tick without coordination.
 
 ### Running the test suite
 

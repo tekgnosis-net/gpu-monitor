@@ -399,12 +399,23 @@ def _install_signal_handlers(state: _SchedulerState) -> None:
 
 
 async def main_loop(state: _SchedulerState,
-                    tick_seconds: int = DEFAULT_TICK_SECONDS) -> None:
+                    tick_seconds: int = DEFAULT_TICK_SECONDS,
+                    install_signal_handlers: bool = True) -> None:
     """Forever loop: tick, sleep, tick, sleep. Exits cleanly when
     state.stop_requested is True (set by the signal handler on
-    SIGTERM)."""
+    SIGTERM).
+
+    `install_signal_handlers` defaults to True for backward compat
+    with the legacy bash-supervised mode where this was a standalone
+    process. The v2.0.0 unified entrypoint passes False so that
+    `gpu_monitor.lifecycle` owns SIGTERM/SIGINT — without this,
+    `signal.signal(...)` here would override
+    `loop.add_signal_handler(...)` set by lifecycle, and SIGTERM
+    would flip state.stop_requested but never trigger the
+    supervisor's stop event, hanging `docker stop` until SIGKILL."""
     import asyncio
-    _install_signal_handlers(state)
+    if install_signal_handlers:
+        _install_signal_handlers(state)
     log.info("scheduler: started, tick=%ds, tz=%s", tick_seconds, state.tz)
     while not state.stop_requested:
         try:

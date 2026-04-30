@@ -24,6 +24,7 @@ import asyncio
 import logging
 import os
 import sys
+from logging.handlers import WatchedFileHandler
 from pathlib import Path
 
 import pynvml
@@ -50,13 +51,51 @@ def _path(env_var: str, default: str | Path) -> Path:
     return Path(os.environ.get(env_var, default))
 
 
+def _safe_int_env(env_var: str, default: int) -> int:
+    """Parse an integer env var, falling back silently on bad input
+    so a typo in a compose file doesn't crash the container at
+    import time. The fallback is logged later (after _configure_logging
+    runs) via _emit_deferred_warnings()."""
+    raw = os.environ.get(env_var)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        _DEFERRED_WARNINGS.append(
+            f"{env_var}={raw!r} is not an integer; falling back to {default}"
+        )
+        return default
+
+
+_DEFERRED_WARNINGS: list[str] = []
+
 BASE_DIR = _path("GPU_MONITOR_BASE", "/app")
 DB_FILE = _path("GPU_MONITOR_DB", BASE_DIR / "history" / "gpu_metrics.db")
 SETTINGS_FILE = _path("GPU_MONITOR_SETTINGS", BASE_DIR / "history" / "settings.json")
 LOG_DIR = _path("GPU_MONITOR_LOG_DIR", BASE_DIR / "logs")
 INVENTORY_FILE = _path("GPU_MONITOR_INVENTORY", BASE_DIR / "gpu_inventory.json")
 CONFIG_FILE = _path("GPU_MONITOR_CONFIG", BASE_DIR / "gpu_config.json")
-WEB_PORT = int(os.environ.get("GPU_MONITOR_PORT", "8081"))
+VERSION_FILE = _path("GPU_MONITOR_VERSION_FILE", BASE_DIR / "VERSION")
+WEB_PORT = _safe_int_env("GPU_MONITOR_PORT", 8081)
+
+
+def _read_version() -> str:
+    """Single source of truth for the running version: /app/VERSION,
+    populated at build time from the APP_VERSION build-arg. Falls
+    back to the package's hardcoded `__version__` constant if the
+    file is missing (typical only in dev-mode `python3 -m gpu_monitor`
+    runs from a checkout). Avoids the drift Copilot flagged where the
+    /api/version route reads /app/VERSION but the startup banner +
+    gpu_config.json could disagree."""
+    try:
+        text = VERSION_FILE.read_text(encoding="utf-8").strip()
+        return text or __version__
+    except OSError:
+        return __version__
+
+
+VERSION = _read_version()
 
 
 # ─── Logging ───────────────────────────────────────────────────────────────
@@ -78,9 +117,14 @@ def _configure_logging() -> None:
     for h in list(root.handlers):
         root.removeHandler(h)
 
-    # File handler (rotated by housekeeping.py, not by Python's
-    # RotatingFileHandler — keeps the rotation policy unified).
-    file_handler = logging.FileHandler(LOG_DIR / "app.log", encoding="utf-8")
+    # WatchedFileHandler (not plain FileHandler) is required because
+    # housekeeping.py rotates by rename + touch. A plain FileHandler
+    # would keep the file descriptor pointing at the old (renamed)
+    # inode and continue writing into the rotated file forever,
+    # defeating the size cap. WatchedFileHandler stat()s the path on
+    # every emit and reopens on inode change. The cost is negligible
+    # (one stat per log line).
+    file_handler = WatchedFileHandler(LOG_DIR / "app.log", encoding="utf-8")
     file_handler.setFormatter(fmt)
     root.addHandler(file_handler)
 
@@ -88,6 +132,13 @@ def _configure_logging() -> None:
     stdout_handler = logging.StreamHandler(sys.stdout)
     stdout_handler.setFormatter(fmt)
     root.addHandler(stdout_handler)
+
+    # Emit any warnings buffered during module import (e.g., a
+    # malformed GPU_MONITOR_PORT). These need to wait until logging
+    # is configured because they happen before this function runs.
+    for msg in _DEFERRED_WARNINGS:
+        log.warning(msg)
+    _DEFERRED_WARNINGS.clear()
 
 
 # ─── server task ───────────────────────────────────────────────────────────
@@ -115,19 +166,20 @@ async def _run_server() -> None:
 
 
 async def _run_scheduler() -> None:
-    """Run the existing reporting.scheduler main_loop. We don't
-    install its signal handlers (lifecycle.supervise owns those);
-    the scheduler's main_loop tolerates signal-handler-install
-    failure for test harnesses, which we exploit here."""
+    """Run the existing reporting.scheduler main_loop. Pass
+    install_signal_handlers=False so lifecycle.supervise owns
+    SIGTERM/SIGINT — without this, signal.signal(...) inside
+    main_loop would override loop.add_signal_handler(...) set by
+    lifecycle, and SIGTERM would never reach the supervisor's
+    stop event (hanging `docker stop`)."""
     state = scheduler._SchedulerState()
-    await scheduler.main_loop(state)
+    await scheduler.main_loop(state, install_signal_handlers=False)
 
 
 async def _run_alert_checker() -> None:
-    """Run the existing reporting.alert_checker main_loop. Same
-    rationale as the scheduler wrapper above."""
+    """Same rationale as _run_scheduler above."""
     state = alert_checker._AlertCheckerState()
-    await alert_checker.main_loop(state)
+    await alert_checker.main_loop(state, install_signal_handlers=False)
 
 
 # ─── main ──────────────────────────────────────────────────────────────────
@@ -141,7 +193,7 @@ async def _async_main() -> None:
     inventories = inventory.discover(
         inventory_path=INVENTORY_FILE,
         config_path=CONFIG_FILE,
-        version=__version__,
+        version=VERSION,
     )
     source = NVMLSource(inventories)
 
@@ -162,7 +214,7 @@ def main() -> int:
     _configure_logging()
 
     log.info("=" * 40)
-    log.info("Starting NVIDIA GPU Monitor v%s", __version__)
+    log.info("Starting NVIDIA GPU Monitor v%s", VERSION)
     log.info("https://github.com/tekgnosis-net/gpu-monitor")
     log.info("-" * 40)
 

@@ -288,14 +288,23 @@ def _install_signal_handlers(state: _AlertCheckerState) -> None:
 async def main_loop(
     state: _AlertCheckerState,
     tick_seconds: int | None = None,
+    install_signal_handlers: bool = True,
 ) -> None:
     """Forever loop: tick, sleep, tick, sleep. Exits cleanly when
     state.stop_requested is True (set by signal handler on SIGTERM).
 
     tick_seconds defaults to alerts.poll_interval_seconds from
     settings.json, re-read each tick so live changes take effect.
+
+    `install_signal_handlers` defaults to True for backward compat
+    with the legacy bash-supervised mode. The v2.0.0 unified
+    entrypoint passes False so `gpu_monitor.lifecycle` owns
+    SIGTERM/SIGINT — without this, `signal.signal(...)` here would
+    override `loop.add_signal_handler(...)` set by lifecycle, and
+    SIGTERM would never reach the supervisor's stop event.
     """
-    _install_signal_handlers(state)
+    if install_signal_handlers:
+        _install_signal_handlers(state)
     log.info("alert_checker: started")
 
     while not state.stop_requested:
