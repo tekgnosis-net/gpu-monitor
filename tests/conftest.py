@@ -12,6 +12,17 @@ files during collection. Future phases can port them into proper
 pytest modules and remove their names from this list.
 """
 
+import sys
+from pathlib import Path
+
+# Make `src/` importable for tests so `from gpu_monitor import db` works
+# without requiring an editable install. server_module and reporting/
+# tests already do this inline; doing it once here keeps the new
+# gpu_monitor tests clean.
+_SRC = Path(__file__).resolve().parent.parent / "src"
+if str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
 collect_ignore_glob = [
     "db_load_*.py",   # db_load_test.py, db_load_3d_test.py, db_load_7d_test.py
     "test_trimming.py",
