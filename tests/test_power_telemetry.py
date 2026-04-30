@@ -272,21 +272,30 @@ def test_migration_drops_not_null_and_preserves_data(tmp_path):
     assert null_count == 1
 
 
-def test_migration_is_idempotent(tmp_path):
-    """The bash caller guards on `notnull=1` so the migration only
-    runs once, but if a buggy operator re-runs it manually the SQL
-    must still leave a valid (idempotent-equivalent) state. This
-    test confirms a second run doesn't silently corrupt the schema."""
+def test_migration_guard_skips_after_success(tmp_path):
+    """The migration is intended to run once. The bash caller in
+    migrate_database() guards on
+        SELECT "notnull" FROM pragma_table_info('gpu_metrics') WHERE name='power'
+    and only runs the rebuild when that returns 1.
+
+    This test verifies the post-condition the guard depends on: after
+    a successful migration, the `notnull` flag is 0, so subsequent
+    container starts will see the guard return 0 and skip the
+    migration. (The rebuild SQL itself would also succeed if re-run
+    against the post-migration state — it would just rebuild
+    unnecessarily — so the guard is what makes this idempotent in
+    practice, not any inherent error from the SQL.)"""
     db = tmp_path / "metrics.db"
     conn = sqlite3.connect(str(db))
     _create_old_schema(conn)
     _insert_row(conn, epoch=int(time.time()), power=100.0)
     conn.commit()
 
+    assert _power_notnull_constraint(conn) == 1, (
+        "fixture should start with the old NOT NULL schema"
+    )
     conn.executescript(MIGRATION_SQL)
-    # First run succeeded — power is now nullable. A second run would
-    # try to CREATE TABLE gpu_metrics_new again; SQLite would error
-    # because that table doesn't exist (we renamed it). The caller
-    # is expected to guard against this — verify the guard query
-    # returns 0 (nullable) so it WON'T re-run.
-    assert _power_notnull_constraint(conn) == 0
+    assert _power_notnull_constraint(conn) == 0, (
+        "post-migration: bash guard query must return 0 so the "
+        "migration is not re-run on subsequent container starts"
+    )
