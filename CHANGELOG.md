@@ -3,6 +3,25 @@
 All notable changes to this fork of `bigsk1/gpu-monitor` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0](https://github.com/tekgnosis-net/gpu-monitor/compare/v1.5.0...v2.0.0) (2026-04-30)
+
+
+### ⚠ BREAKING CHANGES
+
+* **collector:** Container entrypoint changed from `./monitor_gpu.sh` to `python3 -m gpu_monitor`. Anyone with `command:` or `entrypoint:` overrides in their compose file must remove them.
+* **collector:** stub gpu_monitor package + port db migrations to Python
+
+### Bug Fixes
+
+* **collector:** address Copilot review feedback on PR [#29](https://github.com/tekgnosis-net/gpu-monitor/issues/29) ([20c110f](https://github.com/tekgnosis-net/gpu-monitor/commit/20c110f14b73164a61eaad72b3bf0c8ad90b6d43))
+* **collector:** use NVML v2 memory API to match nvidia-smi reporting ([1ec4428](https://github.com/tekgnosis-net/gpu-monitor/commit/1ec44289382271757e0dd19bb2cdcadceeb64343))
+
+
+### Code Refactoring
+
+* **collector:** port inventory, source, collector, housekeeping, entrypoint to Python ([9bfc308](https://github.com/tekgnosis-net/gpu-monitor/commit/9bfc308008e1de8044f0448f60ea8a1bec6b363a))
+* **collector:** stub gpu_monitor package + port db migrations to Python ([a8eb378](https://github.com/tekgnosis-net/gpu-monitor/commit/a8eb378ef0fb208626cceb284e1919c6ec196948))
+
 ## [1.5.0](https://github.com/tekgnosis-net/gpu-monitor/compare/v1.4.0...v1.5.0) (2026-04-30)
 
 
