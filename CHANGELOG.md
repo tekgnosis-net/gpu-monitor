@@ -3,6 +3,18 @@
 All notable changes to this fork of `bigsk1/gpu-monitor` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0](https://github.com/tekgnosis-net/gpu-monitor/compare/v2.0.0...v2.1.0) (2026-04-30)
+
+
+### Features
+
+* **perf:** asyncio.to_thread for blocking DB/render + WAL truncation + 1s polling + GPU favicon ([32937de](https://github.com/tekgnosis-net/gpu-monitor/commit/32937deb814f58bf379670ec852bddbebbaf97db))
+
+
+### Bug Fixes
+
+* **perf:** address Copilot review feedback on PR [#33](https://github.com/tekgnosis-net/gpu-monitor/issues/33) ([74298b1](https://github.com/tekgnosis-net/gpu-monitor/commit/74298b14590a2e08f83198bbb7c0c445cd164437))
+
 ## [2.0.0](https://github.com/tekgnosis-net/gpu-monitor/compare/v1.5.0...v2.0.0) (2026-04-30)
 
 
