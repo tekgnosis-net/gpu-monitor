@@ -74,6 +74,7 @@ freezegun without launching a real subprocess.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import signal
@@ -242,9 +243,14 @@ async def _fire_schedule(
         log.error("scheduler: cannot decrypt SMTP password: %s", exc)
         return False
 
-    # Render the report — matplotlib + Jinja + premailer
+    # Render the report — matplotlib + Jinja + premailer.
+    # v2.1.0: wrapped in asyncio.to_thread so a multi-second render
+    # (the matplotlib chart generation dominates) doesn't stall the
+    # collector tick or other concurrent aiohttp routes that share
+    # the unified event loop with this scheduler task.
     try:
-        message = render.generate_report(
+        message = await asyncio.to_thread(
+            render.generate_report,
             template=template,
             db_file=state.db_file,
             inventory_file=state.inventory_file,

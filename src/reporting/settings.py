@@ -112,10 +112,20 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 
 
 class CollectionSettings(BaseModel):
-    # Range from the plan's audit: 2–300 s for interval, 5–3600 s for flush.
-    # Lower interval = more responsive charts but more CPU. Upper flush =
-    # longer worst-case data-loss window on unclean shutdown.
-    interval_seconds: int = Field(default=4, ge=2, le=300)
+    # Range: 1–300 s for interval, 5–3600 s for flush.
+    # v2.1.0: lowered interval_seconds floor from 2 → 1. The bash
+    # collector had a 2s floor as a safety bound around the
+    # subprocess-fork cost of `nvidia-smi`. With pynvml the per-tick
+    # cost is ~1-2ms total, so 1Hz polling is comfortable. NVML's
+    # internal utilization sampling window is ~1 second, so 1s is
+    # also the meaningful floor — polling faster returns duplicate
+    # utilization values. Operators wanting finer granularity can
+    # still set interval_seconds=1; the only cost is more DB rows.
+    #
+    # `flush_interval_seconds` is preserved for backward compat in
+    # settings.json files but ignored by the v2.0.0 collector
+    # (per-tick INSERT under WAL has no batch cadence to tune).
+    interval_seconds: int = Field(default=4, ge=1, le=300)
     flush_interval_seconds: int = Field(default=60, ge=5, le=3600)
 
 
