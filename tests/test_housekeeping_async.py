@@ -187,9 +187,12 @@ def test_clean_old_data_issues_wal_checkpoint_truncate(tmp_path, monkeypatch):
         conn.close()
 
     # Wrap sqlite3.connect to record SQL statements run on each
-    # connection. We use a subclass that delegates to the real
-    # Connection but tees execute() and executemany() calls through
-    # our recorder.
+    # connection. We subclass Connection and override only `execute()`
+    # — clean_old_data goes through that path for the DELETE, VACUUM,
+    # and PRAGMA wal_checkpoint(TRUNCATE) statements we need to
+    # capture. If a future change introduced executemany() into
+    # clean_old_data, this test would silently miss it; the comment
+    # is here to flag the intentional narrow scope.
     statements: list[str] = []
     real_connect = sqlite3.connect
 

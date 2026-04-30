@@ -1210,14 +1210,20 @@ async def handle_vacuum(request: web.Request) -> web.Response:
     # large DBs. Running it inline on the asyncio event loop would stall
     # collector ticks for the entire duration, dropping samples. Wrap
     # in asyncio.to_thread so the event loop stays responsive.
-    def _vacuum() -> tuple[bool, str | None]:
-        """Returns (success, error_message). On error, error_message is
-        the str(exc) for the response body."""
+    #
+    # Return signature: (ok, failure_kind, detail).
+    # `failure_kind` is "open" when _open_db_readwrite raised (lock
+    # contention, missing file, RO mount) or "exec" when VACUUM itself
+    # failed mid-run. The two map to different HTTP error messages
+    # ("database unavailable" vs "vacuum failed") so callers can
+    # distinguish a misconfigured environment from a real VACUUM
+    # error.
+    def _vacuum() -> tuple[bool, str, str]:
         try:
             conn = _open_db_readwrite()
         except sqlite3.OperationalError as exc:
             log.warning("vacuum: cannot open DB for write: %s", exc)
-            return (False, str(exc))
+            return (False, "open", str(exc))
         try:
             try:
                 # VACUUM cannot run inside a transaction. isolation_level=None
@@ -1231,18 +1237,18 @@ async def handle_vacuum(request: web.Request) -> web.Response:
                 # something else triggers a checkpoint. Truncate now so the
                 # API caller's "freed_bytes" reflects actual disk reclaim.
                 conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-                return (True, None)
+                return (True, "", "")
             except sqlite3.OperationalError as exc:
                 log.warning("vacuum: execute failed: %s", exc)
-                return (False, str(exc))
+                return (False, "exec", str(exc))
         finally:
             conn.close()
 
-    ok, err = await asyncio.to_thread(_vacuum)
+    ok, kind, detail = await asyncio.to_thread(_vacuum)
     if not ok:
+        error_msg = "database unavailable" if kind == "open" else "vacuum failed"
         return web.json_response(
-            {"error": "vacuum failed" if err else "database unavailable",
-             "detail": err or ""},
+            {"error": error_msg, "detail": detail},
             status=503,
         )
 
@@ -1304,12 +1310,16 @@ async def handle_purge(request: web.Request) -> web.Response:
     # DELETE on a multi-million-row gpu_metrics table can take seconds.
     # Wrap in asyncio.to_thread so the collector tick isn't stalled
     # waiting for the lock + write.
-    def _purge() -> tuple[bool, str | None, int]:
+    #
+    # Return signature: (ok, failure_kind, detail, rows_deleted).
+    # See _vacuum's contract above for the open/exec failure-kind
+    # distinction; same rationale applies.
+    def _purge() -> tuple[bool, str, str, int]:
         try:
             conn = _open_db_readwrite()
         except sqlite3.OperationalError as exc:
             log.warning("purge: cannot open DB for write: %s", exc)
-            return (False, str(exc), 0)
+            return (False, "open", str(exc), 0)
         try:
             try:
                 cursor = conn.execute(
@@ -1320,18 +1330,18 @@ async def handle_purge(request: web.Request) -> web.Response:
                     (cutoff_seconds,),
                 )
                 conn.commit()
-                return (True, None, cursor.rowcount or 0)
+                return (True, "", "", cursor.rowcount or 0)
             except sqlite3.OperationalError as exc:
                 log.warning("purge: execute failed: %s", exc)
-                return (False, str(exc), 0)
+                return (False, "exec", str(exc), 0)
         finally:
             conn.close()
 
-    ok, err, rows_deleted = await asyncio.to_thread(_purge)
+    ok, kind, detail, rows_deleted = await asyncio.to_thread(_purge)
     if not ok:
+        error_msg = "database unavailable" if kind == "open" else "purge failed"
         return web.json_response(
-            {"error": "purge failed" if err else "database unavailable",
-             "detail": err or ""},
+            {"error": error_msg, "detail": detail},
             status=503,
         )
 

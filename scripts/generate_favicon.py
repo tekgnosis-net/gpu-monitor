@@ -25,7 +25,6 @@ Re-run from the repo root:
 
 from __future__ import annotations
 
-import math
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -62,24 +61,20 @@ def _draw_native() -> Image.Image:
         outline=WHITE, width=ring_w,
     )
 
-    # Four curved fan blades. Each blade is a thick arc segment from the
-    # hub region outward, rotated 90° apart. Drawn as rotated chord-like
-    # shapes for a stylized "spinning blade" look.
-    blade_r_outer = int(NATIVE * 0.28)
-    blade_r_inner = int(NATIVE * 0.10)
+    # Four curved fan blades. Each blade is one thick arc segment swept
+    # through ~60° at radius blade_r, rotated 90° apart. Drawing arcs
+    # (rather than filled polygons) keeps the design lightweight and
+    # renders crisply at any size after LANCZOS downsampling. A single
+    # arc per blade is sufficient — adding an inner stroke at small
+    # radii made the 16×16 output too busy.
+    blade_r = int(NATIVE * 0.28)
     blade_w = int(NATIVE * 0.075)
 
     for angle_deg in (0, 90, 180, 270):
-        # Each blade is two arc strokes: one at the inner edge, one at
-        # the outer edge, swept through ~60° to give the curved-blade
-        # impression. Drawing arcs rather than filled polygons keeps
-        # the design lightweight and renders crisply at any size.
         sweep_start = angle_deg - 30
         sweep_end = angle_deg + 30
-        # Outer arc (leading edge of blade)
         d.arc(
-            [cx - blade_r_outer, cy - blade_r_outer,
-             cx + blade_r_outer, cy + blade_r_outer],
+            [cx - blade_r, cy - blade_r, cx + blade_r, cy + blade_r],
             sweep_start, sweep_end, fill=WHITE, width=blade_w,
         )
 
