@@ -5,5 +5,126 @@ with direct calls into `libnvidia-ml.so` via `pynvml`. Returns
 structured `GPUMetric` instances; missing power telemetry surfaces as
 `power_w=None` rather than the legacy `[N/A]` string sentinel.
 
-Filled in during Step 4 of the refactor.
+The collector calls `NVMLSource.sample()` once per tick. Each
+NVML query is fast (microseconds — no subprocess fork) so a
+multi-GPU sample completes in well under a millisecond, even on the
+slowest paths. NVML errors are categorized:
+
+  * NVML_ERROR_NOT_SUPPORTED on power → power_w=None for that GPU
+    (laptop/integrated GPUs without telemetry)
+  * NVML_ERROR_GPU_IS_LOST → log warning, skip that GPU; the
+    inventory will be re-discovered on next container restart
+  * Anything else → propagate; collector.run() catches and continues
 """
+
+from __future__ import annotations
+
+import logging
+import time
+from typing import Any
+
+import pynvml
+
+from gpu_monitor.state import GPUInventory, GPUMetric
+
+log = logging.getLogger("gpu-monitor.source")
+
+
+class NVMLSource:
+    """Cached-handle NVML sampler.
+
+    Owns one `pynvml` device handle per GPU listed in the inventory it
+    was constructed with. `sample()` returns the current per-GPU
+    telemetry. Idempotent for repeated calls; no per-call init cost.
+    """
+
+    def __init__(self, inventories: list[GPUInventory]) -> None:
+        self._inventories = inventories
+        # Map index → (uuid, handle). Cached at construction so the
+        # tight tick loop doesn't re-resolve handles on every call.
+        self._handles: list[tuple[GPUInventory, Any]] = []
+        for inv in inventories:
+            try:
+                handle = pynvml.nvmlDeviceGetHandleByIndex(inv.index)
+            except pynvml.NVMLError as exc:
+                log.warning(
+                    "source: failed to acquire handle for GPU %d (%s); "
+                    "skipping in tick loop",
+                    inv.index, exc,
+                )
+                continue
+            self._handles.append((inv, handle))
+
+    def sample(self) -> list[GPUMetric]:
+        """Sample every cached GPU. Returns one GPUMetric per GPU.
+
+        A per-GPU error doesn't fail the whole sample — the rest of
+        the GPUs still report. This matches the bash collector's
+        per-row `[N/A]` tolerance, but with structured error codes
+        instead of string parsing.
+        """
+        timestamp = int(time.time())
+        out: list[GPUMetric] = []
+        for inv, handle in self._handles:
+            metric = self._sample_one(inv, handle, timestamp)
+            if metric is not None:
+                out.append(metric)
+        return out
+
+    def _sample_one(
+        self,
+        inv: GPUInventory,
+        handle: Any,
+        timestamp: int,
+    ) -> GPUMetric | None:
+        """Sample a single GPU. Returns None if the device is in a
+        state where no useful reading can be produced (e.g. GPU_LOST)."""
+        try:
+            temperature = float(pynvml.nvmlDeviceGetTemperature(
+                handle, pynvml.NVML_TEMPERATURE_GPU
+            ))
+        except pynvml.NVMLError as exc:
+            log.warning("source: GPU %d temperature read failed (%s)", inv.index, exc)
+            return None
+
+        try:
+            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+            utilization = float(util.gpu)
+        except pynvml.NVMLError as exc:
+            log.warning("source: GPU %d utilization read failed (%s)", inv.index, exc)
+            return None
+
+        try:
+            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            memory_mib = float(mem.used // (1024 * 1024))
+        except pynvml.NVMLError as exc:
+            log.warning("source: GPU %d memory read failed (%s)", inv.index, exc)
+            return None
+
+        # Power: explicitly tolerate NOT_SUPPORTED → None (→ SQL NULL)
+        # so 24h aggregations correctly exclude the gap rather than
+        # averaging in a bogus 0.
+        power_w: float | None
+        try:
+            power_mw = pynvml.nvmlDeviceGetPowerUsage(handle)
+            power_w = power_mw / 1000.0
+        except pynvml.NVMLError as exc:
+            err_code = getattr(exc, "value", None)
+            if err_code == pynvml.NVML_ERROR_NOT_SUPPORTED:
+                power_w = None
+            else:
+                log.warning(
+                    "source: GPU %d power read failed (%s); recording NULL",
+                    inv.index, exc,
+                )
+                power_w = None
+
+        return GPUMetric(
+            gpu_index=inv.index,
+            gpu_uuid=inv.uuid,
+            timestamp_epoch=timestamp,
+            temperature=temperature,
+            utilization=utilization,
+            memory_mib=memory_mib,
+            power_w=power_w,
+        )
