@@ -29,16 +29,28 @@ def _patch_nvml(monkeypatch, *, per_handle):
 
     SimpleNamespace handles (rather than MagicMock) avoid the
     is-callable trap: MagicMock instances are callable, so a "return
-    this object" spec would have been miscalled as a factory."""
+    this object" spec would have been miscalled as a factory.
+
+    The GetMemoryInfo dispatch handles both v1 (`GetMemoryInfo(h)`)
+    and v2 (`GetMemoryInfo(h, version=...)`) calls — by default the
+    same spec serves both. Tests that need to differentiate v1 vs v2
+    can use the "GetMemoryInfo_v2" key for the version-tagged path."""
     handles = {i: SimpleNamespace(_id=i) for i in per_handle}
     monkeypatch.setattr(pynvml, "nvmlDeviceGetHandleByIndex",
                         lambda i: handles[i])
 
     def _dispatch(method_name):
-        def _impl(handle, *args):
+        def _impl(handle, *args, **kwargs):
             for hid, h in handles.items():
                 if h is handle:
-                    spec = per_handle[hid].get(method_name)
+                    spec_key = method_name
+                    # Distinguish v2 memory calls from v1 if the test
+                    # opts in by providing a "GetMemoryInfo_v2" key.
+                    if (method_name == "GetMemoryInfo"
+                            and kwargs.get("version") is not None
+                            and "GetMemoryInfo_v2" in per_handle[hid]):
+                        spec_key = "GetMemoryInfo_v2"
+                    spec = per_handle[hid].get(spec_key)
                     if isinstance(spec, BaseException):
                         raise spec
                     return spec
@@ -167,6 +179,58 @@ def test_sample_unexpected_power_error_logs_null(monkeypatch):
     out = src.sample()
     assert len(out) == 1
     assert out[0].power_w is None
+
+
+def test_sample_prefers_v2_memory_api(monkeypatch):
+    """When NVML v2 memory API is available, NVMLSource calls it for
+    `used` so the value matches what nvidia-smi reports. The v1 API
+    overcounts by ~400 MiB on Ampere/Ada cards (driver-reserved
+    chunk). This test gives different specs for v1 and v2 and asserts
+    the v2 value lands in the GPUMetric."""
+    util_obj = SimpleNamespace(gpu=10, memory=5)
+    v1_mem = SimpleNamespace(used=24570 * 1024 * 1024)  # legacy total-free
+    v2_mem = SimpleNamespace(used=24120 * 1024 * 1024)  # nvidia-smi-matching
+
+    _patch_nvml(monkeypatch, per_handle={
+        0: {
+            "GetTemperature": 50,
+            "GetUtilizationRates": util_obj,
+            "GetMemoryInfo": v1_mem,
+            "GetMemoryInfo_v2": v2_mem,
+            "GetPowerUsage": 200_000,
+        },
+    })
+
+    src = NVMLSource([_inv(0, "x")])
+    out = src.sample()
+    assert len(out) == 1
+    assert out[0].memory_mib == 24120.0, (
+        f"v2 memory API should win when available; got {out[0].memory_mib}"
+    )
+
+
+def test_sample_falls_back_to_v1_memory_when_v2_unavailable(monkeypatch):
+    """Older drivers / pynvml releases without nvmlMemory_v2 fall
+    back to v1. The result is overcounted but still useful — better
+    than a hard failure."""
+    util_obj = SimpleNamespace(gpu=10, memory=5)
+    v1_mem = SimpleNamespace(used=24570 * 1024 * 1024)
+
+    _patch_nvml(monkeypatch, per_handle={
+        0: {
+            "GetTemperature": 50,
+            "GetUtilizationRates": util_obj,
+            "GetMemoryInfo": v1_mem,
+            "GetPowerUsage": 200_000,
+        },
+    })
+    # Hide the v2 sentinel so NVMLSource constructor flips the flag off
+    monkeypatch.delattr(pynvml, "nvmlMemory_v2", raising=False)
+
+    src = NVMLSource([_inv(0, "x")])
+    assert src._mem_v2_available is False
+    out = src.sample()
+    assert out[0].memory_mib == 24570.0
 
 
 def test_init_skips_handle_acquisition_failure(monkeypatch):

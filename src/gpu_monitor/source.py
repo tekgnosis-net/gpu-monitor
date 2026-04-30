@@ -55,6 +55,18 @@ class NVMLSource:
                 continue
             self._handles.append((inv, handle))
 
+        # Prefer NVML's v2 memory API when available. The legacy v1
+        # API computes `used = total - free`, which includes ~400 MiB
+        # of driver-reserved memory (CUDA context, command queues,
+        # etc.) that `nvidia-smi` excludes. The v2 API (added in
+        # driver 525+) returns the user-visible "used" matching
+        # `nvidia-smi --query-gpu=memory.used`. Detected once at
+        # construction so the per-tick loop has no branch-mispredict
+        # cost. If the driver doesn't support v2, the first attempt
+        # to call it will raise and we'll downgrade the flag for the
+        # rest of the process lifetime.
+        self._mem_v2_available = hasattr(pynvml, "nvmlMemory_v2")
+
     def sample(self) -> list[GPUMetric]:
         """Sample every cached GPU. Returns one GPUMetric per GPU.
 
@@ -95,8 +107,7 @@ class NVMLSource:
             return None
 
         try:
-            mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
-            memory_mib = float(mem.used // (1024 * 1024))
+            memory_mib = self._read_memory_used_mib(handle)
         except pynvml.NVMLError as exc:
             log.warning("source: GPU %d memory read failed (%s)", inv.index, exc)
             return None
@@ -128,3 +139,32 @@ class NVMLSource:
             memory_mib=memory_mib,
             power_w=power_w,
         )
+
+    def _read_memory_used_mib(self, handle: Any) -> float:
+        """Return current GPU memory in use, in MiB, matching what
+        `nvidia-smi --query-gpu=memory.used` would report.
+
+        Tries the NVML v2 memory API first (driver 525+). If the
+        driver/library doesn't support v2, downgrades the flag and
+        falls back to v1 for the remaining process lifetime — the
+        v1 result will overcount by ~400 MiB on Ampere/Ada cards
+        but is still useful as a coarse trend indicator.
+        """
+        if self._mem_v2_available:
+            try:
+                mem = pynvml.nvmlDeviceGetMemoryInfo(
+                    handle, version=pynvml.nvmlMemory_v2
+                )
+                return float(mem.used // (1024 * 1024))
+            except (TypeError, pynvml.NVMLError) as exc:
+                log.warning(
+                    "source: NVML v2 memory API unavailable (%s); "
+                    "falling back to v1 (will overcount used memory by "
+                    "the driver-reserved chunk for the rest of this "
+                    "process lifetime)",
+                    exc,
+                )
+                self._mem_v2_available = False
+
+        mem = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        return float(mem.used // (1024 * 1024))
