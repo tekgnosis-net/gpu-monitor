@@ -3,6 +3,18 @@
 All notable changes to this fork of `bigsk1/gpu-monitor` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0](https://github.com/tekgnosis-net/gpu-monitor/compare/v1.4.0...v1.5.0) (2026-04-30)
+
+
+### Features
+
+* **ui:** show memory/power utilization % inline with gauge label ([8810de0](https://github.com/tekgnosis-net/gpu-monitor/commit/8810de057f24a621620b6d6661286271d98827a7))
+
+
+### Bug Fixes
+
+* **metrics:** preserve telemetry gaps as NULL + report enforced power cap ([69cb68a](https://github.com/tekgnosis-net/gpu-monitor/commit/69cb68aa931f9c3294b86a986908f55c076fb5af))
+
 ## [1.4.0](https://github.com/tekgnosis-net/gpu-monitor/compare/v1.3.0...v1.4.0) (2026-04-15)
 
 
