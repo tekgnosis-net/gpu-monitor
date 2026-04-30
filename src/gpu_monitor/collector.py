@@ -38,9 +38,19 @@ from gpu_monitor.source import NVMLSource
 log = logging.getLogger("gpu-monitor.collector")
 
 
-# Tick cadence bounds — matches load_settings() validation in monitor_gpu.sh.
+# Tick cadence bounds.
+#
+# v2.1.0: MIN_INTERVAL_S lowered from 2 → 1 because the bash collector's
+# 2s floor was an arbitrary safety bound around the subprocess fork cost
+# of `nvidia-smi`. With pynvml the per-tick cost is ~1-2ms total, so 1Hz
+# polling is comfortable. NVML's `nvmlDeviceGetUtilizationRates` itself
+# samples internally over a ~1-second window, so 1s is also the practical
+# *floor* — polling faster than 1Hz returns the same utilization value
+# multiple times. Operators wanting finer granularity for temperature /
+# memory / power can still set interval_seconds=1; the only cost is more
+# DB rows (~520k/day at 1s × 2 GPUs × 3-day retention vs ~130k at 4s).
 DEFAULT_INTERVAL_S = 4
-MIN_INTERVAL_S = 2
+MIN_INTERVAL_S = 1
 MAX_INTERVAL_S = 300
 
 

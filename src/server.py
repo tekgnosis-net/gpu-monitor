@@ -44,6 +44,7 @@ Phase 6 will add PUT routes and MAY justify pulling in pydantic at that
 point; Phase 3 does not.
 """
 
+import asyncio
 import json
 import logging
 import sqlite3
@@ -239,26 +240,30 @@ async def handle_metrics_current(request: web.Request) -> web.Response:
     """Latest sample per GPU. Uses a correlated subquery to find the most
     recent timestamp_epoch per gpu_index, avoiding a GROUP BY that SQLite's
     query planner would have to resolve with per-group scans."""
-    try:
-        conn = _open_db_readonly()
-    except sqlite3.OperationalError as exc:
-        log.warning("metrics_current: cannot open DB: %s", exc)
-        return web.json_response([], status=200)
+    def _query():
+        try:
+            conn = _open_db_readonly()
+        except sqlite3.OperationalError as exc:
+            log.warning("metrics_current: cannot open DB: %s", exc)
+            return None
+        try:
+            return conn.execute("""
+                SELECT m.gpu_index, m.gpu_uuid, m.timestamp,
+                       m.temperature, m.utilization, m.memory, m.power
+                FROM gpu_metrics m
+                WHERE m.timestamp_epoch = (
+                    SELECT MAX(timestamp_epoch)
+                    FROM gpu_metrics m2
+                    WHERE m2.gpu_index = m.gpu_index
+                )
+                ORDER BY m.gpu_index ASC
+            """).fetchall()
+        finally:
+            conn.close()
 
-    try:
-        rows = conn.execute("""
-            SELECT m.gpu_index, m.gpu_uuid, m.timestamp,
-                   m.temperature, m.utilization, m.memory, m.power
-            FROM gpu_metrics m
-            WHERE m.timestamp_epoch = (
-                SELECT MAX(timestamp_epoch)
-                FROM gpu_metrics m2
-                WHERE m2.gpu_index = m.gpu_index
-            )
-            ORDER BY m.gpu_index ASC
-        """).fetchall()
-    finally:
-        conn.close()
+    rows = await asyncio.to_thread(_query)
+    if rows is None:
+        return web.json_response([], status=200)
 
     return web.json_response([
         {
@@ -290,28 +295,32 @@ async def handle_metrics_history(request: web.Request) -> web.Response:
     )
     gpu_index = _parse_gpu_param(request.query.get("gpu"))
 
-    try:
-        conn = _open_db_readonly()
-    except sqlite3.OperationalError as exc:
-        log.warning("metrics_history: cannot open DB: %s", exc)
+    def _query():
+        try:
+            conn = _open_db_readonly()
+        except sqlite3.OperationalError as exc:
+            log.warning("metrics_history: cannot open DB: %s", exc)
+            return None
+        try:
+            cutoff_sql = "strftime('%s', 'now') - ?"
+            return conn.execute(
+                f"""
+                SELECT timestamp, temperature, utilization, memory, power
+                FROM gpu_metrics
+                WHERE gpu_index = ? AND timestamp_epoch > ({cutoff_sql})
+                ORDER BY timestamp_epoch ASC
+                """,
+                (gpu_index, range_s),
+            ).fetchall()
+        finally:
+            conn.close()
+
+    rows = await asyncio.to_thread(_query)
+    if rows is None:
         return web.json_response({
             "timestamps": [], "temperatures": [], "utilizations": [],
             "memory": [], "power": [],
         }, status=200)
-
-    try:
-        cutoff_sql = "strftime('%s', 'now') - ?"
-        rows = conn.execute(
-            f"""
-            SELECT timestamp, temperature, utilization, memory, power
-            FROM gpu_metrics
-            WHERE gpu_index = ? AND timestamp_epoch > ({cutoff_sql})
-            ORDER BY timestamp_epoch ASC
-            """,
-            (gpu_index, range_s),
-        ).fetchall()
-    finally:
-        conn.close()
 
     return web.json_response({
         "timestamps":   [r["timestamp"]    for r in rows],
@@ -328,28 +337,32 @@ async def handle_stats_24h(request: web.Request) -> web.Response:
     identical to the legacy gpu_24hr_stats.txt contract — the retrofitted
     frontend just picks [0].stats for the single-GPU legacy view. Future
     multi-GPU frontends in Phase 4 can index by gpu_index."""
-    try:
-        conn = _open_db_readonly()
-    except sqlite3.OperationalError as exc:
-        log.warning("stats_24h: cannot open DB: %s", exc)
-        return web.json_response([], status=200)
+    def _query():
+        try:
+            conn = _open_db_readonly()
+        except sqlite3.OperationalError as exc:
+            log.warning("stats_24h: cannot open DB: %s", exc)
+            return None
+        try:
+            return conn.execute("""
+                SELECT
+                    gpu_index,
+                    MIN(temperature) AS temp_min, MAX(temperature) AS temp_max,
+                    MIN(utilization) AS util_min, MAX(utilization) AS util_max,
+                    MIN(memory) AS mem_min,       MAX(memory) AS mem_max,
+                    MIN(CASE WHEN power > 0 THEN power ELSE NULL END) AS power_min,
+                    MAX(power) AS power_max
+                FROM gpu_metrics
+                WHERE timestamp_epoch > strftime('%s', 'now') - 86400
+                GROUP BY gpu_index
+                ORDER BY gpu_index ASC
+            """).fetchall()
+        finally:
+            conn.close()
 
-    try:
-        rows = conn.execute("""
-            SELECT
-                gpu_index,
-                MIN(temperature) AS temp_min, MAX(temperature) AS temp_max,
-                MIN(utilization) AS util_min, MAX(utilization) AS util_max,
-                MIN(memory) AS mem_min,       MAX(memory) AS mem_max,
-                MIN(CASE WHEN power > 0 THEN power ELSE NULL END) AS power_min,
-                MAX(power) AS power_max
-            FROM gpu_metrics
-            WHERE timestamp_epoch > strftime('%s', 'now') - 86400
-            GROUP BY gpu_index
-            ORDER BY gpu_index ASC
-        """).fetchall()
-    finally:
-        conn.close()
+    rows = await asyncio.to_thread(_query)
+    if rows is None:
+        return web.json_response([], status=200)
 
     return web.json_response([
         {
@@ -421,49 +434,53 @@ async def handle_stats_power(request: web.Request) -> web.Response:
             "insufficient_telemetry": True,
         }
 
-    try:
-        conn = _open_db_readonly()
-    except sqlite3.OperationalError as exc:
-        log.warning("stats_power: cannot open DB: %s", exc)
-        return web.json_response(_empty_response(), status=200)
-
-    try:
+    def _query():
         try:
-            # Single aggregation query — all metrics fall out of one
-            # scan of the windowed rows for this GPU. The CASE WHEN
-            # guards ensure NULL / non-positive power rows don't corrupt
-            # peak/avg/energy but still get counted in samples_total via
-            # an unconditional COUNT(*) so the frontend can compute the
-            # invalid ratio.
-            row = conn.execute(
-                """
-                SELECT
-                    COALESCE(
-                        SUM(CASE WHEN power > 0 THEN power * interval_s ELSE 0 END),
-                        0
-                    ) / 3600.0 AS energy_wh,
-                    COALESCE(MAX(CASE WHEN power > 0 THEN power END), 0) AS peak_power_w,
-                    COALESCE(AVG(CASE WHEN power > 0 THEN power END), 0) AS avg_power_w,
-                    COUNT(*) AS samples_total,
-                    SUM(CASE WHEN power IS NULL OR power <= 0 THEN 1 ELSE 0 END)
-                        AS samples_invalid
-                FROM gpu_metrics
-                WHERE gpu_index = ?
-                  AND timestamp_epoch > strftime('%s', 'now') - ?
-                """,
-                (gpu_index, range_s),
-            ).fetchone()
+            conn = _open_db_readonly()
         except sqlite3.OperationalError as exc:
-            # A DB-open that succeeded can still race a schema change,
-            # WAL-checkpoint lock, or (in pathological cases) a missing
-            # table. Match the DB-open fallback shape so callers see the
-            # same "insufficient_telemetry: true" notice in both
-            # failure modes rather than one silent 5xx and one graceful
-            # placeholder.
-            log.warning("stats_power: query failed: %s", exc)
-            return web.json_response(_empty_response(), status=200)
-    finally:
-        conn.close()
+            log.warning("stats_power: cannot open DB: %s", exc)
+            return None
+        try:
+            try:
+                # Single aggregation query — all metrics fall out of one
+                # scan of the windowed rows for this GPU. The CASE WHEN
+                # guards ensure NULL / non-positive power rows don't corrupt
+                # peak/avg/energy but still get counted in samples_total via
+                # an unconditional COUNT(*) so the frontend can compute the
+                # invalid ratio.
+                return conn.execute(
+                    """
+                    SELECT
+                        COALESCE(
+                            SUM(CASE WHEN power > 0 THEN power * interval_s ELSE 0 END),
+                            0
+                        ) / 3600.0 AS energy_wh,
+                        COALESCE(MAX(CASE WHEN power > 0 THEN power END), 0) AS peak_power_w,
+                        COALESCE(AVG(CASE WHEN power > 0 THEN power END), 0) AS avg_power_w,
+                        COUNT(*) AS samples_total,
+                        SUM(CASE WHEN power IS NULL OR power <= 0 THEN 1 ELSE 0 END)
+                            AS samples_invalid
+                    FROM gpu_metrics
+                    WHERE gpu_index = ?
+                      AND timestamp_epoch > strftime('%s', 'now') - ?
+                    """,
+                    (gpu_index, range_s),
+                ).fetchone()
+            except sqlite3.OperationalError as exc:
+                # A DB-open that succeeded can still race a schema change,
+                # WAL-checkpoint lock, or (in pathological cases) a missing
+                # table. Match the DB-open fallback shape so callers see the
+                # same "insufficient_telemetry: true" notice in both
+                # failure modes rather than one silent 5xx and one graceful
+                # placeholder.
+                log.warning("stats_power: query failed: %s", exc)
+                return None
+        finally:
+            conn.close()
+
+    row = await asyncio.to_thread(_query)
+    if row is None:
+        return web.json_response(_empty_response(), status=200)
 
     samples_total = int(row["samples_total"] or 0)
     samples_invalid = int(row["samples_invalid"] or 0)
@@ -933,8 +950,13 @@ async def handle_schedule_run_now(request: web.Request) -> web.Response:
         )
 
     version = _read_version()
+    # generate_report does synchronous matplotlib + Jinja work that
+    # can take 2-5 seconds on a multi-GPU install with full charts.
+    # Wrap in asyncio.to_thread so the collector tick isn't stalled
+    # while the report renders.
     try:
-        message = render.generate_report(
+        message = await asyncio.to_thread(
+            render.generate_report,
             template=schedule.get("template", "daily"),
             db_file=DB_FILE,
             inventory_file=INVENTORY_FILE,
@@ -1034,8 +1056,14 @@ async def handle_report_preview(request: web.Request) -> web.Response:
     # the mail-send behavior is never accidentally dark-themed.
     preview_theme = "dark" if request.query.get("theme") == "dark" else "light"
 
+    # include_charts=False mode skips matplotlib entirely so this
+    # path is much faster than the schedule-run path (Jinja-only,
+    # ~50-100ms instead of seconds). Still wrap in to_thread for
+    # consistency and to keep the event loop fully responsive even
+    # if Jinja renders ever grow.
     try:
-        message = render.generate_report(
+        message = await asyncio.to_thread(
+            render.generate_report,
             template=template,
             db_file=DB_FILE,
             inventory_file=INVENTORY_FILE,
@@ -1105,10 +1133,36 @@ async def handle_db_info(request: web.Request) -> web.Response:
         log.warning("db_info: stat failed: %s", exc)
         size_bytes = 0
 
-    try:
-        conn = _open_db_readonly()
-    except sqlite3.OperationalError as exc:
-        log.warning("db_info: cannot open DB: %s", exc)
+    def _query():
+        try:
+            conn = _open_db_readonly()
+        except sqlite3.OperationalError as exc:
+            log.warning("db_info: cannot open DB: %s", exc)
+            return None
+        try:
+            try:
+                summary = conn.execute("""
+                    SELECT
+                        COUNT(*)             AS row_count,
+                        MIN(timestamp_epoch) AS oldest,
+                        MAX(timestamp_epoch) AS newest
+                    FROM gpu_metrics
+                """).fetchone()
+                per_gpu_rows = conn.execute("""
+                    SELECT gpu_index, COUNT(*) AS n
+                    FROM gpu_metrics
+                    GROUP BY gpu_index
+                    ORDER BY gpu_index ASC
+                """).fetchall()
+                return (summary, per_gpu_rows)
+            except sqlite3.OperationalError as exc:
+                log.warning("db_info: query failed: %s", exc)
+                return None
+        finally:
+            conn.close()
+
+    result = await asyncio.to_thread(_query)
+    if result is None:
         return web.json_response({
             "size_bytes": size_bytes,
             "row_count": 0,
@@ -1116,33 +1170,7 @@ async def handle_db_info(request: web.Request) -> web.Response:
             "newest_epoch": None,
             "row_count_per_gpu": [],
         })
-
-    try:
-        try:
-            summary = conn.execute("""
-                SELECT
-                    COUNT(*)             AS row_count,
-                    MIN(timestamp_epoch) AS oldest,
-                    MAX(timestamp_epoch) AS newest
-                FROM gpu_metrics
-            """).fetchone()
-            per_gpu_rows = conn.execute("""
-                SELECT gpu_index, COUNT(*) AS n
-                FROM gpu_metrics
-                GROUP BY gpu_index
-                ORDER BY gpu_index ASC
-            """).fetchall()
-        except sqlite3.OperationalError as exc:
-            log.warning("db_info: query failed: %s", exc)
-            return web.json_response({
-                "size_bytes": size_bytes,
-                "row_count": 0,
-                "oldest_epoch": None,
-                "newest_epoch": None,
-                "row_count_per_gpu": [],
-            })
-    finally:
-        conn.close()
+    summary, per_gpu_rows = result
 
     return web.json_response({
         "size_bytes": size_bytes,
@@ -1178,31 +1206,45 @@ async def handle_vacuum(request: web.Request) -> web.Response:
     except OSError:
         before = 0
 
-    try:
-        conn = _open_db_readwrite()
-    except sqlite3.OperationalError as exc:
-        log.warning("vacuum: cannot open DB for write: %s", exc)
+    # VACUUM is the heaviest blocker in the codebase — multi-second on
+    # large DBs. Running it inline on the asyncio event loop would stall
+    # collector ticks for the entire duration, dropping samples. Wrap
+    # in asyncio.to_thread so the event loop stays responsive.
+    def _vacuum() -> tuple[bool, str | None]:
+        """Returns (success, error_message). On error, error_message is
+        the str(exc) for the response body."""
+        try:
+            conn = _open_db_readwrite()
+        except sqlite3.OperationalError as exc:
+            log.warning("vacuum: cannot open DB for write: %s", exc)
+            return (False, str(exc))
+        try:
+            try:
+                # VACUUM cannot run inside a transaction. isolation_level=None
+                # disables the implicit BEGIN sqlite3 normally wraps around
+                # executes — essential for VACUUM, harmless for everything
+                # else we might run here.
+                conn.isolation_level = None
+                conn.execute("VACUUM")
+                # In WAL mode VACUUM rebuilds via the WAL file; without an
+                # explicit checkpoint, the freed pages stay in -wal until
+                # something else triggers a checkpoint. Truncate now so the
+                # API caller's "freed_bytes" reflects actual disk reclaim.
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                return (True, None)
+            except sqlite3.OperationalError as exc:
+                log.warning("vacuum: execute failed: %s", exc)
+                return (False, str(exc))
+        finally:
+            conn.close()
+
+    ok, err = await asyncio.to_thread(_vacuum)
+    if not ok:
         return web.json_response(
-            {"error": "database unavailable", "detail": str(exc)},
+            {"error": "vacuum failed" if err else "database unavailable",
+             "detail": err or ""},
             status=503,
         )
-
-    try:
-        try:
-            # VACUUM cannot run inside a transaction. isolation_level=None
-            # disables the implicit BEGIN sqlite3 normally wraps around
-            # executes — essential for VACUUM, harmless for everything
-            # else we might run here.
-            conn.isolation_level = None
-            conn.execute("VACUUM")
-        except sqlite3.OperationalError as exc:
-            log.warning("vacuum: execute failed: %s", exc)
-            return web.json_response(
-                {"error": "vacuum failed", "detail": str(exc)},
-                status=503,
-            )
-    finally:
-        conn.close()
 
     try:
         after = DB_FILE.stat().st_size if DB_FILE.exists() else before
@@ -1259,39 +1301,44 @@ async def handle_purge(request: web.Request) -> web.Response:
 
     cutoff_seconds = days_raw * 86400
 
-    try:
-        conn = _open_db_readwrite()
-    except sqlite3.OperationalError as exc:
-        log.warning("purge: cannot open DB for write: %s", exc)
+    # DELETE on a multi-million-row gpu_metrics table can take seconds.
+    # Wrap in asyncio.to_thread so the collector tick isn't stalled
+    # waiting for the lock + write.
+    def _purge() -> tuple[bool, str | None, int]:
+        try:
+            conn = _open_db_readwrite()
+        except sqlite3.OperationalError as exc:
+            log.warning("purge: cannot open DB for write: %s", exc)
+            return (False, str(exc), 0)
+        try:
+            try:
+                cursor = conn.execute(
+                    """
+                    DELETE FROM gpu_metrics
+                    WHERE timestamp_epoch < (strftime('%s', 'now') - ?)
+                    """,
+                    (cutoff_seconds,),
+                )
+                conn.commit()
+                return (True, None, cursor.rowcount or 0)
+            except sqlite3.OperationalError as exc:
+                log.warning("purge: execute failed: %s", exc)
+                return (False, str(exc), 0)
+        finally:
+            conn.close()
+
+    ok, err, rows_deleted = await asyncio.to_thread(_purge)
+    if not ok:
         return web.json_response(
-            {"error": "database unavailable", "detail": str(exc)},
+            {"error": "purge failed" if err else "database unavailable",
+             "detail": err or ""},
             status=503,
         )
-
-    try:
-        try:
-            cursor = conn.execute(
-                """
-                DELETE FROM gpu_metrics
-                WHERE timestamp_epoch < (strftime('%s', 'now') - ?)
-                """,
-                (cutoff_seconds,),
-            )
-            rows_deleted = cursor.rowcount
-            conn.commit()
-        except sqlite3.OperationalError as exc:
-            log.warning("purge: execute failed: %s", exc)
-            return web.json_response(
-                {"error": "purge failed", "detail": str(exc)},
-                status=503,
-            )
-    finally:
-        conn.close()
 
     return web.json_response({
         "ok": True,
         "days": days_raw,
-        "rows_deleted": int(rows_deleted or 0),
+        "rows_deleted": int(rows_deleted),
     })
 
 

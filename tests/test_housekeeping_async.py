@@ -153,6 +153,87 @@ def test_clean_old_data_deletes_old_rows(tmp_path):
         conn.close()
 
 
+def test_clean_old_data_issues_wal_checkpoint_truncate(tmp_path, monkeypatch):
+    """In WAL mode, VACUUM writes rebuilt pages through the -wal file
+    and never truncates it. clean_old_data must explicitly checkpoint
+    + truncate the WAL afterwards, otherwise the daily purge appears
+    to do nothing on disk (main DB shrinks but -wal grows in lockstep).
+
+    Asserting the on-disk WAL size directly is brittle (SQLite
+    auto-truncates the WAL whenever the last connection closes,
+    regardless of wal_autocheckpoint). Instead we capture every SQL
+    statement clean_old_data executes and assert
+    `PRAGMA wal_checkpoint(TRUNCATE)` is among them. This is a unit
+    test of the implementation contract: the production behavior we
+    care about (WAL growth on prod hosts with persistent reader
+    connections from server.py) follows directly from issuing that
+    pragma."""
+    db_path = tmp_path / "metrics.db"
+    db.initialize(db_path)
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"housekeeping": {"retention_days": 1}}))
+
+    now = int(time.time())
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("""
+            INSERT INTO gpu_metrics
+                (timestamp, timestamp_epoch, temperature, utilization,
+                 memory, power, gpu_index, gpu_uuid, interval_s)
+            VALUES ('old', ?, 60, 50, 8000, 200, 0, 'a', 4)
+        """, (now - 5 * 86400,))
+        conn.commit()
+    finally:
+        conn.close()
+
+    # Wrap sqlite3.connect to record SQL statements run on each
+    # connection. We use a subclass that delegates to the real
+    # Connection but tees execute() and executemany() calls through
+    # our recorder.
+    statements: list[str] = []
+    real_connect = sqlite3.connect
+
+    class RecordingConn(sqlite3.Connection):
+        def execute(self, sql, *args, **kwargs):
+            statements.append(sql)
+            return super().execute(sql, *args, **kwargs)
+
+    def fake_connect(*a, **kw):
+        kw["factory"] = RecordingConn
+        return real_connect(*a, **kw)
+
+    monkeypatch.setattr(housekeeping.sqlite3, "connect", fake_connect)
+    housekeeping.clean_old_data(db_path=db_path, settings_path=settings)
+
+    # The implementation must issue exactly these SQL operations,
+    # in this order, after the DELETE/COMMIT:
+    assert any("DELETE FROM gpu_metrics" in s for s in statements), (
+        "clean_old_data should execute the DELETE; got: " + str(statements)
+    )
+    assert any(s.strip() == "VACUUM" for s in statements), (
+        "clean_old_data should VACUUM after delete; got: " + str(statements)
+    )
+    assert any(
+        "wal_checkpoint" in s.lower() and "truncate" in s.lower()
+        for s in statements
+    ), (
+        "clean_old_data should issue PRAGMA wal_checkpoint(TRUNCATE) after "
+        "VACUUM to actually reclaim the WAL file's disk space; got: "
+        + str(statements)
+    )
+    # And the order must be DELETE → VACUUM → wal_checkpoint
+    delete_idx = next(i for i, s in enumerate(statements) if "DELETE FROM" in s)
+    vacuum_idx = next(i for i, s in enumerate(statements) if s.strip() == "VACUUM")
+    truncate_idx = next(
+        i for i, s in enumerate(statements)
+        if "wal_checkpoint" in s.lower() and "truncate" in s.lower()
+    )
+    assert delete_idx < vacuum_idx < truncate_idx, (
+        f"Order must be DELETE → VACUUM → TRUNCATE; got "
+        f"DELETE@{delete_idx} VACUUM@{vacuum_idx} TRUNCATE@{truncate_idx}"
+    )
+
+
 def test_clean_old_data_default_retention(tmp_path):
     """Missing settings.json → default retention_days=3 applied."""
     db_path = tmp_path / "metrics.db"

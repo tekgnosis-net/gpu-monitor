@@ -181,7 +181,14 @@ def clean_old_data(*, db_path: str | Path, settings_path: str | Path) -> None:
         # VACUUM cannot run in a transaction
         conn.isolation_level = None
         conn.execute("VACUUM")
-        log.info("purge: deleted %d row(s) and VACUUMed", deleted)
+        # In WAL mode, VACUUM rebuilds via the WAL, so the .db-wal file
+        # may carry the freed pages indefinitely (until something else
+        # checkpoints). An explicit `wal_checkpoint(TRUNCATE)` blocks
+        # until all readers release, copies WAL pages back to the main
+        # DB, then truncates the WAL file to zero bytes — actually
+        # reclaiming the disk space the user expects from a "purge".
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        log.info("purge: deleted %d row(s), VACUUMed, and truncated WAL", deleted)
     except sqlite3.Error as exc:
         log.error("purge: failed (%s)", exc)
         try:

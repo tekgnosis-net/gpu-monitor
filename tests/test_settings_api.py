@@ -123,15 +123,35 @@ async def test_put_partial_merge_preserves_other_sections(client, tmp_base):
 
 @pytest.mark.asyncio
 async def test_put_invalid_interval_returns_400(client):
-    """Pydantic rejects interval_seconds=1 (below the ge=2 bound)."""
+    """Pydantic rejects interval_seconds=0 (below the ge=1 bound).
+
+    The pre-v2.1.0 floor was 2 (a bash-era safety bound around
+    subprocess-fork cost). v2.1.0 lowers it to 1 because pynvml's
+    per-tick cost is ~1-2ms and NVML's internal sampling window is
+    1 second — so 1 is both achievable and the meaningful floor.
+    """
     resp = await client.put(
         "/api/settings",
-        json={"collection": {"interval_seconds": 1}},
+        json={"collection": {"interval_seconds": 0}},
     )
     assert resp.status == 400
     data = await resp.json()
     assert data["error"] == "validation failed"
     assert any("interval_seconds" in str(d) for d in data["detail"])
+
+
+@pytest.mark.asyncio
+async def test_put_interval_seconds_1_accepted(client):
+    """v2.1.0: interval_seconds=1 is now within the valid range
+    [1, 300]. This test would have failed under v2.0.0."""
+    resp = await client.put(
+        "/api/settings",
+        json={"collection": {"interval_seconds": 1}},
+    )
+    assert resp.status == 200
+    resp2 = await client.get("/api/settings")
+    data = await resp2.json()
+    assert data["collection"]["interval_seconds"] == 1
 
 
 @pytest.mark.asyncio

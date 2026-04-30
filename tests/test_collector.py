@@ -41,10 +41,30 @@ def test_settings_reads_valid_interval(tmp_path):
 
 
 def test_settings_clamps_out_of_range(tmp_path):
-    """interval_seconds outside [2, 300] → clamped to default with
+    """interval_seconds outside [1, 300] → clamped to default with
     a warning log (not a hard failure)."""
     settings_path = tmp_path / "settings.json"
     settings_path.write_text(json.dumps({"collection": {"interval_seconds": 500}}))
+    loader = collector._SettingsLoader(settings_path)
+    assert loader.current_interval() == collector.DEFAULT_INTERVAL_S
+
+
+def test_settings_accepts_one_second_interval(tmp_path):
+    """v2.1.0: interval_seconds=1 is accepted (was rejected in
+    v2.0.0). NVML's internal utilization sampling window is 1s, so
+    this is the meaningful floor."""
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(json.dumps({"collection": {"interval_seconds": 1}}))
+    loader = collector._SettingsLoader(settings_path)
+    assert loader.current_interval() == 1
+
+
+def test_settings_rejects_sub_second_interval(tmp_path):
+    """interval_seconds=0 is below the floor and falls back to
+    default. We don't accept zero because the loop relies on
+    asyncio.sleep(interval) to make forward progress."""
+    settings_path = tmp_path / "settings.json"
+    settings_path.write_text(json.dumps({"collection": {"interval_seconds": 0}}))
     loader = collector._SettingsLoader(settings_path)
     assert loader.current_interval() == collector.DEFAULT_INTERVAL_S
 
