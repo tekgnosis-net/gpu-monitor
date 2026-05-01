@@ -357,7 +357,7 @@ function renderCollectionTab() {
     const header = el('header');
     header.append(el('h3', null, 'Collection'));
     const subtitle = el('div', 'subtitle',
-        'How often the collector samples nvidia-smi and flushes to SQLite. Changes save automatically.');
+        'How often the collector samples NVML and writes to SQLite. Changes save automatically.');
     header.append(subtitle);
     panel.append(header);
 
