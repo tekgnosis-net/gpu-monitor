@@ -3,6 +3,14 @@
 All notable changes to this fork of `bigsk1/gpu-monitor` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.1](https://github.com/tekgnosis-net/gpu-monitor/compare/v2.1.0...v2.1.1) (2026-05-01)
+
+
+### Bug Fixes
+
+* **ui:** align Poll interval min with v2.1.0 backend (1, was 2) ([3e9937a](https://github.com/tekgnosis-net/gpu-monitor/commit/3e9937a3ba50708cab50f0477f3dec26a38e09c7))
+* **ui:** replace bash-era 'samples nvidia-smi and flushes to SQLite' wording ([2a0b419](https://github.com/tekgnosis-net/gpu-monitor/commit/2a0b419e25f6ecdd516a89756943ae8de0d93b8a))
+
 ## [2.1.0](https://github.com/tekgnosis-net/gpu-monitor/compare/v2.0.0...v2.1.0) (2026-04-30)
 
 
