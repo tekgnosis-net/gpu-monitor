@@ -184,7 +184,7 @@ function checkboxInput(name, checked) {
 // Using valueAsNumber instead of Number(input.value) correctly distinguishes
 // "empty field" (NaN) from "literal zero" — Number("") is 0, which would
 // silently send interval_seconds=0 to the server and trigger a 400 from
-// Pydantic's ge=2 constraint with a generic error. Catching the failure
+// Pydantic's ge=1 constraint with a generic error. Catching the failure
 // client-side at the button boundary produces a better error UX.
 function numericValue(input) {
     if (!input.checkValidity()) {
@@ -363,7 +363,9 @@ function renderCollectionTab() {
 
     const c = state.settings.collection || {};
 
-    const intervalInput = numberInput('interval_seconds', c.interval_seconds, 2, 300);
+    // v2.1.0: minimum lowered from 2 → 1. NVML's internal utilization
+    // sampling window is 1 s, so 1 Hz is the meaningful floor.
+    const intervalInput = numberInput('interval_seconds', c.interval_seconds, 1, 300);
     bindNumberChange(intervalInput, v => ({
         collection: { interval_seconds: v },
     }));
@@ -371,7 +373,7 @@ function renderCollectionTab() {
         'collection-interval',
         'Poll interval (seconds)',
         intervalInput,
-        'How often the collector queries nvidia-smi. Lower values produce more responsive charts but increase CPU usage. Changes apply within one interval of saving — no restart required.',
+        'How often the collector samples NVML for GPU metrics. Range 1–300 s; 1 s is the meaningful floor (NVML averages utilization over a ~1 s window internally). Lower values produce more granular charts but more DB rows; per-tick CPU is ~1–2 ms via pynvml. Changes apply within one interval of saving — no restart required.',
     ));
 
     const flushInput = numberInput('flush_interval_seconds', c.flush_interval_seconds, 5, 3600);
