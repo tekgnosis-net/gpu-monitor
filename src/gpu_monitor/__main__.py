@@ -206,6 +206,8 @@ async def _async_main() -> None:
         lambda: _run_alert_checker(),
         lambda: housekeeping.run(
             log_dir=LOG_DIR, db_path=DB_FILE, settings_path=SETTINGS_FILE,
+            inventory_path=INVENTORY_FILE, config_path=CONFIG_FILE,
+            version=VERSION,
         ),
     ])
 

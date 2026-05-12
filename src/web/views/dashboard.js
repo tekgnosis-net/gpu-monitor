@@ -37,6 +37,11 @@ let pollInterval = null;
 let chartInstance = null;
 let themeChangeHandler = null;
 let visibilityHandler = null;
+// In-flight guard for /api/gpus refresh. Without this, rapid
+// visibilitychange flips (alt-tabbing) could stack overlapping
+// network calls. The reads are idempotent, but redundant traffic
+// is still worth suppressing.
+let refreshGpusInflight = false;
 let state = {
     gpus: [],
     selectedGpuIndex: 0,
@@ -435,14 +440,58 @@ function stopPolling() {
     }
 }
 
+// Re-fetch /api/gpus and re-stamp the static-but-not-truly-static
+// attributes on existing <gpu-card> elements. Covers the case where
+// an operator runs `nvidia-smi -pl <new-watts>` against the host
+// while the dashboard is open: the backend's housekeeping loop
+// rewrites gpu_inventory.json on a 60s cadence, but the open tab
+// would otherwise keep using the limit fetched at mount(). This
+// is paired with the housekeeping refresh (option 1) so on-screen
+// gauges converge within one visibility-resume rather than waiting
+// for a manual page reload.
+//
+// Concurrency: guarded by `refreshGpusInflight`. Concurrent rebuilds
+// of state.gpus would never corrupt anything (the array is replaced
+// atomically by assignment) but the redundant network calls aren't
+// worth burning, and the guard makes the data-flow obvious.
+async function refreshGpus() {
+    if (refreshGpusInflight) return;
+    refreshGpusInflight = true;
+    try {
+        const fetched = await api.getGpus();
+        if (!fetched || fetched.length === 0) return;
+        const next = [...fetched].sort((a, b) => (a.index ?? 0) - (b.index ?? 0));
+        state.gpus = next;
+
+        const grid = document.getElementById('gpu-cards-grid');
+        if (!grid) return;
+        next.forEach((gpu) => {
+            const card = grid.querySelector(`gpu-card[gpu-index="${gpu.index}"]`);
+            if (!card) return;
+            // The gauge component reads power-limit-w / memory-total-mib
+            // as attributes on each render. Updating them here makes
+            // the next polling tick's % calculation use the new cap
+            // without any DOM rebuild.
+            card.setAttribute('power-limit-w', String(gpu.power_limit_w || 0));
+            card.setAttribute('memory-total-mib', String(gpu.memory_total_mib || 24576));
+        });
+    } finally {
+        refreshGpusInflight = false;
+    }
+}
+
 function handleVisibilityChange() {
     if (document.hidden) {
         stopPolling();
     } else {
         // Tab became visible — immediate refresh to recover from
         // any staleness accumulated while hidden, then restart the
-        // regular 4s cadence.
+        // regular 4s cadence. Run the metric + inventory refresh in
+        // parallel; they hit different endpoints so there's no
+        // backend contention, and a slow /api/gpus shouldn't delay
+        // the metric refresh that the user actually watches.
         refreshCurrent().catch(err => console.warn('dashboard: visibility refresh failed:', err));
+        refreshGpus().catch(err => console.warn('dashboard: gpus refresh failed:', err));
         startPolling();
     }
 }
