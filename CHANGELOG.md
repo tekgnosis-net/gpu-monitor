@@ -3,6 +3,14 @@
 All notable changes to this fork of `bigsk1/gpu-monitor` are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versioning: [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.2](https://github.com/tekgnosis-net/gpu-monitor/compare/v2.1.1...v2.1.2) (2026-05-12)
+
+
+### Bug Fixes
+
+* **power:** refresh enforced power limit while container is running ([c1f02e9](https://github.com/tekgnosis-net/gpu-monitor/commit/c1f02e99fbd9ba59df4681a921917111f84fd0b0))
+* **power:** refresh enforced power limit while container is running ([8708acb](https://github.com/tekgnosis-net/gpu-monitor/commit/8708acb4207a73212a0c9c324277aa9fcbbe75b1))
+
 ## [2.1.1](https://github.com/tekgnosis-net/gpu-monitor/compare/v2.1.0...v2.1.1) (2026-05-01)
 
 
