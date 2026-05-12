@@ -31,6 +31,8 @@ import time
 from datetime import datetime, date
 from pathlib import Path
 
+from gpu_monitor import inventory as inventory_module
+
 log = logging.getLogger("gpu-monitor.housekeeping")
 
 
@@ -39,6 +41,11 @@ DEFAULT_MAX_SIZE_MB = 5
 DEFAULT_MAX_AGE_HOURS = 25
 DEFAULT_RETENTION_DAYS = 3
 RETENTION_SLACK_S = 600  # 10 min slack to match legacy RETENTION_SECONDS
+
+# Re-read of nvmlDeviceGetEnforcedPowerLimit cadence. 60s is well
+# below operator-perception threshold for `nvidia-smi -pl` changes
+# while keeping NVML traffic negligible (one call per GPU per minute).
+DEFAULT_INVENTORY_REFRESH_INTERVAL_S = 60
 
 # Suffix pattern for rotated files: gpu_stats.log.20260430-143012
 _ROTATED_SUFFIX_LEN = len(".YYYYMMDD-HHMMSS")  # 16 chars
@@ -208,17 +215,42 @@ async def run(
     db_path: str | Path,
     settings_path: str | Path,
     tick_seconds: float = 60.0,
+    inventory_path: str | Path | None = None,
+    config_path: str | Path | None = None,
+    version: str | None = None,
+    inventory_refresh_interval_s: float = DEFAULT_INVENTORY_REFRESH_INTERVAL_S,
 ) -> None:
     """Async run loop: tick every `tick_seconds`, fire rotation
-    on hour boundaries and purge on day boundaries at 00:00.
+    on hour boundaries, purge on day boundaries at 00:00, and
+    re-read enforced power limits on `inventory_refresh_interval_s`.
 
     `tick_seconds` is configurable for tests (which can pass e.g.
     0.01 to drive many simulated boundaries quickly).
+
+    `inventory_path`, `config_path`, `version` together gate the
+    power-limit refresh. When any of them is None the refresh tick
+    is skipped — keeps the existing test suite (which constructs
+    minimal housekeeping fixtures) working without modification.
+
+    Refresh tick is wrapped in `asyncio.to_thread` because NVML
+    calls + the JSON fsync are blocking; running them on the event
+    loop directly would briefly stall the metric polling and API
+    serving tasks running in the same `asyncio.gather`.
     """
     last_rotation_hour: int | None = None
     last_purge_date: date | None = None
+    last_inventory_refresh_epoch: float = 0.0
+    inventory_refresh_enabled = (
+        inventory_path is not None
+        and config_path is not None
+        and version is not None
+    )
 
-    log.info("housekeeping: started (tick=%ss)", tick_seconds)
+    log.info(
+        "housekeeping: started (tick=%ss, inventory_refresh=%s)",
+        tick_seconds,
+        f"{inventory_refresh_interval_s}s" if inventory_refresh_enabled else "off",
+    )
     try:
         while True:
             now = datetime.now()
@@ -236,6 +268,23 @@ async def run(
                 except Exception:
                     log.exception("housekeeping: clean_old_data failed")
                 last_purge_date = now.date()
+
+            if inventory_refresh_enabled:
+                now_epoch = time.time()
+                if (now_epoch - last_inventory_refresh_epoch
+                        >= inventory_refresh_interval_s):
+                    try:
+                        await asyncio.to_thread(
+                            inventory_module.refresh_power_limits,
+                            inventory_path=inventory_path,
+                            config_path=config_path,
+                            version=version,
+                        )
+                    except Exception:
+                        log.exception(
+                            "housekeeping: inventory refresh failed"
+                        )
+                    last_inventory_refresh_epoch = now_epoch
 
             await asyncio.sleep(tick_seconds)
     except asyncio.CancelledError:

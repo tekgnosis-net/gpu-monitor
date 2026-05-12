@@ -309,6 +309,96 @@ async def test_run_fires_rotation_on_first_tick(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_run_fires_inventory_refresh_when_paths_provided(tmp_path, monkeypatch):
+    """When inventory_path + config_path + version are supplied,
+    housekeeping.run() invokes inventory.refresh_power_limits on
+    its configured cadence. Verifies the wiring — the actual rewrite
+    logic is covered in test_inventory_refresh.py."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    db_path = tmp_path / "metrics.db"
+    db.initialize(db_path)
+    inv_path = tmp_path / "gpu_inventory.json"
+    cfg_path = tmp_path / "gpu_config.json"
+
+    # Spy on refresh_power_limits so we don't need pynvml mocking here.
+    refresh_calls = []
+
+    def spy_refresh(*, inventory_path, config_path, version):
+        refresh_calls.append((str(inventory_path), str(config_path), version))
+        return (False, [])
+
+    monkeypatch.setattr(
+        housekeeping.inventory_module, "refresh_power_limits", spy_refresh,
+    )
+
+    sleeps = []
+
+    async def fast_sleep(s):
+        sleeps.append(s)
+        if len(sleeps) >= 1:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(housekeeping.asyncio, "sleep", fast_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await housekeeping.run(
+            log_dir=log_dir, db_path=db_path, settings_path=settings,
+            tick_seconds=0.01,
+            inventory_path=inv_path, config_path=cfg_path, version="2.1.1",
+            inventory_refresh_interval_s=0.0,  # fire every tick for the test
+        )
+
+    # First tick fires the refresh (init epoch is 0 so first delta >>
+    # interval) — exactly one call here, with the wired-through paths.
+    assert len(refresh_calls) == 1
+    assert refresh_calls[0] == (str(inv_path), str(cfg_path), "2.1.1")
+
+
+@pytest.mark.asyncio
+async def test_run_skips_inventory_refresh_when_paths_missing(tmp_path, monkeypatch):
+    """When inventory_path / config_path / version are not passed,
+    the refresh is disabled — keeps the test fixtures and any
+    other harness that constructs minimal housekeeping working."""
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    settings = tmp_path / "settings.json"
+    settings.write_text("{}")
+    db_path = tmp_path / "metrics.db"
+    db.initialize(db_path)
+
+    refresh_calls = []
+
+    def spy_refresh(*, inventory_path, config_path, version):
+        refresh_calls.append(1)
+        return (False, [])
+
+    monkeypatch.setattr(
+        housekeeping.inventory_module, "refresh_power_limits", spy_refresh,
+    )
+
+    sleeps = []
+
+    async def fast_sleep(s):
+        sleeps.append(s)
+        if len(sleeps) >= 1:
+            raise asyncio.CancelledError
+
+    monkeypatch.setattr(housekeeping.asyncio, "sleep", fast_sleep)
+
+    with pytest.raises(asyncio.CancelledError):
+        await housekeeping.run(
+            log_dir=log_dir, db_path=db_path, settings_path=settings,
+            tick_seconds=0.01,
+            # NO inventory_path / config_path / version
+        )
+
+    assert refresh_calls == []
+
+
+@pytest.mark.asyncio
 async def test_run_skips_purge_outside_hour_zero(tmp_path, monkeypatch):
     """Purge is gated on hour=0; outside that, only rotation fires."""
     log_dir = tmp_path / "logs"

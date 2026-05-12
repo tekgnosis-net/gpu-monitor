@@ -146,6 +146,109 @@ def _to_str(value: bytes | str) -> str:
     return str(value)
 
 
+# ─── Periodic refresh ──────────────────────────────────────────────────────
+
+
+def refresh_power_limits(
+    *,
+    inventory_path: str | Path,
+    config_path: str | Path,
+    version: str,
+) -> tuple[bool, list[tuple[int, int, int]]]:
+    """Re-read the enforced power limit per GPU and atomically rewrite
+    both inventory + config JSON if any value changed.
+
+    An operator running `nvidia-smi -pl <watts>` against a live container
+    moves the enforced cap without restarting the daemon. Without this
+    refresh, the cap stored in `gpu_inventory.json` is frozen at
+    container-start and the dashboard's power-gauge denominator drifts
+    out of sync with reality.
+
+    Returns `(changed, deltas)` where `deltas` is a list of
+    `(gpu_index, old_w, new_w)` tuples for the entries that moved.
+    No-op (no disk write) when nothing changed — keeps the mtime stable
+    so consumers polling the file don't see redundant churn.
+
+    Concurrency
+    -----------
+
+    The atomic write-to-tmp + `os.replace` in `_atomic_write_json`
+    means readers (`server.handle_gpus`, the dashboard via /api/gpus)
+    never observe a torn file: they see either the pre-refresh inode
+    or the post-refresh inode, by POSIX rename guarantees. This is
+    the only writer of these two files at runtime, so we don't need
+    a separate inter-process lock.
+
+    NVML thread safety: `libnvidia-ml.so` serializes per-handle access
+    internally; our handle-per-GPU here is independent of the collector's
+    handle cache (different `nvmlDeviceGetHandleByIndex` invocations
+    return distinct opaque pointers to the same underlying device,
+    and read-only NVML calls don't interfere).
+    """
+    try:
+        with Path(inventory_path).open("r", encoding="utf-8") as f:
+            current = json.load(f)
+    except (OSError, ValueError) as exc:
+        log.warning(
+            "refresh: cannot read %s (%s); skipping this tick",
+            inventory_path, exc,
+        )
+        return (False, [])
+
+    gpus = current.get("gpus", [])
+    if not gpus:
+        return (False, [])
+
+    deltas: list[tuple[int, int, int]] = []
+    refreshed: list[GPUInventory] = []
+    for entry in gpus:
+        idx = int(entry.get("index", 0))
+        old_limit = int(entry.get("power_limit_w", 0) or 0)
+        name = entry.get("name", "GPU")
+        uuid = entry.get("uuid", "")
+        memory_total_mib = int(entry.get("memory_total_mib", 0) or 0)
+
+        new_limit = old_limit
+        try:
+            handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
+            new_limit_mw = pynvml.nvmlDeviceGetEnforcedPowerLimit(handle)
+            new_limit = int(round(new_limit_mw / 1000.0))
+        except pynvml.NVMLError as exc:
+            # Per-GPU isolation: a failure here keeps the old value
+            # for that index but still lets us refresh sibling GPUs.
+            # No log spam — common transient cause is GPU_IS_LOST,
+            # which the collector loop will surface separately.
+            log.debug(
+                "refresh: GPU %d power limit re-read failed (%s); "
+                "keeping old value %dW",
+                idx, exc, old_limit,
+            )
+
+        if new_limit != old_limit:
+            deltas.append((idx, old_limit, new_limit))
+
+        refreshed.append(GPUInventory(
+            index=idx,
+            uuid=uuid,
+            name=name,
+            memory_total_mib=memory_total_mib,
+            power_limit_w=new_limit,
+        ))
+
+    if not deltas:
+        return (False, [])
+
+    for idx, old, new in deltas:
+        log.info(
+            "refresh: GPU %d enforced power limit changed %dW → %dW "
+            "(operator likely ran `nvidia-smi -pl`)", idx, old, new,
+        )
+
+    _write_inventory_json(inventory_path, refreshed)
+    _write_config_json(config_path, refreshed, version=version)
+    return (True, deltas)
+
+
 # ─── JSON writers (atomic) ─────────────────────────────────────────────────
 
 
